@@ -9,6 +9,8 @@ build/
 dist/
 docs/
 *.egg-info/
+examples/
+tests/
 # Compiled extension (rebuild with build.bat / python setup.py build_ext --inplace)
 trainstream/_C*.pyd
 trainstream/_C*.so

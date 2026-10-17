@@ -19,6 +19,13 @@ memory planner keeps as many blocks resident as VRAM allows. Hooks sit on every
 block, so a resident block prefetches the next paged one and transfers overlap
 with compute even when paged and resident blocks are interleaved.
 
+Quantized frozen weights (trainstream.quant: int8 / NF4) are always expanded
+on demand: before the block runs, a kernel on the H2D stream writes the
+weight's dtype into its storage from the packed bytes, which live either in
+VRAM ("near": no PCIe traffic, just the expansion) or in host RAM ("far":
+copied over first, a quarter or half of the bf16 bytes). The planner moves
+blocks between near and far exactly as it moves bf16 blocks in and out.
+
 Frozen weights (LoRA base layers) of a paged block get a host copy of their
 own: pinned while that fits the page-lock budget, else ordinary RAM. It is
 dropped again when the block becomes resident. Under torch.autocast the
@@ -38,6 +45,7 @@ from torch import nn
 
 from . import _C
 from .optimizer import physical_ram_bytes
+from .quant import make_quantized, quantized_of
 
 
 def _in_backward() -> bool:
@@ -90,10 +98,22 @@ class ParamPager:
         if candidates is None:
             candidates = pageable_params(model, self.blocks, range(self.n))
         self._entries: Dict[int, list] = {}
+        self._quant: Dict[int, object] = {}  # id(param) -> QuantizedWeight
+        self.quant_blocks: Set[int] = set()
         for i in range(self.n):
             self._entries[i] = [(p, optimizer._slot_of.get(id(p)), p.numel() * p.element_size())
                                 for p in candidates.get(i, [])]
+            for p, _, _ in self._entries[i]:
+                qw = quantized_of(p)
+                if qw is not None:
+                    self._quant[id(p)] = qw
+                    self.quant_blocks.add(i)
         self.block_bytes = [sum(nb for _, _, nb in self._entries[i]) for i in range(self.n)]
+        # what a block costs in VRAM to keep "near": its packed bytes when quantized
+        self.near_bytes = [sum(self._quant[id(p)].nbytes if id(p) in self._quant else nb
+                               for p, _, nb in self._entries[i]) for i in range(self.n)]
+        self.qnear: Set[int] = set()
+        self._keep: Dict[int, list] = {}
         self._host_frozen: Dict[int, torch.Tensor] = {}
         ram = physical_ram_bytes()
         self.pin_budget = 0.40 * ram if ram else float("inf")
@@ -106,8 +126,10 @@ class ParamPager:
         self.events: Dict[int, object] = {}
         self.stats = dict(loads=0, load_bytes=0, releases=0, pages=0, unpages=0)
         frozen_init = frozen_init if frozen_init is not None else {}
-        for i in sorted(set(paged)):
+        for i in sorted(set(paged) | self.quant_blocks):
             self.page(i, frozen_init)
+        for i in sorted(self.quant_blocks - set(paged)):
+            self.unpage(i)  # quantized and near: packed bytes in VRAM
         self._handles = [model.register_forward_pre_hook(self._root_pre)]
         for i, b in enumerate(self.blocks):
             self._handles.append(b.register_forward_pre_hook(self._make_pre(i)))
@@ -118,8 +140,18 @@ class ParamPager:
 
     # -- state ------------------------------------------------------------------
     @property
+    def remote(self) -> Set[int]:
+        """Blocks whose weights come over PCIe when they run."""
+        return (self.paged - self.quant_blocks) | (self.quant_blocks - self.qnear)
+
+    @property
     def bytes_paged(self) -> int:
-        return sum(self.block_bytes[i] for i in self.paged)
+        """Bytes streamed from host RAM per load of every remote block."""
+        return sum(self.near_bytes[i] for i in self.remote)
+
+    @property
+    def quantized_bytes(self) -> int:
+        return sum(qw.nbytes for qw in self._quant.values())
 
     @property
     def last(self) -> int:
@@ -139,7 +171,19 @@ class ParamPager:
 
     # -- moving a block between VRAM and host RAM (between steps) ---------------
     def page(self, i: int, frozen_init: Optional[Dict[int, torch.Tensor]] = None) -> None:
-        """Make block i paged: its weights leave VRAM."""
+        """Make block i paged: its weights leave VRAM. For a quantized block that
+        is already paged: move its packed bytes out of VRAM ("far")."""
+        if i in self.quant_blocks and i in self.paged:
+            if i in self.qnear:
+                self.wait(i)
+                torch.cuda.current_stream(self.device).synchronize()  # nothing may still read them
+                for p, _, _ in self._entries[i]:
+                    qw = self._quant.get(id(p))
+                    if qw is not None:
+                        qw.drop_device()
+                self.qnear.discard(i)
+                self.stats["pages"] += 1
+            return
         if i in self.paged or not self._entries[i]:
             return
         entries = self._entries[i]
@@ -151,6 +195,8 @@ class ParamPager:
                 self.opt.engine.set_paged(slot, True)
                 self.opt._paged_ids.add(id(p))
                 continue
+            if id(p) in self._quant:
+                continue  # its packed host copy is the source
             # Frozen weight: pinned host copy while that fits the page-lock
             # budget, else ordinary RAM (the CPU tensor a model was built in is
             # reused as is). Taken one by one, so a model never exists twice.
@@ -168,13 +214,23 @@ class ParamPager:
             self._host_frozen[id(p)] = host
         self.paged.add(i)
         self._resort()
-        self.allocated[i] = all(p.untyped_storage().nbytes() > 0 for p, _, _ in entries)
+        self.allocated[i] = any(p.untyped_storage().nbytes() > 0 for p, _, _ in entries)
         self.fresh[i] = False
         self.release(i)
         self.stats["pages"] += 1
 
     def unpage(self, i: int) -> None:
-        """Make block i resident: load its weights and keep them in VRAM."""
+        """Make block i resident: load its weights and keep them in VRAM. For a
+        quantized block: keep its packed bytes in VRAM ("near")."""
+        if i in self.quant_blocks:
+            if i not in self.qnear:
+                for p, _, _ in self._entries[i]:
+                    qw = self._quant.get(id(p))
+                    if qw is not None:
+                        qw.to_device(self.device)
+                self.qnear.add(i)
+                self.stats["unpages"] += 1
+            return
         if i not in self.paged:
             return
         self.fresh[i] = False
@@ -212,9 +268,21 @@ class ParamPager:
             self.allocated[i] = True
         after = _C.record_event(self.device.index or 0)  # memory reuse ordered after queued compute
         last = None
+        keep = []
         for p, slot, nbytes in entries:
+            qw = self._quant.get(id(p))
+            if qw is not None:
+                near = qw.dev_q is not None
+                last, held = _C.dequantize_async(p.detach().view(-1), qw.dev_q if near else qw.host_q,
+                                                 qw.dev_absmax if near else qw.host_absmax, qw.kind,
+                                                 qw.block_size, after)
+                keep.extend(held)
+                if not near:
+                    self.stats["load_bytes"] += qw.nbytes
+                continue
             last = _C.h2d_async(p.detach().view(-1), self._source(p, slot), after)
             self.stats["load_bytes"] += nbytes
+        self._keep[i] = keep  # staging copies of far packed bytes, alive until the event
         for s in slots:
             self.opt.engine.set_ready(s, last)  # the next update waits until this read is done
         self.events[i] = last
@@ -232,12 +300,29 @@ class ParamPager:
         self.wait(i)  # an unconsumed prefetch must land before its memory is reused
         for p, _, _ in self._entries[i]:
             p.untyped_storage().resize_(0)
+        self._keep.pop(i, None)
         self.allocated[i] = False
         self.fresh[i] = False
         self.stats["releases"] += 1
 
     def materialize(self) -> None:
-        """Make every block resident (e.g. before unwrap)."""
+        """Make every block resident (e.g. before unwrap). Quantized weights are
+        expanded for good: the model then holds their dequantized values."""
+        for i in sorted(self.quant_blocks):
+            self.fresh[i] = False
+            self.load(i)
+            self.wait(i)
+            torch.cuda.current_stream(self.device).synchronize()
+            for p, _, _ in self._entries[i]:
+                if id(p) in self._quant:
+                    del self._quant[id(p)]
+                    del p._ts_qweight
+            self._keep.pop(i, None)
+            self.quant_blocks.discard(i)
+            self.qnear.discard(i)
+            self.paged.discard(i)
+            self.allocated[i] = True
+        self._resort()
         for i in list(self._sorted):
             self.unpage(i)
 
@@ -293,6 +378,10 @@ class ParamPager:
         return [(n, p) for n, p in self.blocks[i].named_parameters() if id(p) in ids]
 
     def host_value(self, p, slot) -> torch.Tensor:
+        qw = self._quant.get(id(p))
+        if qw is not None:  # the values training actually uses
+            dev = self.device if torch.cuda.is_available() else None
+            return qw.dequantize(dev).cpu()
         if slot is not None:
             self.opt.engine.wait_issued([slot])
         return self._source(p, slot).view(p.shape).clone()
@@ -321,7 +410,14 @@ class ParamPager:
                 return
             torch.cuda.current_stream(self.device).synchronize()
             for p, slot, _ in self._entries[i]:
-                if slot is not None:
+                qw = self._quant.get(id(p))
+                if qw is not None:  # re-quantize the loaded values
+                    new = make_quantized(p.detach(), qw.kind, qw.block_size, pin=qw.pinned)
+                    if qw.dev_q is not None:
+                        new.to_device(self.device)
+                    self._quant[id(p)] = new
+                    p._ts_qweight = new
+                elif slot is not None:
                     self.opt.engine.sync_host_from_param(slot)
                 else:
                     self._host_frozen[id(p)].copy_(p.detach().reshape(-1))

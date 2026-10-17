@@ -44,6 +44,13 @@ cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, void* ex
                             const AdamWParams& hp, const float* grad_sq_norm, int sm_count,
                             cudaStream_t stream, bool bf16_moments = false, uint32_t seed = 0);
 
+// Blockwise-quantized frozen weights (see quant_kernel.cu).
+enum class QKind : int { kNF4 = 0, kInt8 = 1 };
+
+// out[0..n) = dequantized values; one fp32 absmax per `block` values (block even).
+cudaError_t dequantize(QKind kind, DType out_dtype, const void* q, const float* absmax, void* out, int64_t n,
+                       int block, int sm_count, cudaStream_t stream);
+
 // out[0] += sum(grad[i]^2). Used for global gradient-norm clipping on the GPU path.
 cudaError_t grad_sq_norm_accumulate(DType dtype, const void* grad, int64_t n, float* out,
                                     int sm_count, cudaStream_t stream);

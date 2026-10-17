@@ -92,6 +92,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("device") = -1, py::arg("sizes") = std::vector<int64_t>{},
         py::arg("strides") = std::vector<int64_t>{});
   m.def("transfer_stats", &transfer_stats, py::arg("device") = -1);
+  m.def("dequantize_async", &dequantize_async, py::arg("dst"), py::arg("q"), py::arg("absmax"), py::arg("kind"),
+        py::arg("block"), py::arg("after") = EventPtr());
   m.def("synchronize_streams", [](int device) {
         Runtime& rt = runtime(device);
         TS_CUDA_CHECK(cudaStreamSynchronize(rt.d2h));

@@ -118,7 +118,7 @@ class MemoryPlanner:
     """Static plan + closed-loop refinement of the paged block set."""
 
     def __init__(self, budget: Budget, block_bytes: List[int], *, fixed_vram: int, inflight_bytes: int,
-                 margin: float = 0.10, max_refine_steps: int = 8):
+                 margin: float = 0.10, max_refine_steps: int = 8, window_block_bytes: Optional[int] = None):
         self.budget = budget
         self.block_bytes = list(block_bytes)
         self.n = len(block_bytes)
@@ -127,6 +127,8 @@ class MemoryPlanner:
         self.margin = float(margin)
         self.target = int(budget.vram_usable * (1.0 - margin))
         self.max_block = max(block_bytes) if block_bytes else 0
+        # bytes of one block while it runs (its expanded form when quantized)
+        self.window_block = int(window_block_bytes) if window_block_bytes else self.max_block
         self.max_refine_steps = max_refine_steps
         self.steps = 0
         self.stable = 0
@@ -144,7 +146,7 @@ class MemoryPlanner:
         act_reserve = max(2 * self.inflight, int(0.15 * self.target))
         if self.fixed_vram + weights + act_reserve <= self.target:
             return set()
-        window = 3 * self.max_block  # computing + prefetched + lagging release
+        window = 3 * self.window_block  # computing + prefetched + lagging release
         room = self.target - self.fixed_vram - window - act_reserve
         keep, acc = 0, 0
         for b in sorted(self.block_bytes):  # count how many blocks fit (sizes are usually uniform)
@@ -158,7 +160,7 @@ class MemoryPlanner:
     def fits_at_all(self) -> bool:
         """Could the run fit at all with every block paged? Only a clear "no"
         refuses a run: the fixed parts plus two blocks in flight."""
-        return self.fixed_vram + 2 * self.max_block <= self.budget.vram_usable
+        return self.fixed_vram + 2 * self.window_block <= self.budget.vram_usable
 
     # -- refinement ------------------------------------------------------------------
     def refine(self, peak: int, paged: Set[int]) -> Optional[Set[int]]:

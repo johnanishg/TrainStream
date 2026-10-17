@@ -4,6 +4,9 @@
     python examples/lora_large_model.py --size 14b              # Qwen2.5-14B: 29.5 GB of bf16 weights
     python examples/lora_large_model.py --size 7b --stock       # same run with the stock Trainer (all in VRAM)
     python examples/lora_large_model.py --model Qwen/Qwen2.5-7B # a real checkpoint (downloads it)
+    python examples/lora_large_model.py --size 14b --quantize nf4               # NF4 base weights
+    python examples/lora_large_model.py --size 14b --quantize auto --prefer speed
+    python examples/lora_large_model.py --size 32b --quantize nf4  # 65 GB in bf16: more than 64 GB of RAM
 
 By default the model is built from the architecture's config with random
 weights (no download): memory use and step time depend only on the shapes. It
@@ -12,7 +15,14 @@ the frozen decoder-layer weights in host RAM and streams each layer onto the
 GPU while it runs; only the LoRA adapters are trained. The chunked loss keeps
 the 152k-token vocabulary's logits from ever existing in full.
 
-Host RAM needed: about 2 bytes per base parameter (bf16), plus activations.
+TrainStream runs read the weights with trainstream's streaming loader
+(load_model), which quantizes decoder-layer matrices as they are read when
+--quantize is int8 / nf4, or when "auto" finds the bf16 weights would not fit
+in RAM. With --prefer speed, "auto" also picks NF4 when that lets every layer
+stay in VRAM. Quantized runs are not bit-exact with the bf16 base.
+
+Host RAM needed: about 2 bytes per base parameter in bf16 (1.06 int8, 0.56
+NF4), plus activations.
 Writes a JSON summary to --out. With the analytics project present, every
 step also streams to its live UI (--no-ui to turn that off).
 """
@@ -40,6 +50,8 @@ SIZES = {  # Qwen2.5 dense architectures
     "7b": dict(hidden_size=3584, intermediate_size=18944, num_hidden_layers=28, num_attention_heads=28,
                num_key_value_heads=4, tie_word_embeddings=False),
     "14b": dict(hidden_size=5120, intermediate_size=13824, num_hidden_layers=48, num_attention_heads=40,
+                num_key_value_heads=8, tie_word_embeddings=False),
+    "32b": dict(hidden_size=5120, intermediate_size=27648, num_hidden_layers=64, num_attention_heads=40,
                 num_key_value_heads=8, tie_word_embeddings=False),
 }
 
@@ -105,19 +117,33 @@ def main():
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--stock", action="store_true", help="stock Trainer with the model in VRAM, for comparison")
+    ap.add_argument("--quantize", default="auto", choices=["auto", "none", "int8", "nf4"],
+                    help="frozen base weight format (TrainStream runs)")
+    ap.add_argument("--prefer", default="exact", choices=["exact", "speed"],
+                    help="speed: let quantize=auto pick NF4 when it keeps every layer in VRAM")
     ap.add_argument("--out", default=None)
     _live.add_args(ap)
     args = ap.parse_args()
     import peft
 
     t0 = time.perf_counter()
-    if args.model:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
-        name = args.model
+    cfg = Qwen2Config(vocab_size=152064, max_position_embeddings=32768, rope_theta=1e6, **SIZES[args.size])
+    name = args.model or f"Qwen2.5-{args.size.upper()} architecture, random weights"
+    if args.stock:
+        if args.model:
+            model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
+        else:
+            model = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)
     else:
-        cfg = Qwen2Config(vocab_size=152064, max_position_embeddings=32768, rope_theta=1e6, **SIZES[args.size])
-        model = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)
-        name = f"Qwen2.5-{args.size.upper()} architecture, random weights"
+        import tempfile
+        from trainstream.integrations.huggingface import load_model
+        src = args.model
+        if src is None:
+            src = tempfile.mkdtemp(prefix="ts_cfg_")
+            cfg.save_pretrained(src)
+        model = load_model(src, quantize=args.quantize, random_weights=args.model is None)
+        if model._ts_load_info["quantize"]:
+            name += f", {model._ts_load_info['quantize']} base"
     n_base = sum(p.numel() for p in model.parameters())
     print(f"{name}: {n_base / 1e9:.2f}B parameters, {n_base * 2 / GB:.1f} GB in bf16 "
           f"(built in {time.perf_counter() - t0:.0f} s)", flush=True)
@@ -146,7 +172,8 @@ def main():
     if args.stock:
         trainer = Trainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks)
     else:
-        trainer = TrainStreamTrainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks)
+        trainer = TrainStreamTrainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks,
+                                     trainstream={"quantize": args.quantize, "prefer": args.prefer})
     status = "finished"
     try:
         trainer.train()
@@ -167,7 +194,9 @@ def main():
         if session is not None and session.pager is not None:
             st = session.stats()["params"]
             summary.update(paged_blocks=len(st["paged_blocks"]), frozen_pinned_gb=st["frozen_pinned_bytes"] / GB,
-                           frozen_pageable_gb=st["frozen_pageable_bytes"] / GB)
+                           frozen_pageable_gb=st["frozen_pageable_bytes"] / GB, quantize=st.get("quantize"),
+                           quantized_blocks=len(st.get("quantized_blocks", [])),
+                           quantized_gb=st.get("quantized_bytes", 0) / GB)
     print(json.dumps(summary, indent=1))
     if args.out:
         json.dump(summary, open(args.out, "w"), indent=1)

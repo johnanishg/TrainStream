@@ -227,3 +227,99 @@ def test_trainer_takes_a_cpu_model_and_pages_its_layers(tmp_path):
     assert session.pager is not None and len(session.pager.paged) == 4
     assert session.pager.frozen_pinned_bytes + session.pager.frozen_pageable_bytes > 0
     assert losses(ts) == pytest.approx(losses(ref), abs=2e-4)
+
+
+def saved_llama(tmp_path, tie=False, dtype=torch.float32):
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=VOCAB, hidden_size=128, intermediate_size=256, num_hidden_layers=4,
+                      num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128,
+                      tie_word_embeddings=tie)
+    LlamaForCausalLM(cfg).to(dtype).save_pretrained(str(tmp_path / "ckpt"))
+    return str(tmp_path / "ckpt")
+
+
+@pytest.mark.parametrize("tie", [False, True])
+def test_load_model_equals_from_pretrained(tmp_path, tie):
+    from trainstream.integrations.huggingface import load_model
+    d = saved_llama(tmp_path, tie=tie, dtype=torch.bfloat16)
+    ref = LlamaForCausalLM.from_pretrained(d, dtype=torch.bfloat16)
+    model = load_model(d, quantize="none")
+    assert model._ts_load_info["quantize"] is None
+    assert (model.lm_head.weight is model.model.embed_tokens.weight) == tie
+    ids = torch.randint(0, VOCAB, (2, 16))
+    with torch.no_grad():
+        assert torch.equal(ref(ids).logits, model(ids).logits)
+
+
+@pytest.mark.parametrize("kind", ["int8", "nf4"])
+def test_load_model_quantizes_while_reading(tmp_path, kind):
+    from trainstream import quant as Q
+    from trainstream.integrations.huggingface import load_model
+    d = saved_llama(tmp_path, dtype=torch.bfloat16)
+    ref = LlamaForCausalLM.from_pretrained(d, dtype=torch.bfloat16)
+    model = load_model(d, quantize=kind)
+    assert model._ts_load_info["quantized_tensors"] == 4 * 7  # q k v o gate up down per layer
+    for name, p in model.named_parameters():
+        qw = Q.quantized_of(p)
+        if qw is None:
+            assert torch.equal(p, ref.get_parameter(name)), name
+            continue
+        assert p.untyped_storage().nbytes() == 0 and not p.requires_grad and qw.kind == kind
+        q, a = Q.quantize_tensor(ref.get_parameter(name), kind, 64)
+        want = Q.dequantize_reference(q, a, kind, 64, p.numel(), torch.bfloat16).view(p.shape).cpu()
+        assert torch.equal(qw.dequantize().cpu(), want), name
+
+
+def test_load_model_auto_picks_the_most_precise_format_that_fits(tmp_path, monkeypatch):
+    import trainstream.planner as planner
+    from trainstream.integrations.huggingface import load_model
+    d = saved_llama(tmp_path, dtype=torch.bfloat16)
+    numel = sum(p.numel() for p in LlamaForCausalLM.from_pretrained(d).parameters())
+    monkeypatch.setattr(planner, "local_processes", lambda: 1)
+    for ram_factor, want in ((1.1, None), (0.7, "int8"), (0.45, "nf4")):  # RAM as a multiple of the bf16 bytes
+        monkeypatch.setattr(planner, "available_ram_bytes", lambda f=ram_factor: int(f * 2 * numel))
+        model = load_model(d, ram_fraction=1.0)
+        assert model._ts_load_info["quantize"] == want, ram_factor
+    with pytest.raises(ValueError):
+        load_model(d, quantize="fp4")
+
+
+def test_load_model_random_weights_and_overrides(tmp_path):
+    from trainstream.integrations.huggingface import load_model
+    d = saved_llama(tmp_path)
+    model = load_model(d, random_weights=True, quantize="nf4", num_hidden_layers=2)
+    assert len(model.model.layers) == 2 and model._ts_load_info["quantized_tensors"] == 2 * 7
+
+
+@pytest.mark.parametrize("kind", ["int8", "nf4"])
+def test_trainer_qlora_on_loaded_model_matches_dequantized_reference(tmp_path, kind):
+    """load_model(quantize=...) + LoRA + TrainStreamTrainer equals the stock
+    Trainer on a model holding the dequantized base weights."""
+    peft = pytest.importorskip("peft")
+    from trainstream import quant as Q
+    from trainstream.integrations.huggingface import load_model
+    d = saved_llama(tmp_path)
+    model = load_model(d, quantize=kind, dtype=torch.float32)
+    ref_base = LlamaForCausalLM.from_pretrained(d, dtype=torch.float32)
+    for name, p in model.named_parameters():
+        qw = Q.quantized_of(p)
+        if qw is not None:
+            ref_base.get_parameter(name).data.copy_(qw.dequantize().cpu())
+    lora = dict(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0, task_type="CAUSAL_LM")
+    torch.manual_seed(1)
+    ref_model = peft.get_peft_model(ref_base.cuda(), peft.LoraConfig(**lora))
+    model = peft.get_peft_model(model, peft.LoraConfig(**lora))
+    ref_lora = dict(ref_model.named_parameters())
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.copy_(ref_lora[n].cpu())
+    ds = TokenDataset()
+    ref = Trainer(model=ref_model, args=args(tmp_path / "ref", max_steps=6), train_dataset=ds)
+    ref.train()
+    ts = TrainStreamTrainer(model=model, args=args(tmp_path / "ts", max_steps=6), train_dataset=ds,
+                            trainstream={"offload": True, "activation_offload": False})
+    ts.train()
+    session = trainstream.wrapper.unwrap_session(model)
+    assert session.pager is not None and session.pager.quantized_bytes > 0
+    assert losses(ts) == pytest.approx(losses(ref), abs=2e-4)

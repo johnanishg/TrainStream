@@ -4,7 +4,8 @@
     model, optimizer = trainstream.wrap(model, optimizer)
 
 Optimizer state, gradients, a profiled fraction of activations and (when
-needed) the transformer-block weights themselves are moved to host RAM over
+needed) the transformer-block weights themselves (frozen ones optionally
+quantized to int8 / NF4) are moved to host RAM over
 dedicated CUDA copy streams, so models that would not fit in VRAM with a stock
 optimizer can still be trained on a single GPU — or on several, data parallel.
 """
@@ -31,9 +32,10 @@ from .losses import causal_lm_loss, chunked_cross_entropy
 from .optimizer import OffloadAdamW
 from .paging import ParamPager
 from .profiler import HardwareProfile, profile_hardware
+from .quant import quantize_model
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "wrap",
@@ -49,6 +51,7 @@ __all__ = [
     "TrainStreamSession",
     "HardwareProfile",
     "profile_hardware",
+    "quantize_model",
     "find_blocks",
     "pinned_stats",
     "transfer_stats",

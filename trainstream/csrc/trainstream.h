@@ -120,6 +120,14 @@ std::tuple<at::Tensor, EventPtr> h2d_alloc_async(const at::Tensor& src, const Ev
                                                  const std::vector<int64_t>& strides = {});
 std::map<std::string, int64_t> transfer_stats(int device);
 
+// Expand blockwise-quantized weights (kind "nf4" or "int8") into `dst` on the
+// H2D stream, after `after`. `q`/`absmax` may be in host RAM (copied first) or
+// already on the GPU. The returned tensors must stay alive until the event
+// has completed; the consumer waits on the event before using `dst`.
+std::tuple<EventPtr, std::vector<at::Tensor>> dequantize_async(const at::Tensor& dst, const at::Tensor& q,
+                                                               const at::Tensor& absmax, const std::string& kind,
+                                                               int64_t block, const EventPtr& after);
+
 // ---------------------------------------------------------------------------
 // Micro-benchmarks (CUDA-event timed)
 // ---------------------------------------------------------------------------

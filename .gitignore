@@ -7,6 +7,7 @@ env/
 # --- Build outputs ---
 build/
 dist/
+docs/
 *.egg-info/
 # Compiled extension (rebuild with build.bat / python setup.py build_ext --inplace)
 trainstream/_C*.pyd

@@ -65,6 +65,124 @@ def decoder_layers(model: nn.Module):
     return find_blocks(model)
 
 
+def _owner(model: nn.Module, name: str) -> nn.Module:
+    mod = model
+    for part in name.split(".")[:-1]:
+        mod = getattr(mod, part)
+    return mod
+
+
+def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch.bfloat16,
+               quant_block_size: int = 64, random_weights: bool = False, ram_fraction: float = 0.85,
+               trust_remote_code: bool = False, **config_overrides) -> nn.Module:
+    """Load a causal LM for TrainStream training, streaming its checkpoint.
+
+    The model is built with no weights allocated, then its ``.safetensors``
+    files are read one tensor at a time. With ``quantize="int8"`` or ``"nf4"``
+    (or ``"auto"`` when the bf16 weights would not fit in ``ram_fraction`` of
+    the available RAM) every decoder-layer matrix is quantized the moment it
+    is read, so a base larger than RAM never exists in full precision.
+    Quantized weights are frozen: train adapters (PEFT/LoRA) on top.
+
+    Returns the model on the CPU; give it to TrainStreamTrainer or to
+    ``trainstream.wrap(model, optimizer, device="cuda")``.
+
+    ``random_weights=True`` builds the architecture from its config with random
+    weights instead of reading a checkpoint (memory / speed tests at full size
+    without a download). ``config_overrides`` set config fields, e.g.
+    ``num_hidden_layers=4``.
+    """
+    import os
+
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from trainstream import quant as Q
+    from trainstream.optimizer import physical_ram_bytes
+    from trainstream.planner import available_ram_bytes, local_processes
+
+    if quantize is None or quantize is False:
+        quantize = "none"
+    if quantize not in ("auto", "none") + Q.KINDS:
+        raise ValueError(f"quantize must be 'auto', 'none', 'int8' or 'nf4', got {quantize!r}")
+    Q._check("nf4", quant_block_size)
+    cfg = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    for k, v in config_overrides.items():
+        setattr(cfg, k, v)
+    with init_empty_weights(include_buffers=False):
+        model = AutoModelForCausalLM.from_config(cfg, dtype=dtype, trust_remote_code=trust_remote_code)
+    inside = {id(m) for layer in decoder_layers(model) for m in layer.modules()}
+    params = dict(model.named_parameters())  # tied weights appear once
+    elig = {n for n, p in params.items() if p.is_floating_point() and p.dim() >= 2 and p.numel() >= Q.MIN_NUMEL
+            and p.numel() % 2 == 0 and id(_owner(model, n)) in inside}
+    esize = torch.finfo(dtype).bits // 8
+    total = sum(p.numel() for p in params.values()) * esize
+    if quantize == "auto":
+        room = ram_fraction * available_ram_bytes() / local_processes()
+        quantize = "none"
+        if total > room:
+            rest = total - sum(params[n].numel() for n in elig) * esize
+            quantize = "nf4"
+            for kind in ("int8", "nf4"):  # the most precise format that fits
+                if rest + sum(Q.packed_bytes(params[n].numel(), kind, quant_block_size) for n in elig) <= room:
+                    quantize = kind
+                    break
+    ram = physical_ram_bytes()
+    pin_budget = int(0.40 * ram) if ram else 1 << 62
+    qcount = 0
+
+    def put(name: str, value: torch.Tensor) -> None:
+        nonlocal qcount
+        module, attr = _owner(model, name), name.rsplit(".", 1)[-1]
+        old = module._parameters[attr]
+        if quantize in Q.KINDS and name in elig:
+            nb = Q.packed_bytes(value.numel(), quantize, quant_block_size)
+            qw = Q.make_quantized(value.to(dtype), quantize, quant_block_size,
+                                  pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget)
+            holder = nn.Parameter(torch.empty(tuple(value.shape), dtype=dtype), requires_grad=False)
+            Q.attach(holder, qw)
+            module._parameters[attr] = holder
+            qcount += 1
+        else:
+            v = value.to(dtype) if value.is_floating_point() else value
+            module._parameters[attr] = nn.Parameter(v.contiguous(), requires_grad=old.requires_grad and v.is_floating_point())
+
+    if random_weights:
+        std = getattr(cfg, "initializer_range", 0.02)
+        g = torch.Generator().manual_seed(0)
+        for name, p in params.items():
+            if p.dim() >= 2:
+                t = torch.empty(tuple(p.shape)).normal_(0.0, std, generator=g)
+            else:
+                t = (torch.zeros if name.endswith("bias") else torch.ones)(tuple(p.shape))
+            put(name, t)
+            del t
+    else:
+        from safetensors import safe_open
+        if os.path.isdir(name_or_path):
+            folder = name_or_path
+        else:
+            from huggingface_hub import snapshot_download
+            folder = snapshot_download(name_or_path, allow_patterns=["*.safetensors", "*.json"])
+        files = sorted(f for f in os.listdir(folder) if f.endswith(".safetensors"))
+        if not files:
+            raise FileNotFoundError(f"no .safetensors files in {folder}")
+        prefix = getattr(model, "base_model_prefix", "") + "."
+        for f in files:
+            with safe_open(os.path.join(folder, f), framework="pt", device="cpu") as fh:
+                for key in fh.keys():
+                    name = key if key in params else (prefix + key if prefix + key in params else None)
+                    if name is not None and params[name].device.type == "meta":
+                        put(name, fh.get_tensor(key))
+    model.tie_weights()
+    missing = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+    if missing:
+        raise RuntimeError(f"the checkpoint has no values for {len(missing)} parameters, e.g. {missing[:3]}")
+    model._ts_load_info = {"quantize": None if quantize == "none" else quantize,
+                           "quant_block_size": quant_block_size, "quantized_tensors": qcount}
+    return model
+
+
 def wrap_hf(model: nn.Module, optimizer: Optional[torch.optim.Optimizer] = None, **kwargs):
     """``trainstream.wrap`` with the HF decoder stack pre-selected for activation paging."""
     kwargs.setdefault("blocks", decoder_layers(model))

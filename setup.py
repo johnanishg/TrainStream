@@ -1,12 +1,13 @@
 """Build script for TrainStream.
 
-    pip install trainstream --no-build-isolation   # needs PyTorch (CUDA) + CUDA toolkit + C++ compiler
-    python setup.py build_ext --inplace            # from a checkout (Windows: build.bat)
+    pip install trainstream                      # pure-Python wheel; _C compiles on first import
+    python setup.py build_ext --inplace          # from a checkout (Windows: build.bat)
+    pip install . --no-build-isolation           # compile _C ahead of time into the install
 
-TrainStream is a PyTorch C++/CUDA extension, so it is compiled against the
-PyTorch already installed on your machine. Install PyTorch first and pass
---no-build-isolation so pip builds against it (an isolated build environment
-would not contain your CUDA-enabled PyTorch).
+The C++/CUDA sources ship inside the package (trainstream/csrc). Without
+PyTorch at build time (pip's default isolated build, CI) this produces a
+pure-Python wheel and trainstream/_build.py compiles the extension against the
+user's PyTorch on first import. With PyTorch available it compiles _C now.
 
 Target architectures come from TORCH_CUDA_ARCH_LIST when set; otherwise the
 compute capability of every visible GPU is used (e.g. "12.0" for Blackwell).
@@ -19,23 +20,12 @@ from setuptools import find_packages, setup
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Building the compiled module needs torch; packaging the sources (sdist,
-# metadata) does not, so CI machines without a GPU can still publish them.
-COMPILE_COMMANDS = {"build_ext", "bdist_wheel", "build", "install", "develop", "editable_wheel", "bdist_egg"}
-compiling = any(arg in COMPILE_COMMANDS for arg in sys.argv[1:])
-
 try:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-except ImportError as exc:
-    if compiling:
-        raise SystemExit(
-            "TrainStream compiles against your installed PyTorch.\n"
-            "  1. Install a CUDA build of PyTorch, e.g.\n"
-            "       pip install torch --index-url https://download.pytorch.org/whl/cu130\n"
-            "  2. Install TrainStream without build isolation:\n"
-            "       pip install trainstream --no-build-isolation\n"
-            f"(import error: {exc})")
+except ImportError:
+    torch = None
+if os.environ.get("TRAINSTREAM_PURE_WHEEL"):  # force the compile-on-import wheel
     torch = None
 
 
@@ -61,12 +51,12 @@ if torch is not None:
     ext_modules = [CUDAExtension(
         name="trainstream._C",
         sources=[
-            "csrc/bindings.cpp",
-            "csrc/memory_pinner.cpp",
-            "csrc/offload_adamw.cpp",
-            "csrc/offload_adamw_kernel.cu",
+            "trainstream/csrc/bindings.cpp",
+            "trainstream/csrc/memory_pinner.cpp",
+            "trainstream/csrc/offload_adamw.cpp",
+            "trainstream/csrc/offload_adamw_kernel.cu",
         ],
-        include_dirs=[os.path.join(HERE, "csrc")],
+        include_dirs=[os.path.join(HERE, "trainstream", "csrc")],
         extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
     )]
     cmdclass = {"build_ext": BuildExtension.with_options(use_ninja=True)}
@@ -76,7 +66,7 @@ with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="trainstream",
-    version="0.1.0",
+    version="0.1.1",
     author="John Anish G",
     license="Apache-2.0",
     description="Zero-dependency PCIe offloading engine for PyTorch training (optimizer, gradients, activations).",
@@ -86,10 +76,13 @@ setup(
     project_urls={"Source": "https://github.com/johnanishg/TrainStream",
                   "Issues": "https://github.com/johnanishg/TrainStream/issues"},
     packages=find_packages(include=["trainstream", "trainstream.*"]),
+    package_data={"trainstream": ["csrc/*.h", "csrc/*.cpp", "csrc/*.cu"]},
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     python_requires=">=3.9",
-    install_requires=[],  # torch is a build+runtime prerequisite, not a declared dependency
+    # torch is not declared: users must pick the CUDA build that matches their driver.
+    # ninja drives the compile-on-first-import build.
+    install_requires=["ninja"],
     extras_require={"hf": ["transformers", "accelerate", "peft"]},
     classifiers=[
         "Development Status :: 3 - Alpha",

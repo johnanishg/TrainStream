@@ -22,19 +22,26 @@ When a model already fits, TrainStream trades throughput for memory. Its value i
 ## Requirements
 
 - An NVIDIA GPU and a CUDA build of PyTorch
-- The CUDA toolkit matching PyTorch's CUDA major version, and a C++ compiler (MSVC 2022+ on Windows, GCC 11+ on Linux)
-- Tested on Windows 11, PyTorch 2.14.1+cu130, CUDA 13.4, Python 3.14. Linux builds use the same setup but are untested.
+- The CUDA toolkit matching PyTorch's CUDA major version, and a C++ compiler (Visual Studio 2022+ Build Tools with "Desktop development with C++" on Windows, GCC 11+ on Linux)
+- Tested on Windows 11, PyTorch 2.14.1+cu130, CUDA 13.4, Python 3.14. Linux uses the same build path but is untested.
 
 ## Install
 
-TrainStream compiles against the PyTorch you already have, so install PyTorch first and disable build isolation:
-
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install trainstream --no-build-isolation
+pip install torch --index-url https://download.pytorch.org/whl/cu130   # if you don't have CUDA PyTorch yet
+pip install trainstream
 ```
 
-From a checkout: `build.bat` (Windows) or `python setup.py build_ext --inplace`.
+The first `import trainstream` compiles the CUDA extension against your PyTorch (a few minutes, once) and caches it; every later import is instant. On Windows it finds Visual Studio and the CUDA toolkit itself, so any terminal works. The cache is keyed by PyTorch/CUDA/Python version and GPU, so upgrading PyTorch triggers one rebuild.
+
+| Variable | Effect |
+|---|---|
+| `TRAINSTREAM_CACHE_DIR` | where builds are cached (default `%LOCALAPPDATA%\trainstream\build`, Linux `~/.cache/trainstream`) |
+| `TRAINSTREAM_VERBOSE_BUILD=1` | show compiler output |
+| `TORCH_CUDA_ARCH_LIST` | GPU architectures to compile for (default: the GPUs present) |
+| `CUDA_HOME` | CUDA toolkit to use, if it isn't found automatically |
+
+To compile ahead of time instead: `pip install trainstream --no-binary trainstream --no-build-isolation`. From a checkout: `build.bat` (Windows) or `python setup.py build_ext --inplace`.
 
 ## Usage
 

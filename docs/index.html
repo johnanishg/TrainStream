@@ -473,11 +473,13 @@ model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integ
       <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">python -m venv .venv
 .venv\Scripts\activate                     # Linux/macOS: source .venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install setuptools wheel ninja         # build tooling only</pre></div></li>
-    <li><strong>Build the native extension.</strong> On Windows, <code>build.bat</code> loads the MSVC x64 environment, finds the CUDA toolkit and builds in place. Elsewhere, call setup.py directly. The target GPU architecture is detected automatically; set <code>TORCH_CUDA_ARCH_LIST</code> to override it.
-      <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">build.bat                                  # Windows
-python setup.py build_ext --inplace        # Linux
-pip install -e . --no-build-isolation      # optional: install into the environment</pre></div></li>
+pip install trainstream</pre></div></li>
+    <li><strong>Import once to build the native extension.</strong> The first <code>import trainstream</code> compiles the bundled C++/CUDA sources against your PyTorch (a few minutes) and caches the result in <code>%LOCALAPPDATA%\trainstream</code> (Linux: <code>~/.cache/trainstream</code>; override with <code>TRAINSTREAM_CACHE_DIR</code>). Later imports load the cached build instantly. On Windows it finds Visual Studio and the CUDA toolkit by itself, so a normal terminal works. The GPU architecture is detected automatically; set <code>TORCH_CUDA_ARCH_LIST</code> to override it, and <code>TRAINSTREAM_VERBOSE_BUILD=1</code> to see compiler output.
+      <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">python -c "import trainstream"             # first time: compiles, then cached
+
+# from a checkout instead (builds trainstream/_C in place):
+build.bat                                  # Windows
+python setup.py build_ext --inplace        # Linux</pre></div></li>
     <li><strong>Verify.</strong> The test suite checks numerical parity with <code>torch.optim.AdamW</code>, bit-exact activation paging, allocator behaviour and end-to-end training.
       <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">pip install pytest
 python -m pytest tests -q                  # 47 passed (9 need transformers)</pre></div></li>
@@ -641,7 +643,7 @@ print(off.stats)   # packed_bytes, prefetch_hits/misses, dedup_hits, backpressur
   <p>Both optimizer modes reproduce <code>torch.optim.AdamW</code>'s arithmetic order exactly: decoupled decay, <code>lerp</code> for <em>m</em>, <code>addcmul</code> for <em>v</em>, and <code>denom = √v / √(1−β₂ᵗ) + ε</code>. That's why parity comes out at about 3e-7 rather than "close enough".</p>
   <h3>cpu mode: host AdamW</h3>
   <p>Each parameter becomes a <em>slot</em> split into 1M-element chunks. Chunk <em>c</em> of slot <em>s</em> always goes to worker <code>(s·2654435761 + c) mod T</code>, so accumulate → norm → update for any chunk run in FIFO order on one thread without locks. When the last chunk of a slot finishes, its finaliser queues the H2D upload on the h2d stream and publishes the slot's <code>ready</code> event.</p>
-  <div class="code"><div class="bar"><span>csrc/offload_adamw.cpp · inner loop</span><button class="copy">Copy</button></div><pre data-lang="cpp">template &lt;typename G, typename P, bool kStage&gt;
+  <div class="code"><div class="bar"><span>trainstream/csrc/offload_adamw.cpp · inner loop</span><button class="copy">Copy</button></div><pre data-lang="cpp">template &lt;typename G, typename P, bool kStage&gt;
 void adamw_host(float* p, float* m, float* v, const G* g, P* stage,
                 int64_t b, int64_t e, const HostHp&amp; hp) {
   const float decay = 1.0f - hp.lr * hp.weight_decay;
@@ -657,7 +659,7 @@ void adamw_host(float* p, float* m, float* v, const G* g, P* stage,
   <p><strong>Eager updates.</strong> With a single micro-batch and no clipping, the update for a tensor is queued from inside its gradient hook, and reads the pinned DMA staging buffer directly, with no fp32 accumulator round trip. On the 85M model this cut the post-backward drain from 42 ms to 19 ms.</p>
   <h3>gpu mode: zero-copy kernel</h3>
   <p>Moments are allocated with <code>cudaHostAllocMapped</code>, and the kernel dereferences their device aliases directly. Each warp-wide load becomes a PCIe read, so the kernel is bus-bound by design (16 B of traffic per fp32 parameter). It hides about 1–2 µs of PCIe latency by issuing every load for four unrolled elements before consuming any of them:</p>
-  <div class="code"><div class="bar"><span>csrc/offload_adamw_kernel.cu</span><button class="copy">Copy</button></div><pre data-lang="cpp">#pragma unroll
+  <div class="code"><div class="bar"><span>trainstream/csrc/offload_adamw_kernel.cu</span><button class="copy">Copy</button></div><pre data-lang="cpp">#pragma unroll
 for (int u = 0; u &lt; kUnroll; ++u) {             // phase 1: put 4 × 3 host reads in flight
   const int64_t i = base + u * kThreads;
   if (i &lt; n) { g[u] = Cvt&lt;T&gt;::load(grad[i]) * clip; m[u] = exp_avg[i]; v[u] = exp_avg_sq[i];
@@ -760,7 +762,7 @@ print(trainstream.pinned_stats()["by_tag"])     # bytes per buffer kind in page-
   <div class="kicker advanced">Advanced phase</div>
   <h2>Custom stream synchronization with CUDA events</h2>
   <p>TrainStream never calls <code>cudaDeviceSynchronize</code> on the hot path. Every cross-stream dependency is an event, recorded by the producer and waited on by the consumer's stream. Events come from a per-device recycling pool, so thousands per step cost almost nothing. Re-recording a pooled event is safe because <code>cudaStreamWaitEvent</code> snapshots the event's state when it's called.</p>
-  <div class="code"><div class="bar"><span>csrc/memory_pinner.cpp · d2h_async</span><button class="copy">Copy</button></div><pre data-lang="cpp">EventPtr d2h_async(const at::Tensor&amp; dst, const at::Tensor&amp; src) {
+  <div class="code"><div class="bar"><span>trainstream/csrc/memory_pinner.cpp · d2h_async</span><button class="copy">Copy</button></div><pre data-lang="cpp">EventPtr d2h_async(const at::Tensor&amp; dst, const at::Tensor&amp; src) {
   Runtime&amp; rt = runtime(src.get_device());
   auto produced = make_event(dev);
   produced-&gt;record(compute_stream(dev));   // everything that writes src is queued before this
@@ -785,7 +787,7 @@ print(trainstream.pinned_stats()["by_tag"])     # bytes per buffer kind in page-
   <div class="kicker advanced">Advanced phase</div>
   <h2>Custom host memory allocators via the PyTorch C++ API</h2>
   <p><code>cudaHostAlloc</code> is slow (it page-locks memory in the kernel), and activation stashes churn every step, so TrainStream keeps a size-bucketed cache in front of it. Blocks are wrapped as ordinary ATen tensors with <code>at::from_blob</code> and a custom deleter, so they behave like any other tensor in Python.</p>
-  <div class="code"><div class="bar"><span>csrc/memory_pinner.cpp</span><button class="copy">Copy</button></div><pre data-lang="cpp">at::Tensor pinned_empty(const std::vector&lt;int64_t&gt;&amp; sizes, at::ScalarType dtype,
+  <div class="code"><div class="bar"><span>trainstream/csrc/memory_pinner.cpp</span><button class="copy">Copy</button></div><pre data-lang="cpp">at::Tensor pinned_empty(const std::vector&lt;int64_t&gt;&amp; sizes, at::ScalarType dtype,
                         const std::string&amp; tag, bool mapped, bool cached) {
   at::globalContext().lazyInitDevice(at::kCUDA);   // else Tensor.is_pinned() reports false
   void* ptr = PinnedAllocator::get().allocate(nbytes, mapped, cached, tag);
@@ -893,15 +895,16 @@ pagers = [trainstream.ActivationOffloader(s, list(s), offload="auto",
   <div class="kicker reference">Reference</div>
   <h2>Project layout</h2>
   <div class="code"><div class="bar"><span>tree</span><button class="copy">Copy</button></div><pre>setup.py, build.bat           build (CUDAExtension; Windows helper loads MSVC + CUDA)
-csrc/
-  trainstream.h               shared runtime declarations
-  memory_pinner.cpp           event pool, streams, pin-logging allocator, DMA, PCIe/matmul benchmarks
-  offload_adamw.h / .cpp      worker pool, gradient pipeline, host AdamW, engine, AdamW benchmarks
-  offload_adamw_kernel.cu     zero-copy AdamW + grad-norm kernels (CUDA headers only)
-  kernels.h                   torch-free kernel launch interface
-  bindings.cpp                pybind11 module trainstream._C
 trainstream/
-  __init__.py                 public API
+  __init__.py                 public API (loads or compiles _C)
+  _build.py                   compile-on-first-import + build cache
+  csrc/
+    trainstream.h             shared runtime declarations
+    memory_pinner.cpp         event pool, streams, pin-logging allocator, DMA, PCIe/matmul benchmarks
+    offload_adamw.h / .cpp    worker pool, gradient pipeline, host AdamW, engine, AdamW benchmarks
+    offload_adamw_kernel.cu   zero-copy AdamW + grad-norm kernels (CUDA headers only)
+    kernels.h                 torch-free kernel launch interface
+    bindings.cpp              pybind11 module trainstream._C
   wrapper.py                  wrap / unwrap / memory_report
   optimizer.py                OffloadAdamW (torch.optim.Optimizer)
   hooks.py                    readiness hooks, gradient streaming, activation pager + auto tuner

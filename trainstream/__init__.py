@@ -8,22 +8,29 @@ to pinned host RAM over dedicated CUDA copy streams, so models that would not
 fit in VRAM with a stock optimizer can still be trained on a single GPU.
 """
 
-import torch  # noqa: F401  (loads libtorch / c10 before the extension)
+import sys
 
 try:
-    from . import _C  # compiled extension (python setup.py build_ext --inplace)
-except ImportError as _exc:  # pragma: no cover - depends on build state
+    import torch  # noqa: F401  (loads libtorch / c10 before the extension)
+except ImportError as _exc:  # pragma: no cover - depends on the environment
     raise ImportError(
-        "trainstream._C is not built. Run `python setup.py build_ext --inplace` "
-        "(Windows: build.bat) from the repository root. Original error: " + str(_exc)
-    ) from _exc
+        "TrainStream needs PyTorch with CUDA. Install it first, e.g.\n"
+        "    pip install torch --index-url https://download.pytorch.org/whl/cu130") from _exc
+
+try:
+    from . import _C  # prebuilt (build.bat / setup.py build_ext / --no-build-isolation install)
+except ImportError:
+    from . import _build
+
+    _C = _build.load()  # compiled on first import, then loaded from the cache
+    sys.modules[__name__ + "._C"] = _C
 
 from .hooks import ActivationOffloader, GradientOffloader, ParamReadyHooks, find_blocks
 from .optimizer import OffloadAdamW
 from .profiler import HardwareProfile, profile_hardware
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "wrap",

@@ -803,10 +803,10 @@ I^* = F_{{bf16}} / B_{{H2D}}</pre></details>
 # ---- 8. Implementation ----
 body.append(section("impl", "Artifact", "Implementation", tbl(
     ["Component", "File", "Notes"],
-    [("Runtime: event pool, streams, pinned allocator, DMA, PCIe/matmul benchmarks", "<code>csrc/memory_pinner.cpp</code>", "C++ (C++17 features; compiled as C++20 because PyTorch 2.14 headers require it)"),
-     ("Optimizer engine: worker pool, gradient pipeline, host AdamW, eager path", "<code>csrc/offload_adamw.cpp/.h</code>", "templated on gradient and parameter dtype; branch-free inner loop"),
-     ("Zero-copy AdamW + grad-norm kernels", "<code>csrc/offload_adamw_kernel.cu</code>", "CUDA headers only; 4-way unroll, load-first"),
-     ("Bindings", "<code>csrc/bindings.cpp</code>", "pybind11 via torch/extension.h; GIL released on blocking calls; terminate hook prints C++ errors"),
+    [("Runtime: event pool, streams, pinned allocator, DMA, PCIe/matmul benchmarks", "<code>trainstream/csrc/memory_pinner.cpp</code>", "C++ (C++17 features; compiled as C++20 because PyTorch 2.14 headers require it)"),
+     ("Optimizer engine: worker pool, gradient pipeline, host AdamW, eager path", "<code>trainstream/csrc/offload_adamw.cpp/.h</code>", "templated on gradient and parameter dtype; branch-free inner loop"),
+     ("Zero-copy AdamW + grad-norm kernels", "<code>trainstream/csrc/offload_adamw_kernel.cu</code>", "CUDA headers only; 4-way unroll, load-first"),
+     ("Bindings", "<code>trainstream/csrc/bindings.cpp</code>", "pybind11 via torch/extension.h; GIL released on blocking calls; terminate hook prints C++ errors"),
      ("Python API", "<code>trainstream/wrapper.py, optimizer.py, hooks.py, profiler.py</code>", "<code>wrap()</code>, <code>OffloadAdamW</code> (a real torch.optim.Optimizer), pager + tuner, profiler"),
      ("Hugging Face", "<code>trainstream/integrations/huggingface.py</code>", "<code>TrainStreamTrainer</code>, <code>wrap_hf</code>; optional dependency"),
      ("Harness", "<code>dashboard/</code>, <code>examples/verify_ram_offload.py</code>, <code>examples/hf_finetune.py</code>", "one-click comparison reports, verification verdicts"),

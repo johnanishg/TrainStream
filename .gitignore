@@ -39,3 +39,11 @@ dashboard/reports/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- Personal tools and notes (kept locally, not part of the library) ---
+# Live analytics reference project (train.py + UI)
+trainstream-analytics/
+# Development dashboard and research-paper material
+dashboard/
+start_dashboard.bat
+research/

@@ -189,7 +189,6 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
       <li><a href="#first-run">Your first fine-tune</a></li>
       <li><a href="#huggingface">Hugging Face transformers</a></li>
       <li><a href="#terms">Key terminology</a></li>
-      <li><a href="#dashboard">Live dashboard</a></li>
     </ul></div>
   <div class="group"><button class="gtitle">Intermediate <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
     <ul>
@@ -401,7 +400,7 @@ model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integ
 <section id="results">
   <div class="kicker overview">Overview</div>
   <h2>Measured results</h2>
-  <p>A byte-level GPT is trained on Python's standard-library source with bf16 autocast, batch 8 × 512 tokens, on the development machine above. Every figure comes from the live dashboard or the test harness in this repository.</p>
+  <p>A byte-level GPT is trained on Python's standard-library source with bf16 autocast, batch 8 × 512 tokens, on the development machine above. Every figure comes from the benchmark runs or the test harness in this repository.</p>
   <div class="tbl"><table>
     <tr><th>Model</th><th>Engine</th><th class="num">Peak VRAM</th><th class="num">Step time</th><th class="num">Tokens/s</th><th>Notes</th></tr>
     <tr><td>85M fp32</td><td>torch AdamW (fused)</td><td class="num">2.47 GiB</td><td class="num">44 ms</td><td class="num">92.5k</td><td>baseline</td></tr>
@@ -575,21 +574,6 @@ model, optimizer = wrap_hf(model, torch.optim.AdamW(model.parameters(), lr=2e-5)
   </dl>
 </section>
 
-<section id="dashboard">
-  <div class="kicker beginner">Beginner phase</div>
-  <h2>Live dashboard</h2>
-  <p>The repository ships a real-time test interface. It trains actual models on your GPU and streams measurements to the browser. It needs nothing beyond the Python standard library and TrainStream itself.</p>
-  <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">python dashboard/server.py           # then open http://127.0.0.1:8765</pre></div>
-  <ul>
-    <li><strong>One-click full report (default):</strong> pick a model and press <em>Start full report</em>. The dashboard verifies the optimizer math, then runs TensorFlow + AdamW, PyTorch + stock AdamW and PyTorch + TrainStream (optionally TrainStream zero-copy) on identical settings, and produces one report: a headline, PASS/FAIL verdicts (fits or not, VRAM saved, state in RAM, no hidden spill, same loss), a results table, loss and VRAM charts, and cause-specific recommendations. Reports are saved under <code>dashboard/reports/</code> as HTML and JSON. Example result on the 1.2B model: stock AdamW stopped at the VRAM limit after 2 steps, while TrainStream completed all 30 steps with 13.7 GiB peak VRAM and 18.0 GiB of optimizer state in system RAM.</li>
-    <li><strong>Clear and Fresh restart</strong> (header buttons): <em>Clear</em> wipes runs, charts, the log and the current report for every viewer, optionally releasing cached GPU and pinned memory and deleting saved reports. <em>Fresh restart</em> stops any job, ends leftover TensorFlow workers and restarts the server in a new process, returning all of its VRAM and pinned RAM (in testing: 6.5 GiB → 0.8 GiB in about 5 s); the page reloads by itself. The restarted server logs to <code>%TEMP%\trainstream-dashboard.log</code>.</li>
-    <li><strong>Training runs:</strong> pick a GPT preset from 20M to 1.8B parameters and run TrainStream, stock AdamW, or both back to back for a side-by-side comparison. Loss, held-out loss, throughput, step time and peak VRAM update every step.</li>
-    <li><strong>Live telemetry</strong> (2 Hz): bytes/s on TrainStream's copy streams, VRAM, pinned memory by tag, GPU utilisation and power.</li>
-    <li><strong>Engine internals:</strong> host AdamW time, forward waits on weights, which activation blocks are paged, and prefetch hit rate.</li>
-    <li><strong>Profiler and verification:</strong> run the hardware micro-benchmarks, the parity check against <code>torch.optim.AdamW</code>, and a 100M-parameter optimizer benchmark from the page.</li>
-  </ul>
-</section>
-
 <hr>
 
 <!-- ======================================================= INTERMEDIATE -->
@@ -746,8 +730,8 @@ python examples/verify_ram_offload.py --engine baseline --gpt xxl-1.8B --vram-ca
   <ol class="steps">
     <li><strong>Make the driver fail loudly instead of spilling (optional).</strong> NVIDIA Control Panel → Manage 3D settings → <em>CUDA – Sysmem Fallback Policy</em> → <em>Prefer No Sysmem Fallback</em>. Stock runs that don't fit then raise out-of-memory instead of crawling. Reset it afterwards if other apps rely on it.</li>
     <li><strong>Open Task Manager → Performance → GPU</strong> and watch <em>Dedicated GPU memory</em> (VRAM) and <em>Shared GPU memory</em>. In <em>Details</em>, add the "Dedicated GPU memory" and "Shared GPU memory" columns to see them per process.</li>
-    <li><strong>Run stock AdamW on a model that doesn't fit</strong> (dashboard: <code>xxl-1.8B</code>, engine Baseline). Dedicated memory pins at the card's capacity and shared memory climbs by many GB: that's the driver spill.</li>
-    <li><strong>Run TrainStream on the same model.</strong> Dedicated memory stays well below capacity. Shared memory roughly equals the dashboard's <em>Pinned host RAM</em> figure, and the dashboard's PCIe chart shows gigabytes moving every step.</li>
+    <li><strong>Run stock AdamW on a model that doesn't fit</strong> (e.g. <code>python examples/verify_ram_offload.py</code>, which runs both engines). Dedicated memory pins at the card's capacity and shared memory climbs by many GB: that's the driver spill.</li>
+    <li><strong>Run TrainStream on the same model.</strong> Dedicated memory stays well below capacity. Shared memory roughly equals <code>trainstream.pinned_stats()["live_bytes"]</code>, and <code>trainstream.transfer_stats()</code> shows gigabytes moving every step.</li>
     <li><strong>Inspect a moment tensor yourself:</strong>
       <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">master, m, v = optimizer.engine.state(0)        # slot 0 = first trainable parameter
 print(m.device, m.is_pinned(), m.abs().mean())  # cpu True &lt;non-zero after a step&gt;
@@ -917,9 +901,6 @@ tests/
   test_optimizer.py           parity, eager/accumulation, dtypes, state dicts, migration
   test_offload.py             allocator, DMA ordering, paging exactness and leaks, profiler, wrap()
   test_huggingface.py         Trainer parity, paging, LoRA, checkpoint resume (skipped without transformers)
-dashboard/
-  server.py, trainer.py       standard-library HTTP + SSE server running real GPU jobs
-  model.py, index.html        byte-level GPT + stdlib corpus, live UI
 docs/index.html               this page</pre></div>
 </section>
 
@@ -937,7 +918,7 @@ docs/index.html               this page</pre></div>
   </ul>
 </section>
 
-<footer>TrainStream 0.1.0 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and the dashboard to reproduce them on yours.</footer>
+<footer>TrainStream 0.1.1 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and <code>examples/verify_ram_offload.py</code> to check them on yours.</footer>
 </div>
 </main>
 

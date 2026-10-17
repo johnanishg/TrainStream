@@ -17,7 +17,7 @@ TrainStream is a C++/CUDA extension for PyTorch. It keeps only the weights in VR
 | Qwen2.5-1.5B full fine-tune (Hugging Face Trainer) | 35.9 GiB peak (spill), 111.7 s / 10 steps | 18.7 GiB, 28.5 s / 10 steps, same losses |
 | 85M GPT (fits either way) | 2.5 GiB, ~94k tokens/s | 1.8 GiB, ~64k tokens/s |
 
-When a model already fits, TrainStream trades throughput for memory. Its value is training what does not fit, or freeing VRAM for larger batches. All numbers come from a single machine; see `research/research_dossier.html` for methodology and caveats.
+When a model already fits, TrainStream trades throughput for memory. Its value is training what does not fit, or freeing VRAM for larger batches. All numbers come from a single machine (RTX 5090 Laptop, Windows 11).
 
 ## Requirements
 
@@ -72,10 +72,9 @@ Use `bf16=True` or fp32; fp16 with loss scaling is not supported.
 
 ## Tools in this repository
 
-- `start_dashboard.bat` — live dashboard: one-click comparison reports (stock AdamW vs TrainStream), real-time VRAM / RAM / PCIe charts
 - `examples/verify_ram_offload.py` — proves where training memory lives (VRAM vs system RAM) with a PASS/FAIL verdict
 - `examples/hf_finetune.py` — fine-tune a Hugging Face model, optionally side by side with the stock Trainer
-- `docs/index.html` — full documentation; `research/` — research dossier with all measurements
+- `docs/index.html` — full documentation
 
 ## Limitations
 

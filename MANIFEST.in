@@ -1,8 +1,6 @@
 include README.md LICENSE NOTICE pyproject.toml setup.py build.bat
 recursive-include trainstream/csrc *.h *.cpp *.cu
 recursive-include trainstream *.py
-prune dashboard
-prune research
 prune runs
 prune build
 global-exclude *.py[cod] __pycache__ *.pyd *.so

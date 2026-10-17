@@ -7,7 +7,10 @@ The model is built on the CPU and handed to trainstream.wrap(device="cuda",
 param_offload=True): every transformer block's weights go straight to host RAM
 and are streamed onto the GPU only while that block runs (forward and
 backward). Optimizer state and gradients live in host RAM as usual, and
-activations are paged automatically. ``--vram-gb`` caps PyTorch's allocator
+activations are paged automatically. The data is real text (the Python
+standard library's source, as bytes), so the loss curve is a real one; with
+the analytics project present every step also streams to its live UI.
+``--vram-gb`` caps PyTorch's allocator
 (torch.cuda.set_per_process_memory_fraction) to show the run staying inside a
 GPU smaller than the model.
 
@@ -24,6 +27,9 @@ from torch import nn
 from torch.nn import functional as F
 
 import trainstream
+
+import _live
+from _gpt import ByteCorpus
 
 
 class Block(nn.Module):
@@ -69,6 +75,7 @@ def main():
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--vram-gb", type=float, default=4.0)
     ap.add_argument("--moments", default="bf16", choices=["fp32", "bf16"])
+    _live.add_args(ap)
     args = ap.parse_args()
 
     dev = torch.cuda.current_device()
@@ -85,19 +92,37 @@ def main():
     pager = trainstream.wrapper.unwrap_session(model).pager
     print(f"paged {len(pager.paged)} of {pager.n} blocks ({pager.bytes_paged / 1e9:.1f} GB of weights in host RAM)")
 
-    data = torch.randint(0, 256, (64, args.seq + 1), device="cuda")
-    for step in range(1, args.steps + 1):
-        torch.cuda.reset_peak_memory_stats()
-        t0 = time.perf_counter()
-        batch = data[torch.randint(0, 64, (args.batch,))]
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = model(batch[:, :-1], batch[:, 1:])
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-        torch.cuda.synchronize()
-        print(f"step {step:3d}  loss {loss.item():.3f}  {time.perf_counter() - t0:6.2f} s  "
-              f"peak VRAM {torch.cuda.max_memory_allocated() / 1e9:5.2f} GB")
+    size = f"{n / 1e9:.1f}B" if n >= 1e9 else f"{n / 1e6:.0f}M"
+    live = _live.open_run(args, f"bigger-than-vram-{size}-cap{args.vram_gb:g}GB")
+    live.start(model, "trainstream",
+               model_info={"preset": f"GPT {n / 1e9:.2f}B", "params": n, "n_layer": args.layers,
+                           "d_model": args.d_model, "n_head": args.heads},
+               train_info={"batch": args.batch, "seq": args.seq, "steps": args.steps, "lr": 3e-4,
+                           "tokens_per_step": args.batch * args.seq, "dtype": "bf16 autocast, fp32 weights"})
+    corpus = ByteCorpus("cuda")
+    status = "finished"
+    try:
+        for step in range(1, args.steps + 1):
+            live.begin_step()
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            x, y = corpus.batch(args.batch, args.seq)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+            torch.cuda.synchronize()
+            live.end_step(step, loss=loss.item(), tokens=args.batch * args.seq)
+            print(f"step {step:3d}  loss {loss.item():.3f}  {time.perf_counter() - t0:6.2f} s  "
+                  f"peak VRAM {torch.cuda.max_memory_allocated() / 1e9:5.2f} GB")
+    except torch.OutOfMemoryError as exc:
+        status = "out of memory"
+        live.event("CUDA out of memory", detail=str(exc).splitlines()[0])
+        raise
+    finally:
+        live.finish(status)
+    _live.keep_serving(args, live)
 
 
 if __name__ == "__main__":

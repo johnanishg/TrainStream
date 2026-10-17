@@ -18,7 +18,7 @@ TrainStream is a C++/CUDA extension for PyTorch. It keeps only the weights in VR
 | 1.8B GPT, weights paged to RAM (0.2) | — | 2.4 GiB peak, 2.1 s/step; 1.84 GiB inside a 4 GB VRAM cap with bf16 moments |
 | 3.6B GPT full fine-tune (all parameters trained) | needs ~58 GB of VRAM | 3.1 GiB peak, 3.15 s/step, 30 GiB of host RAM |
 | LoRA r=16 on the Qwen2.5-7B architecture (random weights) | 20.3 GB peak, 0.27 s/step | 4.6 GB peak, 1.25 s/step |
-| LoRA r=16 on the Qwen2.5-14B architecture (random weights; 29.5 GB) | does not fit | 5.6 GB peak, 2.48 s/step, 36 GB of host RAM |
+| LoRA r=16 on Qwen2.5-14B (29.5 GB of weights) | does not fit | 1.37 s/step: the memory planner keeps 28 of 48 layers in VRAM (19.9 GiB peak) and streams 20 from RAM |
 | 85M GPT (fits either way) | 2.55 GiB, 43.7 ms/step | `offload="auto"` switches to stock fused AdamW: 2.56 GiB, 43.8 ms/step |
 
 Offloading costs throughput when a model already fits, which is why `offload="auto"` measures two steps and then switches to plain fused GPU AdamW if offloading isn't needed. TrainStream's value is training what does not fit, or freeing VRAM for larger batches. All numbers come from a single machine (RTX 5090 Laptop, Windows 11).
@@ -27,7 +27,7 @@ Offloading costs throughput when a model already fits, which is why `offload="au
 
 - An NVIDIA GPU and a CUDA build of PyTorch
 - The CUDA toolkit matching PyTorch's CUDA major version, and a C++ compiler (Visual Studio 2022+ Build Tools with "Desktop development with C++" on Windows, GCC 11+ on Linux)
-- Tested on Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14) and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1+cu130, CUDA 13.3, GCC 13.3, Python 3.12): all 78 tests pass on both, RTX 5090 Laptop GPU. Native Linux and other GPUs are untested.
+- Tested on Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14) and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1+cu130, CUDA 13.3, GCC 13.3, Python 3.12): all 89 tests pass on both, RTX 5090 Laptop GPU. Native Linux and other GPUs are untested.
 
 ## Install
 
@@ -78,9 +78,10 @@ model, optimizer = trainstream.wrap(model, optimizer, device="cuda",
 | `wrap()` option | What it does |
 |---|---|
 | `offload="auto"` | switches to stock fused AdamW after 2 steps if the model fits (`True` always offloads) |
-| `param_offload="auto"` | pages block weights to host RAM when they'd take more than half the GPU; `True`, a fraction, or block indices |
+| `param_offload="auto"` | memory planner: measures the VRAM and RAM of the machine it runs on, keeps as many transformer blocks resident as fit, pages the rest, and refines the split from the first steps' measured peaks; `True`, a fraction, or block indices fix it |
 | `activation_offload="auto"` | pages a profiled share of activations (`True`, a fraction, `False`) |
-| `moment_dtype="bfloat16"` | bf16 optimizer moments with stochastic rounding: half the host memory for them |
+| `moment_dtype="auto"` | fp32 optimizer moments, or bf16 (stochastic rounding, half the memory) when fp32 wouldn't fit in RAM |
+| `check_memory=True` | refuse at `wrap()` with a clear explanation when the run can't fit in RAM/VRAM |
 | `distributed` | data parallel when a `torch.distributed` group with more than 1 rank exists; gradients averaged on the host over gloo |
 | `max_grad_norm`, `accumulation_steps` | clipping and gradient accumulation, done inside the optimizer |
 

@@ -66,7 +66,7 @@ with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="trainstream",
-    version="0.2.0",
+    version="0.3.0",
     author="John Anish G",
     license="Apache-2.0",
     description="Zero-dependency PCIe offloading engine for PyTorch training (optimizer, gradients, activations).",

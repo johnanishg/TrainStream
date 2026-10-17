@@ -168,7 +168,7 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
   </button>
   <div class="brand">TrainStream <span>docs</span></div>
   <div class="spacer"></div>
-  <span class="pill opt">v0.2.0</span>
+  <span class="pill opt">v0.3.0</span>
   <span class="pill opt">C++ · CUDA · ATen</span>
   <span class="pill">zero dependencies</span>
 </header>
@@ -201,6 +201,7 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
       <li><a href="#tuning">Profile-driven tuning</a></li>
       <li><a href="#verify">Prove it uses system RAM</a></li>
       <li><a href="#param-paging">Parameter paging</a></li>
+      <li><a href="#planner">Automatic memory planning</a></li>
       <li><a href="#extras">Chunked loss and bf16 moments</a></li>
     </ul></div>
   <div class="group"><button class="gtitle">Advanced <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
@@ -517,7 +518,8 @@ model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integ
     <tr><td>Full fine-tune, GPT, fp32 weights, bf16 moments, batch 2 × 512</td><td class="num">3.63B (all trained)</td><td class="num">3.06 GiB</td><td class="num">3.15 s</td><td class="num">29.7 GiB state, 33.9 GiB process</td><td>32 of 32 blocks paged; validation loss 6.65 → 4.00 over 15 steps. Stock AdamW would need about 58 GB of VRAM.</td></tr>
     <tr><td>LoRA r=16, Qwen2.5-7B architecture, stock Trainer + PEFT</td><td class="num">7.62B (40.4M trained)</td><td class="num">20.3 GB</td><td class="num">0.27 s</td><td class="num">2.9 GB process</td><td>whole bf16 model in VRAM</td></tr>
     <tr><td>LoRA r=16, Qwen2.5-7B architecture, TrainStreamTrainer</td><td class="num">7.62B (40.4M trained)</td><td class="num">4.6 GB</td><td class="num">1.25 s</td><td class="num">20.2 GB process</td><td>model passed on the CPU; 28 of 28 layers paged, 13.1 GB pinned</td></tr>
-    <tr><td>LoRA r=16, Qwen2.5-14B architecture, TrainStreamTrainer</td><td class="num">14.77B (68.8M trained)</td><td class="num">5.6 GB</td><td class="num">2.48 s</td><td class="num">36.2 GB process</td><td>29.5 GB of bf16 weights, more than the GPU holds; 48 of 48 layers paged, 26.1 GB pinned and 0.3 GB pageable past the pin budget</td></tr>
+    <tr><td>LoRA r=16, real Qwen2.5-14B checkpoint, TrainStreamTrainer + memory planner</td><td class="num">14.77B (68.8M trained)</td><td class="num">19.9 GiB</td><td class="num">1.37 s</td><td class="num">20.5 GB process</td><td>28 of 48 layers resident, 20 paged (<a href="#planner">details</a>)</td></tr>
+    <tr><td>LoRA r=16, Qwen2.5-14B architecture, every layer paged</td><td class="num">14.77B (68.8M trained)</td><td class="num">5.6 GB</td><td class="num">2.48 s</td><td class="num">36.2 GB process</td><td>29.5 GB of bf16 weights, more than the GPU holds; 48 of 48 layers paged, 26.1 GB pinned and 0.3 GB pageable past the pin budget</td></tr>
   </table></div>
   <p>The LoRA runs use the exact Qwen2.5 layer shapes with random weights (<code>examples/lora_large_model.py</code>; pass <code>--model</code> for a real checkpoint), batch 1 × 512, a 152,064-token vocabulary and the chunked loss. Memory and time depend only on the shapes, so the losses mean nothing here. Correctness is covered by the test suite: <code>test_trainer_takes_a_cpu_model_and_pages_its_layers</code> matches the stock Trainer step for step. In the 3.6B run the training loss jumped from 6.18 to 23.9 at step 2 and was back on trend by step 5. The 1.8B model does the same (6.10 → 13.09) with the unpaged code path too, and the paged and unpaged 1.8B runs are identical step for step, so the jump is the first Adam step of this model, not paging.</p>
   <div class="tbl"><table>
@@ -551,6 +553,7 @@ model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integ
     <tr><td>Chunked output layer + loss</td><td><span class="yes">yes</span></td><td><code>chunked_cross_entropy</code>; used by <code>TrainStreamTrainer</code></td></tr>
     <tr><td>bf16 optimizer moments</td><td><span class="yes">yes</span></td><td>stochastic rounding, host and zero-copy paths</td></tr>
     <tr><td>Data parallel (multi-process)</td><td><span class="yes">yes</span></td><td>gradients averaged on the host over gloo (<a href="#distributed">details</a>)</td></tr>
+    <tr><td>Automatic VRAM / RAM planning</td><td><span class="yes">yes</span></td><td><code>planner.py</code>: measured budget, block split, moment precision, live refinement, watchdog</td></tr>
     <tr><td>Automatic resident mode</td><td><span class="yes">yes</span></td><td><code>offload="auto"</code>: fused GPU AdamW when the model fits</td></tr>
     <tr><td>Weights read outside their module</td><td><span class="yes">yes</span></td><td>parameter guard waits for in-flight updates</td></tr>
     <tr><td><code>.to()</code> / <code>.half()</code> after wrap</td><td><span class="yes">yes</span></td><td>engine rebuilt, optimizer state carried over</td></tr>
@@ -605,7 +608,7 @@ build.bat                                  # Windows
 python setup.py build_ext --inplace        # Linux</pre></div></li>
     <li><strong>Verify.</strong> The test suite checks numerical parity with <code>torch.optim.AdamW</code>, bit-exact activation paging, allocator behaviour and end-to-end training.
       <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">pip install pytest
-python -m pytest tests -q                  # 78 passed (12 need transformers)</pre></div></li>
+python -m pytest tests -q                  # 89 passed (12 need transformers)</pre></div></li>
     <li><strong>Look at your hardware.</strong>
       <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">import trainstream
 print(trainstream.profile_hardware().summary())</pre></div></li>
@@ -882,7 +885,32 @@ print(trainstream.pinned_stats()["by_tag"])     # bytes per buffer kind in page-
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 model, optimizer = trainstream.wrap(model, optimizer, device="cuda",
                                     param_offload=True, moment_dtype="bfloat16")</pre></div>
-  <p><code>param_offload="auto"</code> (the default) pages when the weights would take more than half of the GPU, or a <code>set_per_process_memory_fraction</code> cap. <code>True</code> pages every block, and a fraction or a list of indices pages some. Paging needs <code>optimizer_mode="cpu"</code>. When weights are paged, automatic activation paging pages every block from the first step instead of calibrating, because calibration needs all activations resident. Each paged weight crosses PCIe twice per step, once for forward and once for backward. <code>examples/lora_large_model.py</code> fine-tunes a 14.8B-parameter base (<a href="#scale">results</a>). <code>examples/train_bigger_than_vram.py</code> trains the 1.8B model, 7.3 GB of fp32 weights, inside a 4 GB VRAM cap (measured: peak 1.84 GiB, 1.84 s per step).</p>
+  <p><code>param_offload="auto"</code> (the default) lets the <a href="#planner">memory planner</a> choose how many blocks stay resident. <code>True</code> pages every block, and a fraction or a list of indices fixes the split (spread through the stack). Paging needs <code>optimizer_mode="cpu"</code>. When weights are paged, automatic activation paging pages every block from the first step instead of calibrating, because calibration needs all activations resident. Each paged weight crosses PCIe twice per step, once for forward and once for backward. <code>examples/lora_large_model.py</code> fine-tunes a 14.8B-parameter base (<a href="#scale">results</a>). <code>examples/train_bigger_than_vram.py</code> trains the 1.8B model, 7.3 GB of fp32 weights, inside a 4 GB VRAM cap (measured: peak 1.84 GiB, 1.84 s per step).</p>
+</section>
+
+<section id="planner">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Automatic memory planning</h2>
+  <p>Nothing about the machine is assumed. When <code>wrap()</code> runs, it measures:</p>
+  <ul>
+    <li>the VRAM this process may use: free device memory minus other processes, capped by <code>set_per_process_memory_fraction</code></li>
+    <li>the physical RAM available now and the page-lock budget (40% of RAM), shared between the training processes on the machine (<code>LOCAL_WORLD_SIZE</code>)</li>
+    <li>the bytes of every transformer block and of everything outside them, split into trained and frozen weights</li>
+  </ul>
+  <p>Then it plans:</p>
+  <ol class="steps">
+    <li><strong>Weights.</strong> As many blocks as fit stay resident. The fixed parts, a transfer window and an activation reserve are set aside first, along with a 10% safety margin (<code>vram_headroom</code>). The rest are paged, spread evenly through the stack so each paged block's copy overlaps the compute of the resident blocks before it. On a card where everything fits, nothing is paged and no paging machinery is installed.</li>
+    <li><strong>Optimizer precision.</strong> With <code>moment_dtype="auto"</code> the moments are fp32 unless fp32 moments wouldn't fit in the available RAM; then they're bf16 with stochastic rounding.</li>
+    <li><strong>Feasibility.</strong> If the host state can't fit in RAM, or the parts that must stay on the GPU can't fit even with every block paged, <code>wrap()</code> raises <code>MemoryError</code> with the numbers and the options, instead of swapping or dying mid-run. <code>check_memory=False</code> skips the check.</li>
+    <li><strong>Measured refinement.</strong> During the first steps the real peak VRAM of each step decides the next move. With a block or more of headroom, blocks move into VRAM. Within 5% of the budget, blocks move out. Two steady steps settle the plan. If every block ends up resident and the measured activations fit too, activation paging is switched off. After that a watchdog pages one more block whenever a later step (longer sequences, a larger batch) eats into the safety margin.</li>
+  </ol>
+  <p>Blocks move between VRAM and RAM between steps. The optimizer's update ordering is preserved, and paged and unpaged training are bit-identical (<code>test_blocks_move_between_vram_and_ram_mid_training_without_changing_results</code>, <code>test_auto_plan_under_a_vram_cap_finds_the_split_and_trains_correctly</code>). Every decision appears in <code>memory_report(model)["events"]</code>.</p>
+  <div class="tbl"><table>
+    <tr><th>LoRA r=16 on Qwen2.5-14B (real checkpoint), batch 1 × 512, 24 GB GPU, 64 GB RAM</th><th class="num">Layers resident</th><th class="num">Step time</th><th class="num">Peak VRAM</th><th class="num">Process RAM</th><th class="num">Copied to GPU per step</th></tr>
+    <tr><td>Every layer paged (the 0.2 rule)</td><td class="num">0 of 48</td><td class="num">2.61 s</td><td class="num">5.2 GiB</td><td class="num">36.2 GB</td><td class="num">≈ 50 GB</td></tr>
+    <tr><td>Memory planner</td><td class="num">28 of 48</td><td class="num">1.37 s</td><td class="num">19.9 GiB</td><td class="num">20.5 GB</td><td class="num">26.6 GB</td></tr>
+  </table></div>
+  <p>Planner log for that run: budget 22.6 GiB usable VRAM and 17.7 GiB of free RAM, with the CPU-loaded model occupying the rest. It started with 21 layers resident. After step 1 it saw a 15.7 GiB peak against a 20.4 GiB target and moved 7 more layers in, then settled at 28 resident and 20 paged (10.4 GiB streamed from RAM). The same code adapts to much smaller budgets. With the test model's eight 50 MB blocks, it settled at 5 of 8 resident under a 450 MB cap, 2 of 8 under 350 MB, and all paged under 280 MB, with no out-of-memory in any of them.</p>
 </section>
 
 <section id="extras">
@@ -1025,9 +1053,11 @@ model, optimizer = trainstream.wrap(model, torch.optim.AdamW(model.parameters(),
     <tr><td><code>optimizer_mode</code></td><td>"cpu"</td><td>"cpu", "gpu" or "auto"</td></tr>
     <tr><td><code>offload</code></td><td>"auto"</td><td>"auto": switch to fused GPU AdamW after 2 steps if the model fits; True: always offload</td></tr>
     <tr><td><code>activation_offload</code></td><td>"auto"</td><td>"auto", a fraction, True or False</td></tr>
-    <tr><td><code>param_offload</code></td><td>"auto"</td><td>page block weights to host RAM: "auto", True, False, a fraction, or block indices</td></tr>
+    <tr><td><code>param_offload</code></td><td>"auto"</td><td>"auto": the memory planner keeps as many blocks resident as VRAM allows; True, False, a fraction, or block indices fix it</td></tr>
     <tr><td><code>device</code></td><td>None</td><td>target GPU when the model is passed on the CPU</td></tr>
-    <tr><td><code>moment_dtype</code></td><td>"float32"</td><td>"float32" or "bfloat16" (stochastic rounding)</td></tr>
+    <tr><td><code>moment_dtype</code></td><td>"auto"</td><td>"auto" (fp32 unless that wouldn't fit in RAM), "float32" or "bfloat16" (stochastic rounding)</td></tr>
+    <tr><td><code>vram_headroom</code></td><td>0.10</td><td>share of usable VRAM the planner keeps free</td></tr>
+    <tr><td><code>check_memory</code></td><td>True</td><td>raise <code>MemoryError</code> at wrap() when the run can't fit, with numbers and options</td></tr>
     <tr><td><code>distributed</code></td><td>auto</td><td>data parallel when a process group with &gt; 1 rank is initialized</td></tr>
     <tr><td><code>guard_params</code></td><td>True</td><td>wait for in-flight updates wherever a weight is read</td></tr>
     <tr><td><code>blocks</code></td><td>auto-detected</td><td>the repeated layer stack (largest same-typed ModuleList/Sequential)</td></tr>
@@ -1102,11 +1132,11 @@ docs/index.html               this page</pre></div>
     <li>fp16 with a GradScaler isn't supported (use bf16 or fp32). AMSGrad and <code>maximize</code> aren't supported.</li>
     <li>For small models that fit, offloading costs throughput. <code>offload="auto"</code> avoids it by switching to resident mode after two steps.</li>
     <li><code>torch.compile</code> has not been tested with TrainStream's hooks.</li>
-    <li>Tested on Windows 11 (PyTorch 2.14.1 + CUDA 13.4, MSVC, Python 3.14) and on Linux: Ubuntu 24.04 under WSL2 (PyTorch 2.14.1+cu130, CUDA toolkit 13.3, GCC 13.3, Python 3.12), with a plain <code>pip install</code> of the 0.2.0 wheel. All 78 tests pass on both, on an RTX 5090 Laptop GPU (sm_120). Native Linux (not WSL) and other GPUs haven't been tested.</li>
+    <li>Tested on Windows 11 (PyTorch 2.14.1 + CUDA 13.4, MSVC, Python 3.14) and on Linux: Ubuntu 24.04 under WSL2 (PyTorch 2.14.1+cu130, CUDA toolkit 13.3, GCC 13.3, Python 3.12), with a plain <code>pip install</code> of the 0.2.0 wheel. All 89 tests pass on both, on an RTX 5090 Laptop GPU (sm_120). Native Linux (not WSL) and other GPUs haven't been tested.</li>
   </ul>
 </section>
 
-<footer>TrainStream 0.2.0 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and <code>examples/verify_ram_offload.py</code> to check them on yours.</footer>
+<footer>TrainStream 0.3.0 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and <code>examples/verify_ram_offload.py</code> to check them on yours.</footer>
 </div>
 </main>
 

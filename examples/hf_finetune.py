@@ -28,6 +28,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingA
 
 from trainstream.integrations.huggingface import TrainStreamTrainer  # noqa: E402
 
+import _live  # noqa: E402  (optional live dashboard)
+
 GiB = float(1 << 30)
 
 
@@ -102,18 +104,23 @@ def run(args, use_trainstream: bool, ds, tok):
         output_dir=os.path.join(args.out, "trainstream" if use_trainstream else "stock"),
         per_device_train_batch_size=args.batch, gradient_accumulation_steps=args.accum,
         max_steps=args.steps, learning_rate=args.lr, lr_scheduler_type="cosine", warmup_steps=max(1, args.steps // 10),
-        weight_decay=0.0, max_grad_norm=1.0, bf16=True, logging_steps=max(1, args.steps // 10),
+        weight_decay=0.0, max_grad_norm=1.0, bf16=True, logging_steps=1,
         report_to="none", save_strategy="no", optim="adamw_torch", seed=0, data_seed=0,
         dataloader_num_workers=0, disable_tqdm=True)
     cls = TrainStreamTrainer if use_trainstream else Trainer
     kw = {"trainstream": {"activation_offload": args.activation_offload}} if use_trainstream else {}
-    trainer = cls(model=model, args=targs, train_dataset=ds, **kw)
+    live = _live.open_run(args, f"hf-{args.model.split('/')[-1]}{'-lora' if args.lora else ''}-"
+                                f"{'trainstream' if use_trainstream else 'stock'}")
+    cb = live.hf_callback(tokens_per_step=args.batch * args.accum * args.block,
+                          optimizer="trainstream" if use_trainstream else "adamw")
+    trainer = cls(model=model, args=targs, train_dataset=ds, callbacks=[cb] if cb else None, **kw)
     t0 = time.time()
     try:
         trainer.train()
         status = "ok"
     except torch.OutOfMemoryError as exc:
         status = "OOM: " + str(exc).split(". GPU")[0]
+        live.finish("out of memory")
     wall = time.time() - t0
     logs = [h for h in trainer.state.log_history if "loss" in h]
     # TrainStreamTrainer resets the peak counter at every log line (ts_vram_peak_gb).
@@ -139,6 +146,7 @@ def main():
     ap.add_argument("--activation-offload", default="auto")
     ap.add_argument("--compare", action="store_true", help="run the stock Trainer first for comparison")
     ap.add_argument("--out", default=os.path.join(ROOT, "runs", "hf_finetune"))
+    _live.add_args(ap)
     args = ap.parse_args()
     if args.activation_offload != "auto":
         args.activation_offload = float(args.activation_offload)
@@ -151,6 +159,7 @@ def main():
     if args.compare:
         run(args, False, ds, tok)
     run(args, True, ds, tok)
+    _live.keep_serving(args)
 
 
 if __name__ == "__main__":

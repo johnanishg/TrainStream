@@ -33,6 +33,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 GiB = float(1 << 30)
+sys.path.insert(0, HERE)
+import _live  # noqa: E402  (optional live dashboard)
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +172,7 @@ def build_model_and_data(args, torch):
             return model(**b).loss
         blocks = None
         return model, batch, loss_fn, blocks
-    sys.path.insert(0, os.path.join(ROOT, "dashboard"))
-    from model import GPT, PRESETS, ByteCorpus, GPTConfig  # noqa: E402
+    from _gpt import GPT, PRESETS, ByteCorpus, GPTConfig  # noqa: E402
     cfg = GPTConfig(**{**PRESETS[args.gpt].to_dict(), "seq_len": args.seq})
     model = GPT(cfg).to("cuda", dtype)
     corpus = ByteCorpus("cuda")
@@ -235,6 +236,14 @@ def child(args):
             st = opt.stats()
             out.update(host_state_bytes=st["host_state_bytes"], pinned_state_bytes=st["pinned_state_bytes"],
                        pageable_state_bytes=st["pageable_state_bytes"])
+        live = _live.open_run(args, f"verify-{args.engine}-{args.hf.split('/')[-1] if args.hf else args.gpt}"
+                                    + (f"-cap{args.vram_cap_gb:g}GB" if cap else ""))
+        live.start(model, "trainstream" if ts is not None else "adamw",
+                   model_info={"preset": args.hf or args.gpt, "params": sum(p.numel() for p in model.parameters()),
+                               "trainable": n, "n_layer": len(blocks) if blocks else None},
+                   train_info={"batch": args.batch, "seq": args.seq, "steps": args.steps, "lr": args.lr,
+                               "tokens_per_step": args.batch * args.seq, "dtype": f"bf16 autocast, {args.dtype} weights"},
+                   vram_limit=int(cap) if cap else None)
         g = torch.Generator(device="cuda").manual_seed(1234)
         steps = []
         from trainstream import _C as tsC  # transfer counters (zero for the baseline)
@@ -269,6 +278,7 @@ def child(args):
                 rec["pinned_by_tag"] = dict(tsC.pinned_tag_bytes())
             steps.append(rec)
             emit({"phase": "step", **rec})
+            live.end_step(step, loss=loss_v, tokens=args.batch * args.seq, step_ms=dt * 1e3)
         out["steps"] = steps
         # Persistent VRAM: what stays allocated between steps beyond the weights.
         out["vram_persistent_extra"] = torch.cuda.memory_allocated() - out["vram_after_model"]
@@ -287,6 +297,7 @@ def child(args):
             }
             out["engine_stats"] = opt.stats()
         out["status"] = "ok"
+        live.finish("finished")
     except torch.OutOfMemoryError as exc:
         out["status"] = "oom"
         msg = str(exc).split("\n")[0]
@@ -295,6 +306,9 @@ def child(args):
         out["status"] = "error"
         out["error"] = f"{type(exc).__name__}: {exc}"[:600]
     out["ram_private_end"] = process_ram()[0]
+    if out["status"] != "ok" and "live" in locals():
+        live.event(out.get("error", out["status"]))
+        live.finish("out of memory" if out["status"] == "oom" else out["status"])
     emit({"phase": "done", **out})
 
 
@@ -307,6 +321,7 @@ def run_engine(args, engine):
         v = getattr(args, k)
         if v is not None:
             cmd += ["--" + k.replace("_", "-"), str(v)]
+    cmd += _live.child_args(args)
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
                             encoding="utf-8", errors="replace")
@@ -436,7 +451,7 @@ def verdict(args, results):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--gpt", default=None, help="dashboard GPT preset (default xl-1.2B when --hf is not given)")
+    ap.add_argument("--gpt", default=None, help="GPT preset from examples/_gpt.py (default xl-1.2B when --hf is not given)")
     ap.add_argument("--hf", default=None, help="Hugging Face model id, e.g. Qwen/Qwen2.5-1.5B")
     ap.add_argument("--vram-cap-gb", type=float, default=16.0, help="simulate a GPU with this much VRAM (0 = no cap)")
     ap.add_argument("--engine", default="both", choices=["both", "baseline", "trainstream"])
@@ -448,7 +463,13 @@ def main():
     ap.add_argument("--activation-offload", default="auto")
     ap.add_argument("--json", default=None, help="write the full report here")
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    _live.add_args(ap)
     args = ap.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # a console code page must not crash the report
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     if not args.hf and not args.gpt:
         args.gpt = "xl-1.2B"
     if args.worker:
@@ -457,6 +478,8 @@ def main():
     total, avail = system_ram()
     print(f"System RAM: {avail / GiB:.1f} GiB free of {total / GiB:.1f} GiB · VRAM budget: "
           f"{'whole GPU' if not args.vram_cap_gb else f'{args.vram_cap_gb:.1f} GiB (simulated)'} · model: {args.hf or args.gpt}")
+    if not _live.start_server(args):
+        args.no_ui = True
     results = {}
     for engine in (["baseline", "trainstream"] if args.engine == "both" else [args.engine]):
         print(f"\n=== {engine} ===")
@@ -473,6 +496,7 @@ def main():
             json.dump({"args": vars(args), "results": results,
                        "checks": [{"name": n, "pass": ok, "detail": d} for n, ok, d in checks]}, fh, indent=2)
         print(f"Report written to {args.json}")
+    _live.keep_serving(args)
     return 0 if passed == len(checks) else 1
 
 

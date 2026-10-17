@@ -12,6 +12,7 @@ from . import _C
 from .hooks import ActivationOffloader, find_blocks
 from .optimizer import OffloadAdamW
 from .paging import ParamPager, pageable_params
+from .planner import MemoryPlanner, explain_ram_shortfall, host_bytes_needed, measure_budget
 from .profiler import HardwareProfile, profile_hardware
 
 _ATTR = "_trainstream_session"
@@ -29,6 +30,12 @@ class TrainStreamSession:
         self.config = config
         self.blocks = list(blocks)
         self.paged_blocks = list(paged_blocks)
+        self.planner: Optional[MemoryPlanner] = None
+        self.candidates = None
+        self._act_prev_bytes = 0
+        self._act_step_bytes = 0
+        self._resident_check_step: Optional[int] = None
+        self._watch_level = 0
         self.steps = 0
         self.events: List[str] = []
         self._applying = False
@@ -41,16 +48,11 @@ class TrainStreamSession:
         opt.attach(self.model, guard=cfg["guard_params"])
         if opt.resident:
             return
-        if self.paged_blocks:
-            paged = pageable_params(self.model, self.blocks, self.paged_blocks)
-            for ps in paged.values():
-                for p in ps:
-                    slot = opt._slot_of.get(id(p))
-                    if slot is not None:
-                        opt._paged_ids.add(id(p))
-                        opt.engine.set_paged(slot, True)
-            self.pager = ParamPager(self.model, self.blocks, opt, paged, frozen_init=frozen_init,
-                                    prefetch_depth=cfg["prefetch_depth"])
+        if self.paged_blocks or (self.planner is not None and not self.planner.done):
+            if self.candidates is None:
+                self.candidates = pageable_params(self.model, self.blocks, range(len(self.blocks)))
+            self.pager = ParamPager(self.model, self.blocks, opt, self.paged_blocks, candidates=self.candidates,
+                                    frozen_init=frozen_init, prefetch_depth=cfg["prefetch_depth"])
         if cfg["activation_offload"] not in (False, 0, 0.0, None) and self.blocks:
             act = cfg["activation_offload"] if not cfg.get("_act_fixed") else cfg["_act_fixed"]
             self.activations = ActivationOffloader(
@@ -60,6 +62,8 @@ class TrainStreamSession:
                 max_inflight_bytes=cfg["max_inflight_bytes"])
 
     def teardown(self, materialize: bool = True) -> None:
+        if self.pager is not None:
+            self.paged_blocks = sorted(self.pager.paged)
         self.optimizer.detach()
         if self.activations is not None:
             self.activations.remove()
@@ -77,10 +81,24 @@ class TrainStreamSession:
     # -- resident switch -------------------------------------------------------------
     def _after_step(self) -> None:
         self.steps += 1
-        if self.steps != 2 or self.config["offload"] != "auto":
+        if self.activations is not None:
+            packed = self.activations.stats["packed_bytes"]
+            self._act_step_bytes, self._act_prev_bytes = packed - self._act_prev_bytes, packed
+        if self.planner is not None and self.pager is not None:
+            if not self.planner.done:
+                self._refine_plan()
+                return
+            self._watch_plan()
+        if self._resident_check_step is not None:
+            if self.steps < self._resident_check_step:
+                return
+            self._resident_check_step = None
+        elif self.steps != 2:
+            return
+        if self.config["offload"] != "auto":
             return
         opt = self.optimizer
-        if self.pager is not None or opt._dp is not None or opt.resident:
+        if (self.pager is not None and self.pager.paged) or opt._dp is not None or opt.resident:
             return
         if self._fits_resident():
             opt._post_step_cb = None
@@ -91,6 +109,54 @@ class TrainStreamSession:
             self.events.append("model fits in VRAM: switched to resident fused AdamW")
             if self.config.get("verbose"):
                 print("[trainstream] the model fits in VRAM with a stock optimizer; offloading switched off")
+
+    def _refine_plan(self) -> None:
+        dev = self.optimizer.device
+        peak = torch.cuda.max_memory_allocated(dev)
+        torch.cuda.reset_peak_memory_stats(dev)  # per-step peaks while the plan is being tuned
+        pager, planner = self.pager, self.planner
+        new = planner.refine(peak, set(pager.paged))
+        if new is not None:
+            for i in sorted(new - pager.paged):  # free VRAM first ...
+                pager.page(i)
+            for i in sorted(pager.paged - new):  # ... then fill it
+                pager.unpage(i)
+            self.paged_blocks = sorted(pager.paged)
+            self.events.append(f"memory plan: step peak {peak / 2**30:.2f} GiB of {planner.target / 2**30:.2f} GiB "
+                               f"target -> {pager.n - len(pager.paged)} of {pager.n} blocks resident in VRAM")
+        if planner.done:
+            resident = pager.n - len(pager.paged)
+            self.events.append(f"memory plan settled: {resident} of {pager.n} blocks resident, {len(pager.paged)} "
+                               f"paged ({pager.bytes_paged / 2**30:.1f} GiB streamed from host RAM)")
+            if not pager.paged and self.activations is not None and self.config.get("_act_forced"):
+                # Every block fits: activations too, if the measured paged volume
+                # fits in the remaining headroom.
+                if planner.target - peak > 1.25 * self._act_step_bytes:
+                    self.activations.remove()
+                    self.activations = None
+                    self.events.append(f"activations ({self._act_step_bytes / 2**30:.2f} GiB per step) fit in "
+                                       "VRAM: activation paging switched off")
+            self._resident_check_step = self.steps + 2  # measure a clean step, then consider resident mode
+
+    def _watch_plan(self) -> None:
+        """After the plan settled: if a later step (longer sequences, a bigger
+        batch) eats into the safety margin, page one more block. The peak is
+        read, not reset, so the user's own memory statistics stay intact."""
+        planner, pager = self.planner, self.pager
+        peak = torch.cuda.max_memory_allocated(self.optimizer.device)
+        alarm = planner.target + 0.5 * (planner.budget.vram_usable - planner.target)
+        if peak <= alarm or peak <= self._watch_level + planner.max_block // 2:
+            return
+        resident = [i for i in range(pager.n) if i not in pager.paged and pager.block_bytes[i]]
+        if not resident:
+            return
+        from .planner import spread
+        pick = spread(1, resident)[0]
+        pager.page(pick)
+        self.paged_blocks = sorted(pager.paged)
+        self._watch_level = peak
+        self.events.append(f"memory watchdog: peak {peak / 2**30:.2f} GiB is inside the safety margin; block {pick} "
+                           f"paged ({pager.n - len(pager.paged)} of {pager.n} resident)")
 
     def _fits_resident(self) -> bool:
         dev = self.optimizer.device
@@ -189,6 +255,9 @@ class TrainStreamSession:
                                  paged_bytes=self.pager.bytes_paged, total_blocks=self.pager.n,
                                  frozen_pinned_bytes=self.pager.frozen_pinned_bytes,
                                  frozen_pageable_bytes=self.pager.frozen_pageable_bytes)
+        if self.planner is not None:
+            out["plan"] = dict(target_vram=self.planner.target, settled=self.planner.done,
+                               history=list(self.planner.history), budget=self.planner.budget.describe())
         return out
 
 
@@ -243,19 +312,16 @@ def _unique_params(model: nn.Module):
 
 
 def _paged_block_indices(param_offload, n_blocks: int, weight_bytes: int, on_cpu: bool, device) -> List[int]:
-    if n_blocks == 0 or param_offload in (False, 0, 0.0, None):
-        return []
-    if param_offload == "auto":
-        free, total = vram_budget(device)
-        # Page when the weights alone would take more than half of the GPU.
-        need = weight_bytes > 0.5 * (free if on_cpu else total)
-        return list(range(n_blocks)) if need else []
+    """Fixed (non-planned) paging choices: True, False, a fraction, or indices."""
+    from .planner import spread
+    if n_blocks == 0 or param_offload in (False, 0, 0.0, None, "auto"):
+        return []  # "auto" lands here only without a block stack or in gpu mode
     if param_offload is True:
         return list(range(n_blocks))
     if isinstance(param_offload, (list, tuple, set)):
         return sorted(int(i) for i in param_offload if 0 <= int(i) < n_blocks)
     frac = min(max(float(param_offload), 0.0), 1.0)
-    return list(range(int(round(frac * n_blocks))))
+    return spread(int(round(frac * n_blocks)), list(range(n_blocks)))  # spread for transfer/compute overlap
 
 
 def _broadcast_from_rank0(model: nn.Module, group) -> None:
@@ -277,7 +343,7 @@ def wrap(
     param_offload: Union[str, float, bool, Sequence[int]] = "auto",
     blocks: Optional[Sequence[nn.Module]] = None,
     device: Optional[Union[str, torch.device]] = None,
-    moment_dtype: str = "float32",
+    moment_dtype: str = "auto",
     distributed: Optional[bool] = None,
     guard_params: bool = True,
     max_grad_norm: Optional[float] = None,
@@ -289,6 +355,8 @@ def wrap(
     max_inflight_bytes: Optional[int] = None,
     profile: bool = True,
     lr: float = 1e-3,
+    vram_headroom: float = 0.10,
+    check_memory: bool = True,
     verbose: bool = False,
 ):
     """Enable TrainStream offloading for `model` and return ``(model, optimizer)``.
@@ -303,15 +371,19 @@ def wrap(
         activation_offload: "auto" (calibrate, then size from bandwidth), a
             fraction in [0, 1], True (all but the last block) or False.
         param_offload: page transformer-block weights to host RAM, streaming
-            each block in just before it runs. "auto" pages when the weights
-            would take more than half of the GPU; True, False, a fraction of
-            the blocks, or explicit block indices. Needs optimizer_mode="cpu".
+            each block in just before it runs. "auto" (default) plans from the
+            VRAM this process may use: as many blocks as fit stay resident, the
+            rest are paged (spread through the stack), and the first steps'
+            measured peaks move blocks in or out until it settles. True pages
+            every block; False none; a fraction or block indices fix the split.
+            Needs optimizer_mode="cpu".
         blocks: the repeated layer stack; auto-detected when None.
         device: target GPU when `model` is still on the CPU. With parameter
             paging, block weights then go straight to host RAM and never
             occupy VRAM all at once — models larger than the GPU can train.
-        moment_dtype: "float32" or "bfloat16" (stochastic rounding; half the
-            host memory and traffic for the moments).
+        moment_dtype: "auto" (fp32 unless fp32 moments would not fit in the
+            available RAM), "float32" or "bfloat16" (stochastic rounding; half
+            the host memory and traffic for the moments).
         distributed: data parallel over torch.distributed (default: on when a
             process group with more than one rank is initialized). Parameters
             are broadcast from rank 0; gradients are averaged on the host.
@@ -323,6 +395,9 @@ def wrap(
             without clipping, updates run eagerly during the last backward.
         max_activation_slowdown: "auto" activation paging backs off until the
             measured step time is within this fraction of the un-paged baseline.
+        vram_headroom: fraction of the usable VRAM the planner leaves free.
+        check_memory: raise MemoryError at wrap() when the host state cannot
+            fit in the available RAM, instead of failing later.
         max_inflight_bytes: cap on VRAM held by activations (and, separately,
             by gradients) still in flight to the host; the forward / backward
             pass waits for the link beyond it. Default: 1 GiB, or 10% of the
@@ -365,7 +440,46 @@ def wrap(
 
     stack = list(blocks) if blocks is not None else find_blocks(model)
     weight_bytes = sum(p.numel() * p.element_size() for p in params)
-    paged_blocks = _paged_block_indices(param_offload, len(stack), weight_bytes, on_cpu, target)
+    candidates = pageable_params(model, stack, range(len(stack))) if stack else {}
+    block_bytes = [sum(p.numel() * p.element_size() for p in candidates[i]) for i in range(len(stack))]
+    budget = measure_budget(target)
+    if max_inflight_bytes is None:
+        max_inflight_bytes = int(min(1 << 30, 0.10 * budget.vram_total))
+    planner = None
+    if param_offload == "auto" and stack and optimizer_mode != "gpu":
+        buffers = sum(b.numel() * b.element_size() for b in model.buffers())
+        workspace = max(96 << 20, int(0.02 * budget.vram_total))  # cuBLAS/cuDNN workspaces, allocator slack
+        fixed = (weight_bytes - sum(block_bytes)) + buffers + max_inflight_bytes + workspace
+        planner = MemoryPlanner(budget, block_bytes, fixed_vram=fixed, inflight_bytes=max_inflight_bytes,
+                                margin=vram_headroom)
+        paged_blocks = sorted(planner.initial_paged())
+        if not paged_blocks:
+            planner = None  # everything fits: no paging machinery at all
+        elif check_memory and not planner.fits_at_all():
+            raise MemoryError(
+                f"TrainStream: even with every block paged, this model needs about "
+                f"{(fixed + 2 * planner.max_block) / 2**30:.1f} GiB of VRAM ({budget.describe()}). The parts "
+                f"outside the block stack (embeddings, output layer) stay resident. Use a smaller batch or model, "
+                f"or pass check_memory=False to try anyway.")
+    else:
+        paged_blocks = _paged_block_indices(param_offload, len(stack), weight_bytes, on_cpu, target)
+
+    # Host RAM: decide the moment precision and refuse what cannot fit.
+    trainable_params = [p for p in params if p.requires_grad]
+    paged_set = set(paged_blocks)
+    frozen_paged = sum(p.numel() * p.element_size() for i in paged_set for p in candidates.get(i, [])
+                       if not p.requires_grad)
+    grad_acc = bool(max_grad_norm) or accumulation_steps > 1 or bool(distributed)
+    have = budget.ram_available + (weight_bytes if on_cpu else 0)  # a CPU model's weights become host state
+    have = int(0.90 * have)  # room for paged activations and the rest of the process
+    need32 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=4, grad_acc=grad_acc)
+    need16 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=2, grad_acc=grad_acc)
+    if moment_dtype == "auto":
+        moment_dtype = "float32" if need32 <= have else "bfloat16"
+    need = need16 if moment_dtype in ("bfloat16", "bf16", torch.bfloat16) else need32
+    if check_memory and budget.ram_available and need > have:
+        raise MemoryError(explain_ram_shortfall(need, have, budget, trainable=sum(p.numel() for p in trainable_params),
+                                                frozen=frozen_paged // 2))
     if paged_blocks:
         if optimizer_mode == "gpu":
             raise ValueError("param_offload needs optimizer_mode='cpu' (paged weights are updated on the host)")
@@ -409,8 +523,6 @@ def wrap(
     if max_grad_norm is not None:
         opt.max_grad_norm = max_grad_norm
     opt.accumulation_steps = max(1, int(accumulation_steps))
-    if max_inflight_bytes is None:
-        max_inflight_bytes = int(min(1 << 30, 0.10 * vram_budget(target)[1]))
     if opt.engine is not None and opt.mode == "cpu":
         opt.engine.set_max_inflight_grad_bytes(int(max_inflight_bytes))
         # Pooled gradient staging: a quarter of all gradient bytes (at least
@@ -428,11 +540,14 @@ def wrap(
         paged_bytes = sum(p.numel() * p.element_size()
                           for ps in pageable_params(model, stack, paged_blocks).values() for p in ps)
         reserved = (reserved[0], reserved[1] + paged_bytes)  # each paged weight is loaded twice per step
+    act_forced = False
     if paged_blocks and activation_offload == "auto":
         # A model that needs its weights paged is memory-bound: page every
         # block's activations from the first step instead of calibrating with
-        # all of them resident (which is exactly what would not fit).
+        # all of them resident (which is exactly what would not fit). The
+        # planner switches it off again if everything turns out to fit.
         activation_offload = True
+        act_forced = True
     if activation_offload not in (False, 0, 0.0, None) and not stack and verbose:
         print("[trainstream] no repeated block stack found; activation offload disabled")
 
@@ -442,9 +557,17 @@ def wrap(
                   eager_updates=opt.eager_active, max_grad_norm=max_grad_norm, prefetch_depth=prefetch_depth,
                   min_offload_bytes=min_offload_bytes, guard_params=guard_params,
                   max_activation_slowdown=max_activation_slowdown, max_inflight_bytes=max_inflight_bytes,
-                  verbose=verbose, _reserved=reserved)
+                  verbose=verbose, _reserved=reserved, _act_forced=act_forced,
+                  plan=dict(budget=budget.describe(), host_bytes=need, blocks=len(stack),
+                            initial_paged=len(paged_blocks), auto=planner is not None))
     session = TrainStreamSession(model, opt, hw, config, stack, paged_blocks)
+    session.planner = planner
+    session.candidates = candidates
     session.install(frozen_init=frozen_init)
+    if planner is not None:
+        session.events.append(f"memory plan: {budget.describe()}; starting with {len(stack) - len(paged_blocks)} "
+                              f"of {len(stack)} blocks resident, {len(paged_blocks)} paged; "
+                              f"moments {opt.moment_dtype}")
     frozen_init.clear()
     config["eager_updates"] = opt.eager_active
     opt._post_step_cb = session._after_step

@@ -13,7 +13,8 @@ GPU while it runs; only the LoRA adapters are trained. The chunked loss keeps
 the 152k-token vocabulary's logits from ever existing in full.
 
 Host RAM needed: about 2 bytes per base parameter (bf16), plus activations.
-Writes a JSON summary to --out.
+Writes a JSON summary to --out. With the analytics project present, every
+step also streams to its live UI (--no-ui to turn that off).
 """
 
 import argparse
@@ -28,6 +29,9 @@ import trainstream
 from trainstream.integrations.huggingface import TrainStreamTrainer
 
 from transformers import AutoModelForCausalLM, Qwen2Config, Trainer, TrainerCallback, TrainingArguments
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _live  # noqa: E402
 
 GB = 1e9
 SIZES = {  # Qwen2.5 dense architectures
@@ -102,6 +106,7 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--stock", action="store_true", help="stock Trainer with the model in VRAM, for comparison")
     ap.add_argument("--out", default=None)
+    _live.add_args(ap)
     args = ap.parse_args()
     import peft
 
@@ -129,17 +134,27 @@ def main():
                               bf16=True, logging_steps=1, report_to="none", save_strategy="no",
                               optim="adamw_torch", disable_tqdm=True, dataloader_num_workers=0)
     meter = Meter()
+    engine = "stock" if args.stock else "trainstream"
+    label = args.model.split("/")[-1] if args.model else f"qwen2.5-{args.size}-shape"
+    live = _live.open_run(args, f"lora-{label}-{engine}")
+    info = {"preset": name, "params": n_base, "trainable": trainable,
+            "n_layer": model.config.num_hidden_layers, "d_model": model.config.hidden_size,
+            "n_head": model.config.num_attention_heads, "vocab": model.config.vocab_size}
+    callbacks = [meter] + [cb for cb in [live.hf_callback(tokens_per_step=args.batch * args.seq, model_info=info,
+                                                          optimizer="trainstream" if not args.stock else "adamw")] if cb]
     ds = Tokens(model.config.vocab_size if hasattr(model, "config") else 152064, seq=args.seq)
     if args.stock:
-        trainer = Trainer(model=model, args=targs, train_dataset=ds, callbacks=[meter])
+        trainer = Trainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks)
     else:
-        trainer = TrainStreamTrainer(model=model, args=targs, train_dataset=ds, callbacks=[meter])
+        trainer = TrainStreamTrainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks)
     status = "finished"
     try:
         trainer.train()
     except torch.OutOfMemoryError as exc:
         status = "out of memory: " + str(exc).splitlines()[0][:120]
         print(status)
+        live.event("CUDA out of memory", detail=status)
+        live.finish("out of memory")
     tail = meter.rows[2:] or meter.rows
     summary = dict(model=name, base_params=n_base, trainable=trainable, engine="stock" if args.stock else "trainstream",
                    batch=args.batch, seq=args.seq, status=status, steps=len(meter.rows),
@@ -156,6 +171,7 @@ def main():
     print(json.dumps(summary, indent=1))
     if args.out:
         json.dump(summary, open(args.out, "w"), indent=1)
+    _live.keep_serving(args, live)
 
 
 if __name__ == "__main__":

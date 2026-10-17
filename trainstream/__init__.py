@@ -33,7 +33,7 @@ from .paging import ParamPager
 from .profiler import HardwareProfile, profile_hardware
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "wrap",

@@ -1,0 +1,41 @@
+# --- Python environments (several GB; recreate from the setup guide) ---
+.venv/
+.venv-tf/
+venv/
+env/
+
+# --- Build outputs ---
+build/
+dist/
+*.egg-info/
+# Compiled extension (rebuild with build.bat / python setup.py build_ext --inplace)
+trainstream/_C*.pyd
+trainstream/_C*.so
+*.obj
+*.o
+*.lib
+*.exp
+*.ninja_deps
+.ninja_log
+build.ninja
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- Run outputs (machine-specific results) ---
+# Training/fine-tuning outputs and checkpoints from examples/hf_finetune.py
+runs/
+# Dashboard comparison reports (HTML/JSON); the research dossier keeps its own
+# snapshot in research/research_data.json, which IS tracked
+dashboard/reports/
+*.log
+
+# --- Editors and OS files ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

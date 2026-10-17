@@ -1,0 +1,1003 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrainStream Docs</title>
+<meta name="description" content="TrainStream: a zero-dependency C++/CUDA extension for PyTorch that offloads optimizer state, gradients and activations to host RAM over PCIe.">
+<style>
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #161615;
+  --surface-2: #1f1f1d;
+  --surface-3: #2a2a27;
+  --border: rgba(255,255,255,0.09);
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --accent: #3987e5;
+  --accent-soft: rgba(57,135,229,0.14);
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+  --gpu: #3987e5;
+  --host: #199e70;
+  --link: #9085e9;
+  --cpu: #c98500;
+  --act: #d55181;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --side: 272px;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 72px; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 15.5px/1.65 var(--sans); }
+a { color: #6da7ec; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ---- top bar ---- */
+.topbar { position: fixed; inset: 0 0 auto 0; height: 56px; display: flex; align-items: center; gap: 14px;
+  padding: 0 18px; background: rgba(13,13,13,0.86); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); z-index: 20; }
+.burger { width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--ink); cursor: pointer; display: grid; place-items: center; }
+.burger svg { width: 18px; height: 18px; }
+.brand { font-weight: 700; letter-spacing: .2px; }
+.brand span { color: var(--muted); font-weight: 400; }
+.topbar .spacer { flex: 1; }
+.pill { font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); background: var(--surface-2); padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
+@media (max-width: 640px) { .topbar .pill.opt { display: none; } }
+
+/* ---- sidebar ---- */
+.sidebar { position: fixed; top: 56px; bottom: 0; left: 0; width: var(--side); overflow-y: auto; padding: 18px 14px 40px;
+  border-right: 1px solid var(--border); background: var(--surface); transition: transform .22s ease; z-index: 15; }
+body.collapsed .sidebar { transform: translateX(-100%); }
+.sidebar .group { margin-bottom: 14px; }
+.sidebar .gtitle { width: 100%; display: flex; align-items: center; justify-content: space-between; background: none; border: 0;
+  color: var(--muted); font: 600 11.5px/1 var(--sans); text-transform: uppercase; letter-spacing: .8px; padding: 6px 8px; cursor: pointer; }
+.sidebar .gtitle svg { width: 12px; height: 12px; transition: transform .15s; }
+.sidebar .group.closed .gtitle svg { transform: rotate(-90deg); }
+.sidebar .group.closed ul { display: none; }
+.sidebar ul { list-style: none; margin: 4px 0 0; padding: 0; }
+.sidebar li a { display: block; padding: 5px 10px 5px 12px; border-radius: 7px; color: var(--ink-2); font-size: 14px; border-left: 2px solid transparent; }
+.sidebar li a:hover { background: var(--surface-2); text-decoration: none; color: var(--ink); }
+.sidebar li a.active { background: var(--accent-soft); color: var(--ink); border-left-color: var(--accent); }
+.phase-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+
+/* ---- content ---- */
+main { margin-left: var(--side); padding: 88px 40px 80px; transition: margin .22s ease; }
+body.collapsed main { margin-left: 0; }
+@media (max-width: 960px) {
+  main { margin-left: 0; padding: 80px 16px 60px; }
+  .sidebar { transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,.6); }
+  body.nav-open .sidebar { transform: translateX(0); }
+}
+.wrap { max-width: 980px; margin: 0 auto; }
+section { padding-top: 8px; margin-bottom: 56px; }
+h1 { font-size: clamp(30px, 4.4vw, 44px); line-height: 1.12; margin: 0 0 14px; letter-spacing: -.5px; }
+h2 { font-size: 27px; line-height: 1.25; margin: 0 0 6px; letter-spacing: -.2px; }
+h3 { font-size: 19px; margin: 30px 0 8px; }
+h4 { font-size: 15.5px; margin: 22px 0 6px; color: var(--ink-2); }
+p { margin: 10px 0; color: var(--ink-2); }
+p strong, li strong { color: var(--ink); }
+.lead { font-size: 18px; color: var(--ink-2); max-width: 760px; }
+.kicker { font-size: 12.5px; font-weight: 600; letter-spacing: .9px; text-transform: uppercase; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.kicker.overview { color: #6da7ec; } .kicker.beginner { color: #3fc28f; } .kicker.intermediate { color: #e0a32a; } .kicker.advanced { color: #e07aa2; } .kicker.reference { color: var(--muted); }
+ul, ol { color: var(--ink-2); padding-left: 22px; }
+li { margin: 4px 0; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 40px 0; }
+
+.hero { padding: 26px 0 8px; }
+.hero-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 26px 0 8px; }
+.stat { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.stat .v { font-size: 26px; font-weight: 700; letter-spacing: -.3px; }
+.stat .k { font-size: 13px; color: var(--muted); }
+.stat .s { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin: 16px 0; }
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.callout { border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--surface); border-radius: 10px; padding: 12px 16px; margin: 16px 0; }
+.callout.warn { border-left-color: var(--warning); }
+.callout.good { border-left-color: var(--good); }
+.callout.crit { border-left-color: var(--critical); }
+.callout p { margin: 4px 0; }
+.callout .t { font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+
+/* ---- code ---- */
+code { font: 0.9em/1.4 var(--mono); background: var(--surface-2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 5px; color: #e6e4dc; }
+.code { position: relative; margin: 14px 0; border: 1px solid var(--border); border-radius: 10px; background: #111110; overflow: hidden; }
+.code .bar { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px 6px 14px; border-bottom: 1px solid var(--border);
+  font: 12px var(--mono); color: var(--muted); background: var(--surface); }
+.code button { font: 12px var(--sans); color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 9px; cursor: pointer; }
+.code pre { margin: 0; padding: 14px 16px; overflow-x: auto; font: 13.2px/1.6 var(--mono); color: #e6e4dc; tab-size: 4; }
+.tok-k { color: #c792ea; } .tok-s { color: #a5d6a7; } .tok-c { color: #7d7b74; font-style: italic; } .tok-n { color: #f2b56b; }
+.tok-f { color: #82b1ff; } .tok-p { color: #e07aa2; }
+
+/* ---- tables ---- */
+.tbl { overflow-x: auto; margin: 14px 0; border: 1px solid var(--border); border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { background: var(--surface); color: var(--muted); font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: .5px; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td code { white-space: nowrap; }
+.yes, .no, .part { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 13px; }
+.yes::before, .no::before, .part::before { content: ""; width: 9px; height: 9px; border-radius: 50%; }
+.yes::before { background: var(--good); } .no::before { background: var(--critical); } .part::before { background: var(--warning); }
+
+/* ---- diagrams ---- */
+figure { margin: 18px 0; }
+figure .fig { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; overflow-x: auto; }
+figure svg { display: block; width: 100%; height: auto; min-width: 640px; }
+figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; }
+svg text { font-family: var(--sans); }
+
+/* ---- terms / steps ---- */
+dl.terms { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+dl.terms dt, dl.terms dd { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+dl.terms dt { font-weight: 600; background: var(--surface); }
+dl.terms dd { color: var(--ink-2); }
+@media (max-width: 640px) { dl.terms { grid-template-columns: 1fr; } dl.terms dt { border-bottom: 0; padding-bottom: 2px; } }
+ol.steps { counter-reset: s; list-style: none; padding: 0; }
+ol.steps > li { counter-increment: s; position: relative; padding: 2px 0 14px 46px; margin: 0; }
+ol.steps > li::before { content: counter(s); position: absolute; left: 0; top: 0; width: 30px; height: 30px; border-radius: 50%;
+  background: var(--accent-soft); border: 1px solid rgba(57,135,229,.4); color: #9ec5f4; display: grid; place-items: center; font-weight: 700; font-size: 14px; }
+ol.steps > li > strong { display: block; color: var(--ink); }
+details { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); margin: 12px 0; }
+details summary { cursor: pointer; padding: 11px 16px; font-weight: 600; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+details summary::-webkit-details-marker { display: none; }
+details summary::after { content: "+"; color: var(--muted); font-size: 18px; }
+details[open] summary::after { content: "–"; }
+details > div { padding: 0 16px 12px; }
+.bar-row { display: grid; grid-template-columns: 170px 1fr 92px; gap: 10px; align-items: center; margin: 7px 0; font-size: 13.5px; }
+.bar-row .track { height: 12px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.bar-row .fill { height: 100%; border-radius: 0 4px 4px 0; }
+.bar-row .val { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
+.bar-row .name { color: var(--ink-2); }
+@media (max-width: 560px) { .bar-row { grid-template-columns: 110px 1fr 74px; } }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--ink-2); margin: 8px 0 0; }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 18px; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <button class="burger" id="burger" aria-label="Toggle navigation">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+  </button>
+  <div class="brand">TrainStream <span>docs</span></div>
+  <div class="spacer"></div>
+  <span class="pill opt">v0.1.0</span>
+  <span class="pill opt">C++ · CUDA · ATen</span>
+  <span class="pill">zero dependencies</span>
+</header>
+
+<nav class="sidebar" id="sidebar">
+  <div class="group"><button class="gtitle">Overview <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+    <ul>
+      <li><a href="#mission"><span class="phase-dot" style="background:#6da7ec"></span>Mission</a></li>
+      <li><a href="#architecture">Memory architecture</a></li>
+      <li><a href="#pcie">PCIe bandwidth analysis</a></li>
+      <li><a href="#results">Measured results</a></li>
+      <li><a href="#matrix">Feature matrix</a></li>
+    </ul></div>
+  <div class="group"><button class="gtitle">Beginner <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+    <ul>
+      <li><a href="#bottleneck"><span class="phase-dot" style="background:#3fc28f"></span>Why GPUs run out of memory</a></li>
+      <li><a href="#setup">Setup guide</a></li>
+      <li><a href="#first-run">Your first fine-tune</a></li>
+      <li><a href="#huggingface">Hugging Face transformers</a></li>
+      <li><a href="#terms">Key terminology</a></li>
+      <li><a href="#dashboard">Live dashboard</a></li>
+    </ul></div>
+  <div class="group"><button class="gtitle">Intermediate <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+    <ul>
+      <li><a href="#prefetch"><span class="phase-dot" style="background:#e0a32a"></span>Double-buffered prefetching</a></li>
+      <li><a href="#adamw">Offloaded AdamW mechanics</a></li>
+      <li><a href="#hooks">PyTorch backward hooks</a></li>
+      <li><a href="#tuning">Profile-driven tuning</a></li>
+      <li><a href="#verify">Prove it uses system RAM</a></li>
+    </ul></div>
+  <div class="group"><button class="gtitle">Advanced <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+    <ul>
+      <li><a href="#events"><span class="phase-dot" style="background:#e07aa2"></span>Stream sync with CUDA events</a></li>
+      <li><a href="#allocator">Custom host allocator</a></li>
+      <li><a href="#dma">PCIe DMA tuning</a></li>
+      <li><a href="#pitfalls">Correctness pitfalls we hit</a></li>
+      <li><a href="#multigpu">Multi-GPU pipelines</a></li>
+    </ul></div>
+  <div class="group"><button class="gtitle">Reference <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+    <ul>
+      <li><a href="#api"><span class="phase-dot" style="background:var(--muted)"></span>Python API</a></li>
+      <li><a href="#native">Native module (_C)</a></li>
+      <li><a href="#layout">Project layout</a></li>
+      <li><a href="#limits">Limitations</a></li>
+    </ul></div>
+</nav>
+
+<main>
+<div class="wrap">
+
+<!-- ======================================================= OVERVIEW -->
+<section id="mission" class="hero">
+  <div class="kicker overview">Project overview</div>
+  <h1>Train models larger than your GPU, over the PCIe bus you already have.</h1>
+  <p class="lead">TrainStream is a standalone C++/CUDA extension for PyTorch. It moves optimizer state, gradients and activations into pinned host RAM, streams them over dedicated CUDA copy streams, and overlaps all of it with compute. It uses no DeepSpeed, no bitsandbytes and no third-party libraries: only the C++ standard library, the CUDA runtime and PyTorch's ATen.</p>
+  <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">import trainstream
+model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integration</pre></div>
+  <div class="hero-grid">
+    <div class="stat"><div class="k">VRAM per parameter (fp32 + AdamW)</div><div class="v">16 → 4 B</div><div class="s">weights stay; grads and moments leave</div></div>
+    <div class="stat"><div class="k">Qwen2.5-1.5B full fine-tune, 24 GB GPU</div><div class="v">35.9 → 18.7 GiB</div><div class="s">peak VRAM, same losses, 3.9× faster than spilling</div></div>
+    <div class="stat"><div class="k">Parity with torch.optim.AdamW</div><div class="v">≤ 3e-7</div><div class="s">max abs param difference after 20 steps</div></div>
+    <div class="stat"><div class="k">Runtime dependencies</div><div class="v">0</div><div class="s">CUDA runtime + ATen only</div></div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="kicker overview">Overview</div>
+  <h2>Memory architecture</h2>
+  <p>TrainStream manages three independent data paths. Each runs on its own CUDA stream and is ordered against compute with CUDA events, never with a device-wide sync. A fourth actor, a pool of C++ worker threads, runs the optimizer math on the host.</p>
+  <figure>
+    <div class="fig">
+      <svg viewBox="0 0 940 470" role="img" aria-label="Memory architecture: GPU VRAM, PCIe streams and host RAM">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#c3c2b7"/></marker>
+          <marker id="ahp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#d55181"/></marker>
+          <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#3987e5"/></marker>
+          <marker id="aho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#199e70"/></marker>
+        </defs>
+        <!-- GPU -->
+        <rect x="16" y="16" width="290" height="438" rx="14" fill="#14202e" stroke="#3987e5" stroke-opacity=".55"/>
+        <text x="34" y="46" fill="#9ec5f4" font-size="15" font-weight="700">GPU · VRAM</text>
+        <text x="34" y="66" fill="#898781" font-size="12">compute stream (PyTorch's current stream)</text>
+        <rect x="34" y="84" width="254" height="56" rx="9" fill="#1c3550" stroke="#3987e5" stroke-opacity=".5"/>
+        <text x="48" y="107" fill="#f0efec" font-size="13.5" font-weight="600">Weights (resident)</text>
+        <text x="48" y="127" fill="#c3c2b7" font-size="12">fp32 or bf16 · the only static cost</text>
+        <rect x="34" y="152" width="254" height="56" rx="9" fill="#1a2632" stroke="#3987e5" stroke-opacity=".35" stroke-dasharray="5 4"/>
+        <text x="48" y="175" fill="#f0efec" font-size="13.5" font-weight="600">Gradients (transient)</text>
+        <text x="48" y="195" fill="#c3c2b7" font-size="12">freed the moment D2H is queued</text>
+        <rect x="34" y="220" width="254" height="56" rx="9" fill="#1a2632" stroke="#3987e5" stroke-opacity=".35"/>
+        <text x="48" y="243" fill="#f0efec" font-size="13.5" font-weight="600">Resident activations</text>
+        <text x="48" y="263" fill="#c3c2b7" font-size="12">blocks not chosen by the profiler</text>
+        <rect x="34" y="288" width="122" height="62" rx="9" fill="#3a1d2c" stroke="#d55181" stroke-opacity=".6"/>
+        <text x="46" y="312" fill="#f0efec" font-size="13" font-weight="600">Slot A</text>
+        <text x="46" y="332" fill="#c3c2b7" font-size="11.5">block b computing</text>
+        <rect x="166" y="288" width="122" height="62" rx="9" fill="#3a1d2c" stroke="#d55181" stroke-opacity=".6" stroke-dasharray="5 4"/>
+        <text x="178" y="312" fill="#f0efec" font-size="13" font-weight="600">Slot B</text>
+        <text x="178" y="332" fill="#c3c2b7" font-size="11.5">block b−1 landing</text>
+        <text x="34" y="372" fill="#898781" font-size="12">ping-pong prefetch window (depth 1)</text>
+        <rect x="34" y="388" width="254" height="48" rx="9" fill="#1a2632" stroke="#9085e9" stroke-opacity=".5"/>
+        <text x="48" y="409" fill="#f0efec" font-size="13" font-weight="600">Zero-copy AdamW kernel</text>
+        <text x="48" y="427" fill="#c3c2b7" font-size="11.5">reads moments straight from host (gpu mode)</text>
+
+        <!-- PCIe -->
+        <rect x="336" y="16" width="250" height="438" rx="14" fill="#1b1a26" stroke="#9085e9" stroke-opacity=".45"/>
+        <text x="354" y="46" fill="#c9c2f5" font-size="15" font-weight="700">PCIe · copy engines</text>
+        <text x="354" y="66" fill="#898781" font-size="12">measured 27–29 GB/s per direction</text>
+        <line x1="306" y1="112" x2="610" y2="112" stroke="#199e70" stroke-width="2.5" marker-end="url(#aho)"/>
+        <text x="354" y="102" fill="#f0efec" font-size="13" font-weight="600">d2h stream · low priority</text>
+        <text x="354" y="132" fill="#c3c2b7" font-size="11.5">gradients, activation stashes</text>
+        <line x1="610" y1="196" x2="310" y2="196" stroke="#3987e5" stroke-width="2.5" marker-end="url(#ahg)"/>
+        <text x="354" y="186" fill="#f0efec" font-size="13" font-weight="600">h2d stream · high priority</text>
+        <text x="354" y="216" fill="#c3c2b7" font-size="11.5">updated weights, activation prefetch</text>
+        <line x1="306" y1="410" x2="610" y2="410" stroke="#9085e9" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ah)"/>
+        <line x1="610" y1="420" x2="310" y2="420" stroke="#9085e9" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ah)"/>
+        <text x="354" y="398" fill="#f0efec" font-size="13" font-weight="600">upd stream · zero-copy</text>
+        <text x="354" y="442" fill="#c3c2b7" font-size="11.5">kernel load/store over the bus</text>
+        <rect x="354" y="248" width="214" height="118" rx="9" fill="#222220" stroke="rgba(255,255,255,.12)"/>
+        <text x="368" y="272" fill="#f0efec" font-size="12.5" font-weight="600">Ordering, GPU-side only</text>
+        <text x="368" y="294" fill="#c3c2b7" font-size="11.5">record(event, compute)</text>
+        <text x="368" y="313" fill="#c3c2b7" font-size="11.5">cudaStreamWaitEvent(copy, event)</text>
+        <text x="368" y="332" fill="#c3c2b7" font-size="11.5">cudaMemcpyAsync(…, copy)</text>
+        <text x="368" y="351" fill="#c3c2b7" font-size="11.5">record(done, copy) → consumer waits</text>
+
+        <!-- Host -->
+        <rect x="616" y="16" width="308" height="438" rx="14" fill="#13241e" stroke="#199e70" stroke-opacity=".55"/>
+        <text x="634" y="46" fill="#8be0bf" font-size="15" font-weight="700">Host RAM</text>
+        <text x="634" y="66" fill="#898781" font-size="12">cudaHostAlloc via the pin-logging allocator</text>
+        <rect x="634" y="84" width="272" height="56" rx="9" fill="#173a2e" stroke="#199e70" stroke-opacity=".55"/>
+        <text x="648" y="107" fill="#f0efec" font-size="13.5" font-weight="600">Gradient staging (pinned)</text>
+        <text x="648" y="127" fill="#c3c2b7" font-size="12">DMA target, read in place by AdamW</text>
+        <rect x="634" y="152" width="272" height="56" rx="9" fill="#173a2e" stroke="#199e70" stroke-opacity=".55"/>
+        <text x="648" y="175" fill="#f0efec" font-size="13.5" font-weight="600">fp32 master weights (pinned)</text>
+        <text x="648" y="195" fill="#c3c2b7" font-size="12">H2D source for the updated weights</text>
+        <rect x="634" y="220" width="272" height="56" rx="9" fill="#173a2e" stroke="#199e70" stroke-opacity=".4" stroke-dasharray="5 4"/>
+        <text x="648" y="243" fill="#f0efec" font-size="13.5" font-weight="600">Adam moments m, v</text>
+        <text x="648" y="263" fill="#c3c2b7" font-size="12">pinned within a 40% RAM budget, else pageable</text>
+        <rect x="634" y="288" width="272" height="56" rx="9" fill="#3a1d2c" stroke="#d55181" stroke-opacity=".55"/>
+        <text x="648" y="311" fill="#f0efec" font-size="13.5" font-weight="600">Activation stashes (pinned)</text>
+        <text x="648" y="331" fill="#c3c2b7" font-size="12">size-bucketed cache, event-fenced reuse</text>
+        <rect x="634" y="362" width="272" height="74" rx="9" fill="#2c2614" stroke="#c98500" stroke-opacity=".6"/>
+        <text x="648" y="386" fill="#f0efec" font-size="13.5" font-weight="600">C++ worker pool</text>
+        <text x="648" y="406" fill="#c3c2b7" font-size="12">AdamW per 1M-element chunk, FIFO per</text>
+        <text x="648" y="424" fill="#c3c2b7" font-size="12">(tensor, chunk): no locks on the hot path</text>
+      </svg>
+    </div>
+    <figcaption>Figure 1. Where every byte lives. Dashed outlines are buffers whose lifetime is a fraction of a step. Arrows are the three CUDA streams TrainStream creates per device.</figcaption>
+  </figure>
+
+  <h3>One training step, end to end (cpu optimizer mode)</h3>
+  <figure>
+    <div class="fig">
+      <svg viewBox="0 0 940 300" role="img" aria-label="Timeline showing compute, copy streams and CPU workers overlapping">
+        <text x="16" y="56" fill="#c3c2b7" font-size="12.5">compute</text>
+        <text x="16" y="106" fill="#c3c2b7" font-size="12.5">d2h stream</text>
+        <text x="16" y="156" fill="#c3c2b7" font-size="12.5">h2d stream</text>
+        <text x="16" y="206" fill="#c3c2b7" font-size="12.5">CPU workers</text>
+        <line x1="110" y1="240" x2="924" y2="240" stroke="#383835"/>
+        <text x="110" y="262" fill="#898781" font-size="11.5">forward</text>
+        <text x="430" y="262" fill="#898781" font-size="11.5">backward</text>
+        <text x="760" y="262" fill="#898781" font-size="11.5">next forward</text>
+        <!-- compute -->
+        <g fill="#3987e5"><rect x="110" y="40" width="58" height="26" rx="4"/><rect x="170" y="40" width="58" height="26" rx="4"/><rect x="230" y="40" width="58" height="26" rx="4"/><rect x="290" y="40" width="58" height="26" rx="4"/></g>
+        <g fill="#256abf"><rect x="400" y="40" width="88" height="26" rx="4"/><rect x="490" y="40" width="88" height="26" rx="4"/><rect x="580" y="40" width="88" height="26" rx="4"/><rect x="670" y="40" width="80" height="26" rx="4"/></g>
+        <g fill="#3987e5"><rect x="768" y="40" width="58" height="26" rx="4"/><rect x="828" y="40" width="58" height="26" rx="4"/></g>
+        <text x="122" y="58" fill="#fff" font-size="11">blk 0</text><text x="182" y="58" fill="#fff" font-size="11">blk 1</text><text x="242" y="58" fill="#fff" font-size="11">blk 2</text><text x="302" y="58" fill="#fff" font-size="11">blk 3</text>
+        <text x="414" y="58" fill="#fff" font-size="11">bwd 3</text><text x="504" y="58" fill="#fff" font-size="11">bwd 2</text><text x="594" y="58" fill="#fff" font-size="11">bwd 1</text><text x="684" y="58" fill="#fff" font-size="11">bwd 0</text>
+        <text x="780" y="58" fill="#fff" font-size="11">blk 0</text><text x="840" y="58" fill="#fff" font-size="11">blk 1</text>
+        <!-- d2h -->
+        <g fill="#d55181"><rect x="172" y="90" width="70" height="26" rx="4"/><rect x="244" y="90" width="70" height="26" rx="4"/></g>
+        <text x="180" y="108" fill="#fff" font-size="11">act 0 out</text><text x="252" y="108" fill="#fff" font-size="11">act 1 out</text>
+        <g fill="#199e70"><rect x="492" y="90" width="44" height="26" rx="4"/><rect x="582" y="90" width="44" height="26" rx="4"/><rect x="672" y="90" width="44" height="26" rx="4"/><rect x="752" y="90" width="30" height="26" rx="4"/></g>
+        <text x="497" y="108" fill="#fff" font-size="11">g 3</text><text x="587" y="108" fill="#fff" font-size="11">g 2</text><text x="677" y="108" fill="#fff" font-size="11">g 1</text><text x="754" y="108" fill="#fff" font-size="10">g0</text>
+        <!-- h2d -->
+        <g fill="#d55181"><rect x="500" y="140" width="70" height="26" rx="4" opacity=".85"/><rect x="580" y="140" width="70" height="26" rx="4" opacity=".85"/></g>
+        <text x="506" y="158" fill="#fff" font-size="11">act 1 in</text><text x="586" y="158" fill="#fff" font-size="11">act 0 in</text>
+        <g fill="#3987e5"><rect x="652" y="140" width="34" height="26" rx="4"/><rect x="690" y="140" width="34" height="26" rx="4"/><rect x="728" y="140" width="34" height="26" rx="4"/><rect x="766" y="140" width="24" height="26" rx="4"/></g>
+        <text x="656" y="158" fill="#fff" font-size="10">W3</text><text x="694" y="158" fill="#fff" font-size="10">W2</text><text x="732" y="158" fill="#fff" font-size="10">W1</text><text x="767" y="158" fill="#fff" font-size="10">W0</text>
+        <!-- cpu -->
+        <g fill="#c98500"><rect x="538" y="190" width="80" height="26" rx="4"/><rect x="628" y="190" width="80" height="26" rx="4"/><rect x="718" y="190" width="40" height="26" rx="4"/><rect x="784" y="190" width="20" height="26" rx="4"/></g>
+        <text x="546" y="208" fill="#fff" font-size="11">AdamW 3</text><text x="636" y="208" fill="#fff" font-size="11">AdamW 2</text><text x="722" y="208" fill="#fff" font-size="10">Adam 1</text>
+        <!-- dependency arrows -->
+        <path d="M536 116 L540 190" stroke="#c3c2b7" stroke-width="1.2" fill="none" marker-end="url(#ah)" opacity=".7"/>
+        <path d="M618 203 L652 160" stroke="#c3c2b7" stroke-width="1.2" fill="none" marker-end="url(#ah)" opacity=".7"/>
+        <path d="M790 153 L800 70" stroke="#c3c2b7" stroke-width="1.2" fill="none" marker-end="url(#ah)" opacity=".7"/>
+      </svg>
+    </div>
+    <div class="legend"><span><i style="background:#3987e5"></i>compute / weight upload</span><span><i style="background:#d55181"></i>activation paging</span><span><i style="background:#199e70"></i>gradient streaming</span><span><i style="background:#c98500"></i>host AdamW</span></div>
+    <figcaption>Figure 2. Schematic of the overlap, not to scale. A tensor's update starts the moment its gradient lands on the host (eager mode), so host math runs under the rest of backward. The next forward waits per module, and only on a cudaStreamWaitEvent, so block 0 can start before the last weights have been uploaded.</figcaption>
+  </figure>
+</section>
+
+<section id="pcie">
+  <div class="kicker overview">Overview</div>
+  <h2>PCIe bandwidth analysis</h2>
+  <p>Offloading is a trade between bytes moved and FLOPs available to hide them. The profiler measures both on your machine at start-up. Every number below was measured by <code>trainstream.profile_hardware(quick=False)</code> on the development machine: an RTX 5090 Laptop GPU (sm_120, 24 GB, PCIe 5.0 x8) with a 24-core host, 63 GB of RAM and Windows 11 (WDDM).</p>
+  <div class="grid-2">
+    <div class="card">
+      <h4 style="margin-top:0">Pinned transfer bandwidth by transfer size</h4>
+      <div class="bar-row"><span class="name">64 KiB H2D</span><span class="track"><span class="fill" style="display:block;width:18.9%;background:#3987e5"></span></span><span class="val">5.4 GB/s</span></div>
+      <div class="bar-row"><span class="name">256 KiB H2D</span><span class="track"><span class="fill" style="display:block;width:70.3%;background:#3987e5"></span></span><span class="val">20.1 GB/s</span></div>
+      <div class="bar-row"><span class="name">1 MiB H2D</span><span class="track"><span class="fill" style="display:block;width:94.4%;background:#3987e5"></span></span><span class="val">27.0 GB/s</span></div>
+      <div class="bar-row"><span class="name">16 MiB H2D</span><span class="track"><span class="fill" style="display:block;width:100%;background:#3987e5"></span></span><span class="val">28.6 GB/s</span></div>
+      <div class="bar-row"><span class="name">64 KiB D2H</span><span class="track"><span class="fill" style="display:block;width:31.5%;background:#199e70"></span></span><span class="val">9.0 GB/s</span></div>
+      <div class="bar-row"><span class="name">1 MiB D2H</span><span class="track"><span class="fill" style="display:block;width:94.1%;background:#199e70"></span></span><span class="val">26.9 GB/s</span></div>
+      <div class="bar-row"><span class="name">64 MiB D2H</span><span class="track"><span class="fill" style="display:block;width:100%;background:#199e70"></span></span><span class="val">28.6 GB/s</span></div>
+      <p style="font-size:13px">Below about 1 MiB, per-DMA setup cost dominates; the 4 KiB latency is 4.8 µs. TrainStream only pages tensors of at least 1 MiB (<code>min_offload_bytes</code>) and chunks optimizer work at 1M elements.</p>
+    </div>
+    <div class="card">
+      <h4 style="margin-top:0">The numbers that drive every decision</h4>
+      <div class="tbl" style="margin:0"><table>
+        <tr><th>Quantity</th><th class="num">Measured</th></tr>
+        <tr><td>Pinned H2D / D2H</td><td class="num">27.9 / 27.4 GB/s</td></tr>
+        <tr><td>Both directions at once</td><td class="num">27.9 GB/s</td></tr>
+        <tr><td>Duplex factor</td><td class="num">1.00×</td></tr>
+        <tr><td>Pageable H2D</td><td class="num">14.5 GB/s</td></tr>
+        <tr><td>bf16 / fp32 matmul</td><td class="num">94.6 / 27.6 TFLOPS</td></tr>
+        <tr><td>Host AdamW (12 threads)</td><td class="num">2.5–2.8 Gelem/s</td></tr>
+        <tr><td>Zero-copy AdamW kernel</td><td class="num">1.5–2.7 Gelem/s</td></tr>
+        <tr><td>Break-even intensity</td><td class="num">≈ 3,400 FLOP/B</td></tr>
+      </table></div>
+    </div>
+  </div>
+  <div class="callout warn"><p class="t">Duplex factor 1.0: the two directions share one budget here</p>
+    <p>On this Windows laptop, pushing H2D and D2H at the same time yields the same 27.9 GB/s as one direction alone, so the copy engines effectively serialise. Workstation and Linux systems usually measure close to 2×. TrainStream's offload model reads the measured factor rather than assuming one, which is why it pages fewer activation blocks here than the raw bandwidth suggests.</p></div>
+  <h3>Bytes per step, worked through</h3>
+  <p>For cpu-mode AdamW on <em>N</em> fp32 parameters, each step moves <strong>4N bytes down</strong> (gradients) and <strong>4N bytes up</strong> (updated weights). For the 1.8B model that is 7.3 GB each way: about 265 ms per direction at 27.4 GB/s, or about 530 ms when the directions serialise. The backward pass of that model at batch 8 × 512 tokens takes about 460 ms, so the link is roughly saturated before a single activation is paged. That is exactly the situation the profiler is there to detect.</p>
+  <p>Paging one 400 MiB transformer block costs a D2H and an H2D of 400 MiB, about 30 ms of link time at duplex factor 1. A block's forward takes about 6 ms on this GPU. Hiding a block's paging behind compute would take roughly 67 GB/s, so beyond a small prefix, paging activations here is a <strong>memory-for-time trade</strong>, not free. TrainStream makes the trade explicit (see <a href="#tuning">tuning</a>).</p>
+</section>
+
+<section id="results">
+  <div class="kicker overview">Overview</div>
+  <h2>Measured results</h2>
+  <p>A byte-level GPT is trained on Python's standard-library source with bf16 autocast, batch 8 × 512 tokens, on the development machine above. Every figure comes from the live dashboard or the test harness in this repository.</p>
+  <div class="tbl"><table>
+    <tr><th>Model</th><th>Engine</th><th class="num">Peak VRAM</th><th class="num">Step time</th><th class="num">Tokens/s</th><th>Notes</th></tr>
+    <tr><td>85M fp32</td><td>torch AdamW (fused)</td><td class="num">2.47 GiB</td><td class="num">44 ms</td><td class="num">92.5k</td><td>baseline</td></tr>
+    <tr><td>85M fp32</td><td>TrainStream cpu, auto paging</td><td class="num">1.83 GiB</td><td class="num">≈ 66 ms</td><td class="num">62.3k</td><td>loss curve matches the baseline (3.064 vs 3.089 at step 60)</td></tr>
+    <tr><td>1.8B fp32</td><td>torch AdamW (fused)</td><td class="num">34.1 GiB*</td><td class="num">13,675 ms</td><td class="num">0.3k</td><td>*more than the 24 GB card: the Windows driver spills to system RAM</td></tr>
+    <tr><td>1.8B fp32</td><td>TrainStream cpu, activations resident</td><td class="num">20.6 GiB</td><td class="num">≈ 1,090 ms</td><td class="num">3.8k</td><td>≈ 12.5× faster than the spilling baseline at this batch size; the spill penalty varies by workload (1.84 s/step at batch 4)</td></tr>
+    <tr><td>1.8B fp32</td><td>TrainStream cpu, 43% paged</td><td class="num">16.7 GiB</td><td class="num">≈ 1,420 ms</td><td class="num">2.9k</td><td>−3.9 GiB VRAM</td></tr>
+    <tr><td>1.8B fp32</td><td>TrainStream cpu, 100% paged</td><td class="num">13.5 GiB</td><td class="num">≈ 1,870 ms</td><td class="num">2.2k</td><td>−7.0 GiB VRAM; leaves room for larger batches or models</td></tr>
+  </table></div>
+  <p>Host footprint for 1.8B in cpu mode: 13.5 GiB pinned (fp32 master and gradient staging) plus 13.5 GiB of ordinary RAM for the moments, which the 40% pinning budget moved out of page-locked memory.</p>
+  <div class="callout"><p class="t">How to read the 85M row</p><p>For small models that already fit, TrainStream costs throughput: host AdamW at about 2.6 Gelem/s needs about 33 ms of host time per step for 85M parameters, and only part of that hides under a 30 ms backward. Offloading pays off when the alternative is not fitting at all, or when the freed VRAM buys a larger batch.</p></div>
+</section>
+
+<section id="matrix">
+  <div class="kicker overview">Overview</div>
+  <h2>Feature matrix</h2>
+  <div class="tbl"><table>
+    <tr><th>Capability</th><th>TrainStream</th><th>Implementation</th></tr>
+    <tr><td>Optimizer moments off-GPU</td><td><span class="yes">yes</span></td><td>cudaHostAlloc'd moments (pinned budget, else pageable)</td></tr>
+    <tr><td>Host AdamW (async, eager)</td><td><span class="yes">yes</span></td><td><code>offload_adamw.cpp</code>: worker pool, per-chunk FIFO</td></tr>
+    <tr><td>Zero-copy GPU AdamW</td><td><span class="yes">yes</span></td><td><code>offload_adamw_kernel.cu</code>: mapped pinned moments</td></tr>
+    <tr><td>fp16 / bf16 weights with fp32 master</td><td><span class="yes">yes</span></td><td>master in host RAM; rounded copy uploaded</td></tr>
+    <tr><td>Gradient streaming in backward</td><td><span class="yes">yes</span></td><td><code>register_post_accumulate_grad_hook</code> → D2H stream</td></tr>
+    <tr><td>Gradient accumulation</td><td><span class="yes">yes</span></td><td><code>accumulation_steps</code>; fp32 host accumulator</td></tr>
+    <tr><td>Global-norm clipping</td><td><span class="yes">yes</span></td><td>host reduction (cpu) or device reduction (gpu)</td></tr>
+    <tr><td>Activation paging + prefetch</td><td><span class="yes">yes</span></td><td>saved-tensor hooks, layout-preserving, depth-k window</td></tr>
+    <tr><td>Hardware profiler + auto ratio</td><td><span class="yes">yes</span></td><td>CUDA-event micro-benchmarks + closed-loop tuner</td></tr>
+    <tr><td>LR schedulers, state_dict</td><td><span class="yes">yes</span></td><td>real <code>torch.optim.Optimizer</code> subclass; AdamW-compatible state</td></tr>
+    <tr><td>Migrate an existing AdamW</td><td><span class="yes">yes</span></td><td><code>wrap()</code> moves moments to host and frees their VRAM</td></tr>
+    <tr><td>Hugging Face Trainer / PEFT</td><td><span class="yes">yes</span></td><td><code>trainstream.integrations.huggingface</code>: <code>TrainStreamTrainer</code>, <code>wrap_hf</code></td></tr>
+    <tr><td>Multi-GPU pipeline parallelism</td><td><span class="part">design guide</span></td><td>per-device runtimes exist; scheduling is <a href="#multigpu">documented</a>, not shipped</td></tr>
+    <tr><td>Parameter (weight) paging</td><td><span class="no">no</span></td><td>weights stay resident (see <a href="#limits">limitations</a>)</td></tr>
+    <tr><td>AMSGrad / maximize</td><td><span class="no">no</span></td><td>rejected with a clear error</td></tr>
+  </table></div>
+  <div class="tbl"><table>
+    <tr><th>Per-parameter cost (fp32)</th><th class="num">VRAM</th><th class="num">Host pinned</th><th class="num">Host other</th></tr>
+    <tr><td>torch.optim.AdamW</td><td class="num">16 B</td><td class="num">0</td><td class="num">0</td></tr>
+    <tr><td>TrainStream · cpu mode</td><td class="num">4 B + transient grad</td><td class="num">8 B (+8 B moments if within budget)</td><td class="num">8 B moments otherwise</td></tr>
+    <tr><td>TrainStream · gpu (zero-copy) mode</td><td class="num">8 B (weights + grad)</td><td class="num">8 B mapped moments</td><td class="num">0</td></tr>
+    <tr><td>TrainStream · cpu mode, bf16 weights</td><td class="num">2 B + transient grad</td><td class="num">8 B (master + 2 staging buffers)</td><td class="num">8 B moments</td></tr>
+  </table></div>
+</section>
+
+<hr>
+
+<!-- ======================================================= BEGINNER -->
+<section id="bottleneck">
+  <div class="kicker beginner">Beginner phase</div>
+  <h2>Why GPUs run out of memory</h2>
+  <p>Training a model needs far more memory than storing it. With the Adam family of optimizers, every single parameter brings along:</p>
+  <ul>
+    <li><strong>the weight itself</strong> (4 bytes in fp32),</li>
+    <li><strong>its gradient</strong> (4 bytes, rewritten every step),</li>
+    <li><strong>two running averages</strong> that Adam keeps, the first and second moments (4 + 4 bytes).</li>
+  </ul>
+  <p>That's 16 bytes per parameter before a single activation is stored, so a 1.5B-parameter model needs 24 GB just for this bookkeeping. On top of that, the forward pass saves <strong>activations</strong> (intermediate results) so the backward pass can use them, and they grow with batch size and sequence length.</p>
+  <div class="grid-2">
+    <div class="card"><h4 style="margin-top:0">What actually has to be on the GPU</h4><p>Only the data the GPU is computing with <em>right now</em>: the weights, plus one or two blocks' worth of activations and gradients. The optimizer moments are only touched once per step, by simple element-wise math, which a CPU does well.</p></div>
+    <div class="card"><h4 style="margin-top:0">What the host has plenty of</h4><p>A workstation or laptop often has 2–8× more system RAM than VRAM, and a PCIe link that moves roughly 25–60 GB/s. TrainStream's job is to move the right bytes across that link at the right moment, while the GPU keeps working.</p></div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="kicker beginner">Beginner phase</div>
+  <h2>Setup guide</h2>
+  <p>You need PyTorch with CUDA, a CUDA toolkit whose <strong>major version</strong> matches PyTorch's (for example torch <code>+cu130</code> with toolkit 13.x), and a C++ compiler (MSVC 2022+ on Windows, GCC 11+ on Linux).</p>
+  <ol class="steps">
+    <li><strong>Create an environment and install PyTorch.</strong>
+      <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">python -m venv .venv
+.venv\Scripts\activate                     # Linux/macOS: source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install setuptools wheel ninja         # build tooling only</pre></div></li>
+    <li><strong>Build the native extension.</strong> On Windows, <code>build.bat</code> loads the MSVC x64 environment, finds the CUDA toolkit and builds in place. Elsewhere, call setup.py directly. The target GPU architecture is detected automatically; set <code>TORCH_CUDA_ARCH_LIST</code> to override it.
+      <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">build.bat                                  # Windows
+python setup.py build_ext --inplace        # Linux
+pip install -e . --no-build-isolation      # optional: install into the environment</pre></div></li>
+    <li><strong>Verify.</strong> The test suite checks numerical parity with <code>torch.optim.AdamW</code>, bit-exact activation paging, allocator behaviour and end-to-end training.
+      <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">pip install pytest
+python -m pytest tests -q                  # 47 passed (9 need transformers)</pre></div></li>
+    <li><strong>Look at your hardware.</strong>
+      <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">import trainstream
+print(trainstream.profile_hardware().summary())</pre></div></li>
+  </ol>
+  <div class="callout"><p class="t">About the C++ standard</p><p>TrainStream's own sources use only C++17 features, and the CUDA translation unit includes nothing but CUDA headers. Recent PyTorch headers (2.10+) require C++20, so files that include ATen are compiled in C++20 mode; <code>torch.utils.cpp_extension</code> adds that flag automatically.</p></div>
+</section>
+
+<section id="first-run">
+  <div class="kicker beginner">Beginner phase</div>
+  <h2>Your first fine-tune</h2>
+  <p>Take any ordinary training loop. The only new line is the call to <code>wrap</code>; everything else stays standard PyTorch.</p>
+  <div class="code"><div class="bar"><span>finetune.py</span><button class="copy">Copy</button></div><pre data-lang="py">import torch
+import trainstream
+
+model = MyTransformer().cuda()                       # weights must already be on the GPU
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+
+model, optimizer = trainstream.wrap(model, optimizer)   # moments -> host, hooks installed
+
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10_000)  # create AFTER wrap
+
+for x, y in loader:
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = model(x.cuda(), y.cuda())
+    loss.backward()            # gradients stream to host RAM as they are produced
+    optimizer.step()           # returns immediately; updates finish in the background
+    optimizer.zero_grad()
+    scheduler.step()
+
+optimizer.synchronize()        # wait for the last update before saving
+torch.save({"model": model.state_dict(), "optim": optimizer.state_dict()}, "ckpt.pt")</pre></div>
+  <h4>Gradient accumulation and clipping</h4>
+  <p>Because gradients leave the GPU during backward, <code>torch.nn.utils.clip_grad_norm_</code> has nothing to see. Pass clipping and accumulation to <code>wrap</code> instead:</p>
+  <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">model, optimizer = trainstream.wrap(
+    model, optimizer,
+    accumulation_steps=4,      # backward passes per optimizer.step()
+    max_grad_norm=1.0,         # global-norm clipping, computed on the host
+)</pre></div>
+  <div class="callout warn"><p class="t">Declare your accumulation</p><p>With <code>accumulation_steps=1</code> (the default) and no clipping, each tensor's update runs <em>during</em> backward. If you run a second backward before <code>step()</code> without declaring it, TrainStream raises an error instead of silently changing your training math.</p></div>
+</section>
+
+<section id="huggingface">
+  <div class="kicker beginner">Beginner phase</div>
+  <h2>Hugging Face transformers</h2>
+  <p>TrainStream ships an optional integration for <code>transformers</code>. It works with any causal LM (Llama, Qwen, Mistral, GPT-2, …), with the <code>Trainer</code>, and with PEFT/LoRA. It needs <code>pip install transformers accelerate</code> (plus <code>peft</code> for LoRA); the core library still has no dependencies.</p>
+  <h4>With the Trainer: change one class name</h4>
+  <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">from transformers import AutoModelForCausalLM, TrainingArguments
+from trainstream.integrations.huggingface import TrainStreamTrainer
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B", dtype=torch.float32).cuda()
+args = TrainingArguments(output_dir="out", bf16=True, per_device_train_batch_size=4,
+                         gradient_accumulation_steps=2, learning_rate=2e-5, max_grad_norm=1.0,
+                         optim="adamw_torch", logging_steps=10)
+trainer = TrainStreamTrainer(model=model, args=args, train_dataset=ds,
+                             trainstream={"activation_offload": "auto"})   # optional wrap() options
+trainer.train()</pre></div>
+  <p>Hyper-parameters, the decay/no-decay parameter split, the LR schedule, gradient accumulation, clipping, checkpoint saving and <code>resume_from_checkpoint</code> all carry over. Each log line gains TrainStream metrics: <code>ts_vram_peak_gb</code>, <code>ts_pinned_gb</code>, <code>ts_host_state_gb</code>, <code>ts_d2h_gb</code> and <code>ts_h2d_gb</code>.</p>
+  <h4>With your own loop or accelerate</h4>
+  <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">from trainstream.integrations.huggingface import wrap_hf
+model, optimizer = wrap_hf(model, torch.optim.AdamW(model.parameters(), lr=2e-5))   # decoder layers auto-detected</pre></div>
+  <h4>LoRA / PEFT</h4>
+  <p>Wrap the PEFT model as usual. Only trainable (adapter) parameters get host optimizer state; frozen base weights are left alone. For LoRA, VRAM goes mostly to activations, so <code>activation_offload</code> is the lever that matters there.</p>
+  <div class="tbl"><table>
+    <tr><th>Measured: full fine-tune, bf16 autocast, batch 4 × 512, accumulation 2</th><th class="num">Peak VRAM</th><th class="num">Wall time</th><th>Losses</th></tr>
+    <tr><td>Qwen2.5-0.5B · stock Trainer</td><td class="num">14.97 GiB</td><td class="num">11.3 s (30 steps)</td><td>1.627, 1.668, 1.767, 1.570 …</td></tr>
+    <tr><td>Qwen2.5-0.5B · TrainStreamTrainer</td><td class="num">9.49 GiB</td><td class="num">21.7 s (30 steps)</td><td>1.627, 1.668, 1.767, 1.571 …</td></tr>
+    <tr><td>Qwen2.5-1.5B · stock Trainer</td><td class="num">35.9 GiB*</td><td class="num">111.7 s (10 steps)</td><td>1.364, 1.507, 1.360, 1.417 …</td></tr>
+    <tr><td>Qwen2.5-1.5B · TrainStreamTrainer</td><td class="num">18.7 GiB</td><td class="num">28.5 s (10 steps)</td><td>1.364, 1.507, 1.359, 1.416 …</td></tr>
+  </table></div>
+  <p style="font-size:13px">*More than the 24 GB card: the Windows driver spilled about 12 GiB into system RAM, and the run was 3.9× slower. Full numbers come from <code>examples/hf_finetune.py --compare</code>.</p>
+  <div class="callout warn"><p class="t">Supported precision</p><p>Use <code>bf16=True</code> or fp32. <code>fp16=True</code> is rejected: its GradScaler must inspect gradients on the GPU, and TrainStream has already streamed them to host RAM.</p></div>
+</section>
+
+<section id="terms">
+  <div class="kicker beginner">Beginner phase</div>
+  <h2>Key terminology</h2>
+  <dl class="terms">
+    <dt>VRAM</dt><dd>The GPU's own memory. Fast and scarce: everything the GPU computes on must be here.</dd>
+    <dt>Host RAM</dt><dd>Your computer's main memory. Larger and slower to reach from the GPU.</dd>
+    <dt>PCIe</dt><dd>The bus connecting GPU and CPU. Every offloaded byte crosses it, at tens of GB/s.</dd>
+    <dt>Pinned memory</dt><dd>Host RAM locked so the OS can't move it. The GPU's copy engines can then DMA into it directly and asynchronously, at about twice the speed of ordinary (pageable) memory here.</dd>
+    <dt>DMA</dt><dd>Direct memory access: a hardware copy engine moves data while the GPU's compute units keep working.</dd>
+    <dt>CUDA stream</dt><dd>A queue of GPU work that runs in order. Work on different streams can overlap.</dd>
+    <dt>CUDA event</dt><dd>A marker recorded into a stream. Another stream can wait on it, giving ordering without stopping the CPU.</dd>
+    <dt>Activations</dt><dd>Intermediate results saved during forward because backward needs them.</dd>
+    <dt>Optimizer state / moments</dt><dd>Adam's per-parameter running averages of the gradient (m) and squared gradient (v).</dd>
+    <dt>Master weights</dt><dd>An fp32 copy of the weights used for the update when the GPU weights are fp16/bf16.</dd>
+    <dt>Prefetch</dt><dd>Starting a transfer before the data is needed, so it has arrived by the time it is.</dd>
+    <dt>Zero-copy</dt><dd>A GPU kernel reads and writes host memory directly over PCIe, without a separate copy step.</dd>
+  </dl>
+</section>
+
+<section id="dashboard">
+  <div class="kicker beginner">Beginner phase</div>
+  <h2>Live dashboard</h2>
+  <p>The repository ships a real-time test interface. It trains actual models on your GPU and streams measurements to the browser. It needs nothing beyond the Python standard library and TrainStream itself.</p>
+  <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">python dashboard/server.py           # then open http://127.0.0.1:8765</pre></div>
+  <ul>
+    <li><strong>One-click full report (default):</strong> pick a model and press <em>Start full report</em>. The dashboard verifies the optimizer math, then runs TensorFlow + AdamW, PyTorch + stock AdamW and PyTorch + TrainStream (optionally TrainStream zero-copy) on identical settings, and produces one report: a headline, PASS/FAIL verdicts (fits or not, VRAM saved, state in RAM, no hidden spill, same loss), a results table, loss and VRAM charts, and cause-specific recommendations. Reports are saved under <code>dashboard/reports/</code> as HTML and JSON. Example result on the 1.2B model: stock AdamW stopped at the VRAM limit after 2 steps, while TrainStream completed all 30 steps with 13.7 GiB peak VRAM and 18.0 GiB of optimizer state in system RAM.</li>
+    <li><strong>Clear and Fresh restart</strong> (header buttons): <em>Clear</em> wipes runs, charts, the log and the current report for every viewer, optionally releasing cached GPU and pinned memory and deleting saved reports. <em>Fresh restart</em> stops any job, ends leftover TensorFlow workers and restarts the server in a new process, returning all of its VRAM and pinned RAM (in testing: 6.5 GiB → 0.8 GiB in about 5 s); the page reloads by itself. The restarted server logs to <code>%TEMP%\trainstream-dashboard.log</code>.</li>
+    <li><strong>Training runs:</strong> pick a GPT preset from 20M to 1.8B parameters and run TrainStream, stock AdamW, or both back to back for a side-by-side comparison. Loss, held-out loss, throughput, step time and peak VRAM update every step.</li>
+    <li><strong>Live telemetry</strong> (2 Hz): bytes/s on TrainStream's copy streams, VRAM, pinned memory by tag, GPU utilisation and power.</li>
+    <li><strong>Engine internals:</strong> host AdamW time, forward waits on weights, which activation blocks are paged, and prefetch hit rate.</li>
+    <li><strong>Profiler and verification:</strong> run the hardware micro-benchmarks, the parity check against <code>torch.optim.AdamW</code>, and a 100M-parameter optimizer benchmark from the page.</li>
+  </ul>
+</section>
+
+<hr>
+
+<!-- ======================================================= INTERMEDIATE -->
+<section id="prefetch">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Double-buffered stream prefetching</h2>
+  <p>The activation pager plugs into <code>torch.autograd.graph.saved_tensors_hooks</code>. Everything autograd saves inside a selected block goes through <code>pack</code> during forward and comes back through <code>unpack</code> during backward.</p>
+  <figure>
+    <div class="fig">
+      <svg viewBox="0 0 900 230" role="img" aria-label="Ping-pong prefetch window during backward">
+        <text x="16" y="30" fill="#c3c2b7" font-size="12.5">backward order →</text>
+        <g font-size="12" fill="#fff">
+          <rect x="16" y="50" width="150" height="40" rx="8" fill="#256abf"/><text x="30" y="75">block 5 (resident)</text>
+          <rect x="180" y="50" width="150" height="40" rx="8" fill="#256abf"/><text x="194" y="75">block 4 computing</text>
+          <rect x="344" y="50" width="150" height="40" rx="8" fill="#d55181"/><text x="358" y="75">block 3 landing</text>
+          <rect x="508" y="50" width="150" height="40" rx="8" fill="#3a1d2c" stroke="#d55181"/><text x="522" y="75" fill="#c3c2b7">block 2 in host</text>
+          <rect x="672" y="50" width="150" height="40" rx="8" fill="#3a1d2c" stroke="#d55181"/><text x="686" y="75" fill="#c3c2b7">block 1 in host</text>
+        </g>
+        <path d="M255 100 C 300 150, 380 150, 418 100" stroke="#c3c2b7" fill="none" stroke-width="1.4" marker-end="url(#ah)"/>
+        <text x="236" y="166" fill="#c3c2b7" font-size="12">first unpack in block 4 stages block 3 on the h2d stream</text>
+        <rect x="180" y="186" width="314" height="30" rx="8" fill="none" stroke="#e0a32a" stroke-dasharray="6 4"/>
+        <text x="196" y="206" fill="#e0a32a" font-size="12">ping-pong window: two blocks resident (depth = 1)</text>
+      </svg>
+    </div>
+    <figcaption>Figure 3. With <code>prefetch_depth=1</code>, at most the computing block and the next one are in VRAM. A deeper window trades VRAM for more slack on slow links.</figcaption>
+  </figure>
+  <h4>Forward: pack</h4>
+  <ol>
+    <li>Skip parameters, non-CUDA tensors and anything smaller than <code>min_offload_bytes</code>. Those come back as a light <code>_Resident</code> tag that still knows its block, so unpacking it can trigger the next prefetch.</li>
+    <li><strong>Deduplicate.</strong> Several ops often save the same tensor (q, k and v projections all save the LayerNorm output). A weak-reference map ensures each tensor is copied once.</li>
+    <li>Allocate a pinned stash from the caching allocator, queue <code>d2h_async</code> (the copy stream waits on an event recorded on compute), and keep the VRAM source alive only until that copy's event completes.</li>
+    <li><strong>Backpressure.</strong> If more than <code>max_inflight_bytes</code> are still crossing the link, the host waits for the oldest copy. Without this, a fast GPU outruns PCIe and paging saves almost no memory: on the 1.8B model, 43% paging saved 0.4 GiB without backpressure and 3.9 GiB with it.</li>
+  </ol>
+  <h4>Backward: unpack</h4>
+  <ol>
+    <li>On the first touch of block <em>b</em>, stage blocks <em>b−1 … b−depth</em> with <code>h2d_alloc_async</code>. The destination comes from the compute stream's own pool, so paging never splits VRAM into a second per-stream pool, and the copy is ordered after work already queued there.</li>
+    <li>Return the tensor after making the compute stream wait (GPU-side) on its H2D event. The host never blocks.</li>
+    <li>The tensor is restored with its <strong>exact original strides</strong>; see <a href="#pitfalls">pitfalls</a> for why that matters.</li>
+  </ol>
+  <div class="code"><div class="bar"><span>python · manual control</span><button class="copy">Copy</button></div><pre data-lang="py">from trainstream import ActivationOffloader, find_blocks
+
+off = ActivationOffloader(model, find_blocks(model), offload=0.5,   # first 50% of blocks
+                          prefetch_depth=1, min_bytes=1 &lt;&lt; 20, max_inflight_bytes=1 &lt;&lt; 30)
+...
+print(off.stats)   # packed_bytes, prefetch_hits/misses, dedup_hits, backpressure_ms, ...</pre></div>
+</section>
+
+<section id="adamw">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Offloaded AdamW mechanics</h2>
+  <p>Both optimizer modes reproduce <code>torch.optim.AdamW</code>'s arithmetic order exactly: decoupled decay, <code>lerp</code> for <em>m</em>, <code>addcmul</code> for <em>v</em>, and <code>denom = √v / √(1−β₂ᵗ) + ε</code>. That's why parity comes out at about 3e-7 rather than "close enough".</p>
+  <h3>cpu mode: host AdamW</h3>
+  <p>Each parameter becomes a <em>slot</em> split into 1M-element chunks. Chunk <em>c</em> of slot <em>s</em> always goes to worker <code>(s·2654435761 + c) mod T</code>, so accumulate → norm → update for any chunk run in FIFO order on one thread without locks. When the last chunk of a slot finishes, its finaliser queues the H2D upload on the h2d stream and publishes the slot's <code>ready</code> event.</p>
+  <div class="code"><div class="bar"><span>csrc/offload_adamw.cpp · inner loop</span><button class="copy">Copy</button></div><pre data-lang="cpp">template &lt;typename G, typename P, bool kStage&gt;
+void adamw_host(float* p, float* m, float* v, const G* g, P* stage,
+                int64_t b, int64_t e, const HostHp&amp; hp) {
+  const float decay = 1.0f - hp.lr * hp.weight_decay;
+  for (int64_t i = b; i &lt; e; ++i) {
+    const float gi = static_cast&lt;float&gt;(g[i]) * hp.clip;     // fp32 accumulator or raw DMA staging
+    const float mi = m[i] + (1.0f - hp.beta1) * (gi - m[i]);  // lerp
+    const float vi = hp.beta2 * v[i] + (1.0f - hp.beta2) * gi * gi;
+    const float pi = p[i] * decay - hp.step_size * (mi / (std::sqrt(vi) / hp.bc2_sqrt + hp.eps));
+    m[i] = mi; v[i] = vi; p[i] = pi;
+    if constexpr (kStage) stage[i] = static_cast&lt;P&gt;(pi);     // bf16/fp16 copy for the upload
+  }
+}</pre></div>
+  <p><strong>Eager updates.</strong> With a single micro-batch and no clipping, the update for a tensor is queued from inside its gradient hook, and reads the pinned DMA staging buffer directly, with no fp32 accumulator round trip. On the 85M model this cut the post-backward drain from 42 ms to 19 ms.</p>
+  <h3>gpu mode: zero-copy kernel</h3>
+  <p>Moments are allocated with <code>cudaHostAllocMapped</code>, and the kernel dereferences their device aliases directly. Each warp-wide load becomes a PCIe read, so the kernel is bus-bound by design (16 B of traffic per fp32 parameter). It hides about 1–2 µs of PCIe latency by issuing every load for four unrolled elements before consuming any of them:</p>
+  <div class="code"><div class="bar"><span>csrc/offload_adamw_kernel.cu</span><button class="copy">Copy</button></div><pre data-lang="cpp">#pragma unroll
+for (int u = 0; u &lt; kUnroll; ++u) {             // phase 1: put 4 × 3 host reads in flight
+  const int64_t i = base + u * kThreads;
+  if (i &lt; n) { g[u] = Cvt&lt;T&gt;::load(grad[i]) * clip; m[u] = exp_avg[i]; v[u] = exp_avg_sq[i];
+               p[u] = master ? master[i] : Cvt&lt;T&gt;::load(param[i]); }
+}
+#pragma unroll
+for (int u = 0; u &lt; kUnroll; ++u) { /* phase 2: AdamW math, posted PCIe writes */ }</pre></div>
+  <div class="tbl"><table>
+    <tr><th>Choose</th><th>When</th></tr>
+    <tr><td><code>optimizer_mode="cpu"</code> (default)</td><td>VRAM is the constraint. Gradients leave the GPU too, and host math overlaps backward and the next forward.</td></tr>
+    <tr><td><code>optimizer_mode="gpu"</code></td><td>The CPU is weak or busy (data loading), and you can afford gradient VRAM until <code>step()</code>.</td></tr>
+    <tr><td><code>optimizer_mode="auto"</code></td><td>Lets the profiler compare measured host vs zero-copy throughput.</td></tr>
+  </table></div>
+</section>
+
+<section id="hooks">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>PyTorch backward hooks</h2>
+  <p><code>wrap()</code> installs three kinds of hooks, all removable with <code>trainstream.unwrap(model)</code>:</p>
+  <div class="tbl"><table>
+    <tr><th>Hook</th><th>Where</th><th>Job</th></tr>
+    <tr><td><code>register_post_accumulate_grad_hook</code></td><td>every parameter</td><td>Fires after autograd has finished accumulating into <code>.grad</code>, including tied weights used twice. Queues the D2H (plus the eager update) and sets <code>param.grad = None</code> to free VRAM.</td></tr>
+    <tr><td><code>register_forward_pre_hook</code></td><td>every module that owns parameters</td><td>Waits until that module's own updates have been <em>issued</em>, then makes compute wait (GPU-side) for them to <em>land</em>. Also records first-forward order, so updates run front-to-back.</td></tr>
+    <tr><td><code>saved_tensors_hooks</code> (+ block pre/post hooks)</td><td>root module and the block stack</td><td>Activation paging, block timing during calibration, and the step clock for the auto tuner.</td></tr>
+  </table></div>
+  <div class="code"><div class="bar"><span>trainstream/hooks.py · the gradient hook</span><button class="copy">Copy</button></div><pre data-lang="py">def hook(param):
+    grad = param.grad
+    if grad is None:
+        return
+    on_grad(slot, grad)      # D2H on the copy stream (+ eager AdamW when this is the last micro-batch)
+    param.grad = None        # VRAM released; the engine holds the tensor until the DMA has landed</pre></div>
+  <p>Why a post-accumulate hook rather than a tensor hook: a tensor hook sees each <em>contribution</em> to a gradient, while the post-accumulate hook sees the final sum, which is the only safe moment to stream it out.</p>
+</section>
+
+<section id="tuning">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Profile-driven tuning</h2>
+  <p>With <code>activation_offload="auto"</code> (the default), the pager runs a closed loop instead of trusting a formula:</p>
+  <ol class="steps">
+    <li><strong>Calibrate</strong> (3 steps, nothing paged): measure per-block saved bytes, per-block forward time with CUDA timing events, and wall-clock step time.</li>
+    <li><strong>Predict</strong> the paged prefix <em>K</em> from the link model. The optimizer's own traffic is reserved first, and the duplex factor decides whether D2H and H2D add up or overlap:
+      <div class="code"><div class="bar"><span>trainstream/profiler.py</span><button class="copy">Copy</button></div><pre data-lang="py">link_ms(d2h, h2d) = max(t_d2h, t_h2d, (t_d2h + t_h2d) / duplex_factor)
+K = (step_ms * 0.85 - reserved_link_ms) / link_ms(block_bytes, block_bytes)</pre></div></li>
+    <li><strong>Tune:</strong> measure the real step time with <em>K</em> blocks paged, and halve <em>K</em> until the slowdown is within <code>max_activation_slowdown</code> (15% by default) of the calibrated baseline.</li>
+  </ol>
+  <p>On the 85M model, prediction chose 3 of 12 blocks and tuning settled on 1. When memory matters more than speed, pin the fraction instead, for example <code>activation_offload=1.0</code>.</p>
+  <div class="tbl"><table>
+    <tr><th>Knob</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>activation_offload</code></td><td>"auto"</td><td>"auto", a fraction 0–1, True or False</td></tr>
+    <tr><td><code>max_activation_slowdown</code></td><td>0.15</td><td>tolerated step-time increase in auto mode</td></tr>
+    <tr><td><code>max_inflight_bytes</code></td><td>1 GiB</td><td>VRAM cap on activations still in flight to the host</td></tr>
+    <tr><td><code>prefetch_depth</code></td><td>1</td><td>blocks staged ahead during backward</td></tr>
+    <tr><td><code>min_offload_bytes</code></td><td>1 MiB</td><td>smaller saved tensors stay resident (DMA setup cost)</td></tr>
+    <tr><td><code>threads</code></td><td>cores / 2</td><td>host AdamW workers</td></tr>
+  </table></div>
+</section>
+
+<section id="verify">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Prove it: is training memory really in system RAM?</h2>
+  <p>"It didn't crash" isn't proof. Two different things can put training data in system RAM, and only one of them is TrainStream:</p>
+  <div class="grid-2">
+    <div class="card"><h4 style="margin-top:0">TrainStream (intentional, fast)</h4><p>Optimizer state, gradients and paged activations in <strong>pinned</strong> host buffers, moved by DMA on dedicated streams at about 28 GB/s. This happens <em>by design, from the first step</em>, not only once VRAM is full.</p></div>
+    <div class="card"><h4 style="margin-top:0">The Windows driver (silent, slow)</h4><p>When a process overflows VRAM, WDDM's "sysmem fallback" quietly backs GPU allocations with system RAM. Nothing crashes, but every kernel touching those pages slows down. Stock AdamW on the 1.8B model spilled 13.85 GiB this way.</p></div>
+  </div>
+  <div class="callout crit"><p class="t">The Task Manager trap</p><p>Windows reports CUDA <em>pinned</em> host memory under <strong>"Shared GPU memory"</strong>, the same counter that rises during a driver spill. A test allocation of exactly 4 GiB pinned showed up as 4,172 MiB of shared usage. So high shared GPU memory alone doesn't mean anything went wrong. Subtract TrainStream's pinned bytes; whatever is left over is spill.</p></div>
+  <h3>The automated proof</h3>
+  <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">python examples/verify_ram_offload.py                                    # GPT 1.2B, GPU capped at 16 GB
+python examples/verify_ram_offload.py --hf Qwen/Qwen2.5-0.5B --vram-cap-gb 7 --batch 2
+python examples/verify_ram_offload.py --engine baseline --gpt xxl-1.8B --vram-cap-gb 0   # watch a real driver spill</pre></div>
+  <p>Each engine runs in a fresh process. <code>--vram-cap-gb</code> simulates a smaller GPU (<code>set_per_process_memory_fraction</code>): PyTorch then raises a real out-of-memory error at the cap instead of letting Windows spill. The tool samples Windows' per-process GPU counters and its own memory, and prints a verdict:</p>
+  <div class="tbl"><table>
+    <tr><th>Check</th><th>Evidence it uses</th><th>Measured (Qwen2.5-0.5B, 7 GiB cap)</th></tr>
+    <tr><td>Stock AdamW can't train in the budget</td><td>static footprint, then a real run</td><td>7.4 GiB needed → CUDA OOM</td></tr>
+    <tr><td>TrainStream trains in the same budget</td><td>a completed run</td><td>5/5 steps, peak 6.16 GiB</td></tr>
+    <tr><td>Moments are <em>not</em> in VRAM</td><td>VRAM still allocated after training, beyond the weights</td><td>0.06 GiB (stock: 3.68 GiB)</td></tr>
+    <tr><td>Optimizer state <em>is</em> in RAM</td><td>engine accounting plus the OS's committed-memory counter</td><td>7.36 GiB reported, process grew 8.71 GiB</td></tr>
+    <tr><td>A live moment tensor is in host memory</td><td><code>exp_avg.device</code>, <code>.is_pinned()</code>, non-zero values</td><td>cpu, pinned, mean |m| 4.6e-6</td></tr>
+    <tr><td>GPU weights equal the host master</td><td>max abs difference after the last step</td><td>0.0 (bit-identical)</td></tr>
+    <tr><td>Data crosses PCIe every step</td><td>D2H / H2D byte counters vs gradient size</td><td>1.84–3.86 GiB down, 1.84–4.01 GiB up</td></tr>
+    <tr><td>No driver spill</td><td>Windows "Shared Usage" minus TrainStream's pinned bytes</td><td>0.09 GiB unexplained</td></tr>
+  </table></div>
+  <h3>Checking by hand</h3>
+  <ol class="steps">
+    <li><strong>Make the driver fail loudly instead of spilling (optional).</strong> NVIDIA Control Panel → Manage 3D settings → <em>CUDA – Sysmem Fallback Policy</em> → <em>Prefer No Sysmem Fallback</em>. Stock runs that don't fit then raise out-of-memory instead of crawling. Reset it afterwards if other apps rely on it.</li>
+    <li><strong>Open Task Manager → Performance → GPU</strong> and watch <em>Dedicated GPU memory</em> (VRAM) and <em>Shared GPU memory</em>. In <em>Details</em>, add the "Dedicated GPU memory" and "Shared GPU memory" columns to see them per process.</li>
+    <li><strong>Run stock AdamW on a model that doesn't fit</strong> (dashboard: <code>xxl-1.8B</code>, engine Baseline). Dedicated memory pins at the card's capacity and shared memory climbs by many GB: that's the driver spill.</li>
+    <li><strong>Run TrainStream on the same model.</strong> Dedicated memory stays well below capacity. Shared memory roughly equals the dashboard's <em>Pinned host RAM</em> figure, and the dashboard's PCIe chart shows gigabytes moving every step.</li>
+    <li><strong>Inspect a moment tensor yourself:</strong>
+      <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">master, m, v = optimizer.engine.state(0)        # slot 0 = first trainable parameter
+print(m.device, m.is_pinned(), m.abs().mean())  # cpu True &lt;non-zero after a step&gt;
+print(trainstream.pinned_stats()["by_tag"])     # bytes per buffer kind in page-locked RAM</pre></div></li>
+  </ol>
+</section>
+
+<hr>
+
+<!-- ======================================================= ADVANCED -->
+<section id="events">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>Custom stream synchronization with CUDA events</h2>
+  <p>TrainStream never calls <code>cudaDeviceSynchronize</code> on the hot path. Every cross-stream dependency is an event, recorded by the producer and waited on by the consumer's stream. Events come from a per-device recycling pool, so thousands per step cost almost nothing. Re-recording a pooled event is safe because <code>cudaStreamWaitEvent</code> snapshots the event's state when it's called.</p>
+  <div class="code"><div class="bar"><span>csrc/memory_pinner.cpp · d2h_async</span><button class="copy">Copy</button></div><pre data-lang="cpp">EventPtr d2h_async(const at::Tensor&amp; dst, const at::Tensor&amp; src) {
+  Runtime&amp; rt = runtime(src.get_device());
+  auto produced = make_event(dev);
+  produced-&gt;record(compute_stream(dev));   // everything that writes src is queued before this
+  produced-&gt;block(rt.d2h);                  // cudaStreamWaitEvent: the copy waits, the host does not
+  cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), src.nbytes(), cudaMemcpyDeviceToHost, rt.d2h);
+  auto done = make_event(dev);
+  done-&gt;record(rt.d2h);                     // consumers wait on (or poll) this
+  return done;
+}</pre></div>
+  <h4>Two kinds of wait, used deliberately</h4>
+  <div class="tbl"><table>
+    <tr><th>Wait</th><th>Blocks</th><th>Used for</th></tr>
+    <tr><td><code>Event.wait()</code> → <code>cudaStreamWaitEvent</code></td><td>only the GPU stream</td><td>compute waiting for weights and prefetches; copy streams waiting for producers</td></tr>
+    <tr><td><code>Event.synchronize()</code> → <code>cudaEventSynchronize</code></td><td>the calling host thread</td><td>a worker waiting for gradient bytes to land before reading them; backpressure</td></tr>
+    <tr><td>condition variable on slot <code>inflight</code></td><td>host, until an update is <em>issued</em></td><td>module pre-hooks: an event can't be waited on before it has been recorded</td></tr>
+  </table></div>
+  <div class="callout"><p class="t">The "issued vs landed" subtlety</p><p>Waiting on an event that hasn't been recorded yet is a silent no-op in CUDA. The forward pre-hook therefore first waits (host-side, GIL released) for the worker to have <em>queued</em> the upload, and only then calls <code>cudaStreamWaitEvent</code>. Skipping the first step causes nondeterministic stale-weight reads.</p></div>
+  <p>Stream priorities matter too. H2D is created at the device's highest priority because prefetches sit on backward's critical path; D2H and the zero-copy stream run at the lowest.</p>
+</section>
+
+<section id="allocator">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>Custom host memory allocators via the PyTorch C++ API</h2>
+  <p><code>cudaHostAlloc</code> is slow (it page-locks memory in the kernel), and activation stashes churn every step, so TrainStream keeps a size-bucketed cache in front of it. Blocks are wrapped as ordinary ATen tensors with <code>at::from_blob</code> and a custom deleter, so they behave like any other tensor in Python.</p>
+  <div class="code"><div class="bar"><span>csrc/memory_pinner.cpp</span><button class="copy">Copy</button></div><pre data-lang="cpp">at::Tensor pinned_empty(const std::vector&lt;int64_t&gt;&amp; sizes, at::ScalarType dtype,
+                        const std::string&amp; tag, bool mapped, bool cached) {
+  at::globalContext().lazyInitDevice(at::kCUDA);   // else Tensor.is_pinned() reports false
+  void* ptr = PinnedAllocator::get().allocate(nbytes, mapped, cached, tag);
+  return at::from_blob(ptr, sizes,
+                       [](void* p) { PinnedAllocator::get().release(p); },   // back to the cache
+                       at::TensorOptions().dtype(dtype).device(at::kCPU));
+}</pre></div>
+  <ul>
+    <li><strong>Buckets:</strong> 4 KiB granularity below 1 MiB, 2 MiB above. A cached block is reused if it wastes at most 25% (or one 2 MiB page).</li>
+    <li><strong>Event-fenced reuse:</strong> on release, a fence event is recorded on each copy stream, and the block re-enters the free list only after all fences pass. If a fence can't be created (for example, the device is out of memory), the streams are drained instead. A block is never recycled unfenced.</li>
+    <li><strong>Pin logging:</strong> every alloc, hit, release and free goes into a 4,096-entry ring buffer, with live bytes tracked per tag (<code>adamw.master_fp32</code>, <code>grad.staging</code>, <code>activations</code>, …). <code>trainstream.pinned_stats()</code> and the dashboard's pinned-memory panel read it.</li>
+    <li><strong>Budget:</strong> page-locking too much RAM makes the OS fail DMA mappings, which on this machine surfaced as asynchronous CUDA out-of-memory errors above about 40 GB pinned. Moments are therefore pinned only within 40% of physical RAM (<code>pin_moments</code> overrides this). In cpu mode only host threads touch them, so pinning them isn't required for correctness.</li>
+  </ul>
+</section>
+
+<section id="dma">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>PCIe DMA transaction tuning</h2>
+  <div class="grid-2">
+    <div class="card"><h4 style="margin-top:0">Transfer size</h4><p>Bandwidth reaches 94% of peak at 1 MiB here, and only 19% at 64 KiB. Keep individual DMAs at 1 MiB or larger: page per tensor, not per row, and leave small tensors resident.</p></div>
+    <div class="card"><h4 style="margin-top:0">Pinned or pageable</h4><p>Pageable memory forces the driver to bounce through its own staging buffer (14.5 vs 27.9 GB/s here) and makes <code>cudaMemcpyAsync</code> effectively synchronous. Every buffer that is a DMA endpoint is pinned.</p></div>
+    <div class="card"><h4 style="margin-top:0">Direction mix</h4><p>Measure the duplex factor; don't assume it. At 1.0, gradient D2H and prefetch H2D compete during backward, so reserve link time for the optimizer first.</p></div>
+    <div class="card"><h4 style="margin-top:0">Zero-copy access patterns</h4><p>Mapped memory works only with coalesced, streaming access. Each warp issues 128-byte requests, and the 4-way load-first unroll keeps about 12 reads per thread in flight to cover latency.</p></div>
+  </div>
+  <div class="code"><div class="bar"><span>python · inspect your link</span><button class="copy">Copy</button></div><pre data-lang="py">p = trainstream.profile_hardware(quick=False)
+for size, gbps in sorted(p.sweep_h2d.items()):
+    print(f"{size / 1024:>8.0f} KiB  {gbps:5.1f} GB/s")
+print("duplex factor", p.duplex_factor, " break-even FLOP/B", round(p.break_even_flops_per_byte))</pre></div>
+</section>
+
+<section id="pitfalls">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>Correctness pitfalls we hit (and the tests that pin them down)</h2>
+  <details open><summary>Saved-tensor layout must survive the round trip</summary><div>
+    <p>An early pager restored every activation as contiguous. Under bf16, SDPA picks the memory-efficient attention kernel, whose backward silently returns <strong>wrong gradients</strong> when its saved q/k/v/out come back with a different stride order. The isolated reproducer showed a max gradient error of 54.75, and at 300M parameters training went to NaN. The fix copies dense tensors byte-for-byte and restores their exact strides; non-dense views (q/k/v sliced from a fused qkv) are packed densely <em>in their original dimension order</em>. <code>test_activation_offload_preserves_layout_for_fused_attention</code> checks bit-exact gradients on the efficient, cuDNN and math backends.</p></div></details>
+  <details><summary>recordStream can abort the process on a full device</summary><div>
+    <p>Tagging blocks with <code>recordStream</code> for the copy streams makes PyTorch's caching allocator create CUDA events inside its <em>free</em> path. On a nearly full card that event creation failed inside a destructor, and <code>std::terminate</code> killed the process. TrainStream now keeps explicit lifetimes instead: D2H sources are held until their copy event completes, prefetch buffers come from the consumer's pool and are waited on before use or release, and streamed gradients are released by the worker once the host has consumed them. A terminate hook in the extension prints the real message (<code>[trainstream] terminate: …</code>) rather than a bare stack trace.</p></div></details>
+  <details><summary>A reference cycle leaked a step of pinned activations each step</summary><div>
+    <p>Handles pointed to their forward session and the session listed its handles, so buffers waited for Python's cyclic garbage collector, adding about 5.9 GB of pinned memory per step on the 1.8B model. Sessions now hold only weak references, so the autograd graph owns the buffers. <code>test_paged_activations_are_freed_every_step</code> runs with the GC disabled.</p></div></details>
+  <details><summary>Eager updates and step() raced</summary><div>
+    <p>A slot's <code>has_grad</code> flag was cleared by the asynchronous finaliser, so a <code>step()</code> issued before it ran could update the slot a second time. It's now cleared synchronously when the eager update is queued. Five consecutive full-suite runs pass, and parity tests cover the attached, eager and accumulation paths.</p></div></details>
+  <details><summary>bf16 attention backward isn't deterministic anyway</summary><div>
+    <p>When comparing paged and unpaged gradients under autocast, two runs <em>without any paging</em> already differ by 1.95e-3, the same amount as paged versus unpaged. Parity tests therefore compare in fp32, or fix the attention backend, where TrainStream is bit-exact.</p></div></details>
+</section>
+
+<section id="multigpu">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>Extending the engine to multi-GPU pipeline parallelism</h2>
+  <div class="callout warn"><p class="t">Status: design guide</p><p>The runtime is already per-device: streams, event pools and transfer counters are keyed by device index, and an <code>OffloadAdamW</code> engine binds to one device. The pipeline scheduling below is a worked design, not shipped or tested code.</p></div>
+  <ol class="steps">
+    <li><strong>One engine per stage.</strong> Place stage <em>i</em>'s blocks on <code>cuda:i</code> and give each stage its own <code>OffloadAdamW</code> and <code>ActivationOffloader</code>. Each stage then streams over its own PCIe lanes.
+      <div class="code"><div class="bar"><span>python · sketch</span><button class="copy">Copy</button></div><pre data-lang="py">stages = [nn.Sequential(*blocks[a:b]).to(f"cuda:{i}") for i, (a, b) in enumerate(splits)]
+opts = [trainstream.OffloadAdamW(s.parameters(), lr=3e-4).attach(s) for s in stages]
+pagers = [trainstream.ActivationOffloader(s, list(s), offload="auto",
+                                          profile=trainstream.profile_hardware(f"cuda:{i}"))
+          for i, s in enumerate(stages)]</pre></div></li>
+    <li><strong>Hand-offs with events, not syncs.</strong> Send stage <em>i</em>'s output with <code>tensor.to(f"cuda:{i+1}", non_blocking=True)</code> (peer-to-peer where available), recorded behind an event on stage <em>i</em>'s compute stream. Stage <em>i+1</em>'s stream waits on that event, the same pattern as <code>d2h_async</code>.</li>
+    <li><strong>1F1B schedule with paging.</strong> In a one-forward-one-backward schedule, stage 0 holds up to <em>P</em> micro-batches of activations, which is where VRAM peaks. Page micro-batches in the order they will be consumed, and set <code>prefetch_depth</code> to the number of micro-batches between a forward and its backward on that stage.</li>
+    <li><strong>Share the host fairly.</strong> All stages draw on one pool of RAM bandwidth for host AdamW (about 75 GB/s here). Split <code>threads</code> across engines, and on multi-socket hosts allocate each stage's pinned buffers on the NUMA node nearest its GPU's root complex.</li>
+    <li><strong>Profile per link.</strong> GPUs behind a shared PCIe switch split its bandwidth; run <code>profile_hardware</code> with all stages active and feed each pager its own profile.</li>
+  </ol>
+</section>
+
+<hr>
+
+<!-- ======================================================= REFERENCE -->
+<section id="api">
+  <div class="kicker reference">Reference</div>
+  <h2>Python API</h2>
+  <h3><code>trainstream.wrap(model, optimizer=None, **options) → (model, optimizer)</code></h3>
+  <div class="tbl"><table>
+    <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>optimizer_mode</code></td><td>"cpu"</td><td>"cpu", "gpu" or "auto"</td></tr>
+    <tr><td><code>activation_offload</code></td><td>"auto"</td><td>"auto", a fraction, True or False</td></tr>
+    <tr><td><code>blocks</code></td><td>auto-detected</td><td>the repeated layer stack (largest same-typed ModuleList/Sequential)</td></tr>
+    <tr><td><code>max_grad_norm</code></td><td>None</td><td>global-norm clipping inside the optimizer</td></tr>
+    <tr><td><code>accumulation_steps</code></td><td>1</td><td>backward passes per <code>step()</code></td></tr>
+    <tr><td><code>max_activation_slowdown</code></td><td>0.15</td><td>auto-tuner tolerance</td></tr>
+    <tr><td><code>max_inflight_bytes</code></td><td>1 GiB</td><td>paging backpressure</td></tr>
+    <tr><td><code>prefetch_depth</code>, <code>min_offload_bytes</code>, <code>threads</code>, <code>profile</code>, <code>lr</code>, <code>verbose</code></td><td></td><td>see <a href="#tuning">tuning</a></td></tr>
+  </table></div>
+  <p>Accepts <code>torch.optim.AdamW</code>/<code>Adam</code> (hyper-parameters and existing state are migrated), an <code>OffloadAdamW</code>, or <code>None</code>. Also available: <code>trainstream.unwrap(model)</code> and <code>trainstream.memory_report(model)</code>.</p>
+  <h3><code>trainstream.OffloadAdamW(params, lr, betas, eps, weight_decay, *, mode, max_grad_norm, compute_grad_norm, threads, chunk_elems, accumulation_steps, eager, pin_moments)</code></h3>
+  <p>A real <code>torch.optim.Optimizer</code>. Methods: <code>step()</code>, <code>zero_grad()</code>, <code>attach(model)</code> / <code>detach()</code>, <code>synchronize()</code>, <code>stats()</code>, <code>state_dict()</code> / <code>load_state_dict()</code> (AdamW-compatible, plus fp32 <code>master</code>), and the properties <code>last_grad_norm</code> and <code>eager_active</code>. Without <code>attach</code>, <code>step()</code> blocks until the update has landed, so it works as a drop-in.</p>
+  <h3><code>trainstream.profile_hardware(device=None, quick=True, force=False) → HardwareProfile</code></h3>
+  <p>Fields: <code>h2d_gbps</code>, <code>d2h_gbps</code>, <code>bidir_gbps</code>, <code>pageable_h2d_gbps</code>, <code>latency_us_4k</code>, <code>matmul_tflops_bf16/fp32</code>, <code>cpu_adamw_gelems</code>, <code>zero_copy_adamw_gelems</code>, <code>sweep_h2d/d2h</code>. Derived: <code>duplex_factor</code>, <code>transfer_ms()</code>, <code>link_ms()</code>, <code>activation_offload_fraction()</code>, <code>optimizer_step_ms()</code>, <code>recommend_optimizer_mode()</code>, <code>break_even_flops_per_byte</code>, <code>summary()</code>.</p>
+</section>
+
+<section id="native">
+  <div class="kicker reference">Reference</div>
+  <h2>Native module <code>trainstream._C</code></h2>
+  <div class="tbl"><table>
+    <tr><th>Function</th><th>Purpose</th></tr>
+    <tr><td><code>pinned_empty(sizes, dtype, tag, mapped, cached)</code></td><td>pinned tensor from the caching allocator</td></tr>
+    <tr><td><code>pinned_stats()</code>, <code>pinned_tag_bytes()</code>, <code>pinned_log(n)</code>, <code>pinned_empty_cache()</code>, <code>pinned_set_cache_limit(b)</code></td><td>pin-logging allocator introspection and control</td></tr>
+    <tr><td><code>d2h_async(dst, src)</code>, <code>h2d_async(dst, src, after)</code>, <code>h2d_alloc_async(src, after, device, sizes, strides)</code></td><td>event-ordered DMA on the dedicated streams</td></tr>
+    <tr><td><code>Event(device, timing)</code>: <code>.record() .wait() .synchronize() .query() .elapsed_ms()</code>; <code>record_event()</code></td><td>pooled CUDA events</td></tr>
+    <tr><td><code>OffloadAdamWEngine(device, mode, threads, chunk_elems)</code></td><td>the engine under <code>OffloadAdamW</code></td></tr>
+    <tr><td><code>benchmark_pcie</code>, <code>benchmark_matmul</code>, <code>benchmark_cpu_adamw</code>, <code>benchmark_zero_copy_adamw</code></td><td>micro-benchmarks behind the profiler</td></tr>
+    <tr><td><code>transfer_stats(device)</code>, <code>synchronize_streams(device)</code>, <code>is_dense(t)</code>, <code>build_info()</code></td><td>utilities</td></tr>
+  </table></div>
+</section>
+
+<section id="layout">
+  <div class="kicker reference">Reference</div>
+  <h2>Project layout</h2>
+  <div class="code"><div class="bar"><span>tree</span><button class="copy">Copy</button></div><pre>setup.py, build.bat           build (CUDAExtension; Windows helper loads MSVC + CUDA)
+csrc/
+  trainstream.h               shared runtime declarations
+  memory_pinner.cpp           event pool, streams, pin-logging allocator, DMA, PCIe/matmul benchmarks
+  offload_adamw.h / .cpp      worker pool, gradient pipeline, host AdamW, engine, AdamW benchmarks
+  offload_adamw_kernel.cu     zero-copy AdamW + grad-norm kernels (CUDA headers only)
+  kernels.h                   torch-free kernel launch interface
+  bindings.cpp                pybind11 module trainstream._C
+trainstream/
+  __init__.py                 public API
+  wrapper.py                  wrap / unwrap / memory_report
+  optimizer.py                OffloadAdamW (torch.optim.Optimizer)
+  hooks.py                    readiness hooks, gradient streaming, activation pager + auto tuner
+  profiler.py                 HardwareProfile and the offload models
+  integrations/huggingface.py TrainStreamTrainer, wrap_hf, decoder-layer detection (optional transformers)
+examples/
+  hf_finetune.py              pretrained HF model fine-tune (full or --lora), --compare with the stock Trainer
+  verify_ram_offload.py       VRAM vs system-RAM proof with a PASS/FAIL verdict
+tests/
+  test_optimizer.py           parity, eager/accumulation, dtypes, state dicts, migration
+  test_offload.py             allocator, DMA ordering, paging exactness and leaks, profiler, wrap()
+  test_huggingface.py         Trainer parity, paging, LoRA, checkpoint resume (skipped without transformers)
+dashboard/
+  server.py, trainer.py       standard-library HTTP + SSE server running real GPU jobs
+  model.py, index.html        byte-level GPT + stdlib corpus, live UI
+docs/index.html               this page</pre></div>
+</section>
+
+<section id="limits">
+  <div class="kicker reference">Reference</div>
+  <h2>Limitations</h2>
+  <ul>
+    <li>The output logits of large-vocabulary models are not offloaded. For Qwen (151,936 tokens), batch 4 × 512 tokens of fp32 logits alone is 1.16 GiB, plus their gradient. On small GPUs, reduce the batch size or use a chunked loss.</li>
+    <li>Weights stay resident in VRAM; only optimizer state, gradients and activations are offloaded. A model whose weights alone exceed VRAM needs parameter paging, which isn't implemented.</li>
+    <li>Parameters used outside their owning module's <code>forward</code> (functional calls on another module's weight) bypass the readiness hook. Call <code>optimizer.synchronize()</code> before such reads, or use <code>attach()</code> on that module.</li>
+    <li>Moving a wrapped model with <code>.to()</code> after <code>wrap()</code> invalidates the engine's device pointers. Wrap last.</li>
+    <li>For small models that already fit, cpu mode is slower than fused GPU AdamW; host AdamW is bounded by RAM bandwidth (about 2.6 Gelem/s here).</li>
+    <li>Multi-GPU pipeline parallelism is a documented design, not shipped code.</li>
+    <li>Tested on Windows 11 with an RTX 5090 Laptop GPU (sm_120), CUDA 13.4, PyTorch 2.14.1 and Python 3.14. Linux builds use the same <code>setup.py</code> but haven't been exercised here.</li>
+  </ul>
+</section>
+
+<footer>TrainStream 0.1.0 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and the dashboard to reproduce them on yours.</footer>
+</div>
+</main>
+
+<script>
+(function () {
+  const body = document.body;
+  const mobile = () => window.matchMedia("(max-width: 960px)").matches;
+  document.getElementById("burger").addEventListener("click", () => {
+    if (mobile()) body.classList.toggle("nav-open"); else body.classList.toggle("collapsed");
+  });
+  document.querySelectorAll(".sidebar a").forEach((a) => a.addEventListener("click", () => { if (mobile()) body.classList.remove("nav-open"); }));
+  document.querySelectorAll(".sidebar .gtitle").forEach((b) => b.addEventListener("click", () => b.parentElement.classList.toggle("closed")));
+
+  // Scroll-spy for the sidebar.
+  const links = [...document.querySelectorAll(".sidebar li a")];
+  const byId = new Map(links.map((a) => [a.getAttribute("href").slice(1), a]));
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach((e) => {
+      if (!e.isIntersecting) return;
+      links.forEach((l) => l.classList.remove("active"));
+      const a = byId.get(e.target.id); if (a) a.classList.add("active");
+    });
+  }, { rootMargin: "-70px 0px -70% 0px" });
+  document.querySelectorAll("main section[id]").forEach((s) => obs.observe(s));
+
+  // Copy buttons.
+  document.querySelectorAll(".code").forEach((c) => {
+    const btn = c.querySelector(".copy"), pre = c.querySelector("pre");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(pre.innerText); btn.textContent = "Copied"; }
+      catch (_) { btn.textContent = "Select + Ctrl+C"; }
+      setTimeout(() => (btn.textContent = "Copy"), 1400);
+    });
+  });
+
+  // Minimal syntax highlighting (python / c++ / shell), applied to text nodes only.
+  const KW = {
+    py: "import from as def return if else elif for in while with not and or is None True False class lambda try except finally raise yield pass break continue async await",
+    cpp: "template typename const constexpr auto void return if else for while switch case break default namespace struct class static inline int int64_t float double bool true false nullptr std at",
+    sh: "pip python cd export set",
+  };
+  document.querySelectorAll("pre[data-lang]").forEach((pre) => {
+    const lang = pre.dataset.lang, kws = new Set((KW[lang] || "").split(" "));
+    const src = pre.textContent;
+    const re = lang === "cpp"
+      ? /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|(#\s*\w+[^\n]*)|\b(\d[\d.e+\-]*f?)\b|\b([A-Za-z_]\w*)(?=\s*\()|\b([A-Za-z_]\w*)\b/g
+      : /(#[^\n]*)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(@\w+)|\b(\d[\d_.e+\-]*)\b|\b([A-Za-z_]\w*)(?=\s*\()|\b([A-Za-z_]\w*)\b/g;
+    let out = "", last = 0, m;
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    while ((m = re.exec(src))) {
+      out += esc(src.slice(last, m.index)); last = re.lastIndex;
+      const [t] = m;
+      if (m[1]) out += `<span class="tok-c">${esc(t)}</span>`;
+      else if (m[2]) out += `<span class="tok-s">${esc(t)}</span>`;
+      else if (m[3]) out += `<span class="tok-p">${esc(t)}</span>`;
+      else if (m[4]) out += `<span class="tok-n">${esc(t)}</span>`;
+      else if (m[5]) out += kws.has(t) ? `<span class="tok-k">${esc(t)}</span>` : `<span class="tok-f">${esc(t)}</span>`;
+      else out += kws.has(t) ? `<span class="tok-k">${esc(t)}</span>` : esc(t);
+    }
+    pre.innerHTML = out + esc(src.slice(last));
+  });
+})();
+</script>
+</body>
+</html>

@@ -229,7 +229,7 @@ def child(args):
             import trainstream
             act = args.activation_offload
             act = act if act == "auto" else float(act)
-            model, opt = trainstream.wrap(model, opt, activation_offload=act, blocks=blocks)
+            model, opt = trainstream.wrap(model, opt, offload=True, activation_offload=act, blocks=blocks)
             ts = trainstream
             out["ram_private_after_wrap"] = process_ram()[0]
             st = opt.stats()

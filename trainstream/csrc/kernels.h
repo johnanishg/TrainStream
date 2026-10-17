@@ -36,10 +36,13 @@ struct AdamWParams {
 // rounded copy (mixed-precision training with fp16/bf16 weights).
 // If `grad_sq_norm` is non-null it points at a device float holding sum(g^2) over
 // all gradients; the kernel derives the global-norm clip coefficient from it.
-cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, float* exp_avg,
-                            float* exp_avg_sq, float* master, int64_t n,
+// With bf16_moments the moments are bf16 and written with stochastic rounding
+// (counter-based random bits keyed by `seed` and the element index), so tiny
+// per-step increments to exp_avg_sq are not lost to round-to-nearest.
+cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, void* exp_avg,
+                            void* exp_avg_sq, float* master, int64_t n,
                             const AdamWParams& hp, const float* grad_sq_norm, int sm_count,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool bf16_moments = false, uint32_t seed = 0);
 
 // out[0] += sum(grad[i]^2). Used for global gradient-norm clipping on the GPU path.
 cudaError_t grad_sq_norm_accumulate(DType dtype, const void* grad, int64_t n, float* out,

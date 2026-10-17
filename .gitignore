@@ -47,3 +47,4 @@ trainstream-analytics/
 dashboard/
 start_dashboard.bat
 research/
+trainstream/_C*.pyd.old-*

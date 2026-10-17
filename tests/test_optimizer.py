@@ -189,7 +189,7 @@ def test_wrap_migrates_existing_torch_state():
     opt_mine = torch.optim.AdamW(mine.parameters(), foreach=False, **HP)
     run(ref, opt_ref, warm)
     run(mine, opt_mine, warm)
-    mine, ts_opt = trainstream.wrap(mine, opt_mine, activation_offload=False, profile=False)
+    mine, ts_opt = trainstream.wrap(mine, opt_mine, offload=True, activation_offload=False, profile=False)
     try:
         assert len(opt_mine.state) == 0  # VRAM moments released
         more = batches(4, seed=5)

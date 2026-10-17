@@ -12,6 +12,10 @@
 //  * "gpu": gradients stay in VRAM; a CUDA kernel updates the parameter in
 //    place while reading/writing the moments through mapped pinned memory
 //    (zero-copy over PCIe). Moments never occupy VRAM.
+//
+// Moments are fp32, or bf16 with stochastic rounding (half the host memory and
+// traffic). Paged slots (cpu mode) keep no up-to-date weights in VRAM: the
+// host copy is authoritative and the Python ParamPager streams it in per block.
 #pragma once
 
 #include "trainstream.h"
@@ -45,11 +49,29 @@ class WorkerPool {
 
 class OffloadAdamW {
  public:
-  OffloadAdamW(int device, const std::string& mode, int threads, int64_t chunk_elems);
+  OffloadAdamW(int device, const std::string& mode, int threads, int64_t chunk_elems,
+               const std::string& moment_dtype = "float32");
   ~OffloadAdamW();
 
   // pin_moments=false keeps exp_avg/exp_avg_sq in ordinary RAM (cpu mode only).
-  int64_t add_param(const at::Tensor& param, bool pin_moments = true);
+  // host_init (a CPU tensor, optional) seeds the host weights instead of reading
+  // `param`, for parameters whose VRAM storage is empty (paged models built on CPU).
+  int64_t add_param(const at::Tensor& param, bool pin_moments = true, const at::Tensor& host_init = {});
+
+  // ---- parameter paging (cpu mode) ----------------------------------------
+  // A paged slot's update is not uploaded: the host weights (host_param) are
+  // copied in by the pager whenever the owning block runs.
+  void set_paged(int64_t id, bool paged);
+  at::Tensor host_param(int64_t id);           // fp32 master, or the rounded staging copy
+  void wait_issued(const std::vector<int64_t>& ids);  // host: queued updates finished
+  void set_ready(int64_t id, const EventPtr& ev);     // next update waits for this DMA read
+  void sync_host_from_param(int64_t id);       // VRAM weights -> host copies (blocking)
+
+  // ---- data parallel (cpu mode) -------------------------------------------
+  at::Tensor grad_buffer(int64_t id);  // fp32 host accumulator (reduced in place by the caller)
+  // Queue the AdamW update for one slot from its accumulator, gradients scaled by `scale`.
+  void update_slot(int64_t id, double lr, double beta1, double beta2, double eps, double weight_decay,
+                   double scale);
 
   // cpu mode: stream one gradient to host and queue its accumulation. With
   // apply_update the AdamW update for this tensor is queued right behind it
@@ -64,7 +86,8 @@ class OffloadAdamW {
   double step(const std::vector<int64_t>& ids, const std::vector<double>& lrs,
               const std::vector<double>& beta1s, const std::vector<double>& beta2s,
               const std::vector<double>& epss, const std::vector<double>& wds,
-              const std::vector<at::Tensor>& grads, double max_grad_norm, bool compute_norm);
+              const std::vector<at::Tensor>& grads, double max_grad_norm, bool compute_norm,
+              double grad_scale = 1.0);
 
   // Host-waits until each slot's update has been *issued*, then makes the
   // current compute stream wait (on the GPU) for the H2D / kernel to land.
@@ -80,6 +103,14 @@ class OffloadAdamW {
   std::string mode() const { return gpu_mode_ ? "gpu" : "cpu"; }
   int64_t num_params() const { return static_cast<int64_t>(slots_.size()); }
   int threads() const { return pool_ ? pool_->size() : 0; }
+  // Back-pressure: backward waits once more gradient bytes than this are
+  // still in VRAM waiting for their D2H copy (cpu mode).
+  void set_max_inflight_grad_bytes(int64_t bytes) { max_inflight_grad_bytes_ = bytes; }
+  // Gradient staging buffers are pooled: a pinned buffer is taken when a
+  // gradient arrives and returned once the host has consumed it. Beyond this
+  // many bytes in use, the next gradient waits for one to come back.
+  void set_max_staging_bytes(int64_t bytes);
+  std::string moment_dtype() const { return moment_dtype_ == at::kBFloat16 ? "bfloat16" : "float32"; }
 
  private:
   struct Slot {
@@ -87,10 +118,11 @@ class OffloadAdamW {
     at::Tensor param;  // flat alias of the user's parameter (shares storage)
     int64_t numel = 0;
     at::ScalarType pdtype = at::kFloat;
-    at::Tensor master, exp_avg, exp_avg_sq;  // fp32, pinned host
+    at::Tensor master, exp_avg, exp_avg_sq;  // master fp32; moments fp32 or bf16; host
     float* d_master = nullptr;               // device aliases (gpu mode)
-    float* d_m = nullptr;
-    float* d_v = nullptr;
+    void* d_m = nullptr;
+    void* d_v = nullptr;
+    bool paged = false;
     at::Tensor grad_stage, grad_acc, param_stage;  // cpu mode staging
     at::Tensor grad_keep;  // VRAM gradient kept alive until its DMA / kernel is done
     int64_t step = 0;
@@ -113,12 +145,18 @@ class OffloadAdamW {
   // staging buffer once `from_stage` (its D2H event) has completed.
   void enqueue_update(Slot& s, double lr, double beta1, double beta2, double eps, double wd, double clip,
                       EventPtr after, EventPtr from_stage);
+  // cpu mode: VRAM gradients are kept alive only until their D2H copy has
+  // landed (the host works from the staging copy), polled on every call.
+  void retire_grad(EventPtr d2h_done, at::Tensor grad);
+  void acquire_stage(Slot& s, at::ScalarType dtype);
+  void release_stage(Slot& s);
+  void reap_grads(bool block);
   void record_error(const std::string& msg);
   void check_error();
   double step_cpu(const std::vector<int64_t>& ids, const std::vector<double>& lrs,
                   const std::vector<double>& beta1s, const std::vector<double>& beta2s,
                   const std::vector<double>& epss, const std::vector<double>& wds,
-                  double max_grad_norm, bool compute_norm);
+                  double max_grad_norm, bool compute_norm, double grad_scale);
   void step_gpu(const std::vector<int64_t>& ids, const std::vector<double>& lrs,
                 const std::vector<double>& beta1s, const std::vector<double>& beta2s,
                 const std::vector<double>& epss, const std::vector<double>& wds,
@@ -126,10 +164,20 @@ class OffloadAdamW {
 
   int device_;
   bool gpu_mode_;
+  at::ScalarType moment_dtype_ = at::kFloat;
   int64_t chunk_;
   std::unique_ptr<WorkerPool> pool_;
   std::vector<std::unique_ptr<Slot>> slots_;
 
+  std::mutex retire_mu_;
+  std::deque<std::pair<EventPtr, at::Tensor>> retiring_;
+  int64_t retiring_bytes_ = 0;
+  std::mutex stage_mu_;
+  std::condition_variable stage_cv_;
+  int64_t stage_bytes_ = 0;
+  int64_t stage_peak_ = 0;
+  int64_t max_stage_bytes_ = int64_t(4) << 30;
+  int64_t max_inflight_grad_bytes_ = int64_t(1) << 30;
   std::mutex err_mu_;
   std::string error_;
 

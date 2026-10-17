@@ -159,7 +159,15 @@ class SdpaBlock(nn.Module):
 @pytest.mark.parametrize("backend", ["EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "MATH"])
 def test_activation_offload_preserves_layout_for_fused_attention(backend):
     """Regression: memory-efficient attention backward is wrong if its saved
-    tensors come back with a different stride order."""
+    tensors come back with a different stride order.
+
+    The memory-efficient backward accumulates with atomics, so its last bits
+    depend on scheduling: even without any paging, two runs differ (up to
+    ~3e-3 relative) when other GPU work changes the timing. That backend is
+    therefore compared bit-exactly in PyTorch's deterministic mode. cuDNN
+    attention is not available in that mode (PyTorch: "cuDNN SDPA is not
+    deterministic") and is compared within 1% instead — the layout bug this
+    guards against produced errors of 54.75."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     def run(offload):
@@ -167,10 +175,13 @@ def test_activation_offload_preserves_layout_for_fused_attention(backend):
         model = nn.Sequential(*[SdpaBlock(512) for _ in range(3)]).to(DEV)
         off = ActivationOffloader(model, list(model), offload=offload, min_bytes=0)
         x = torch.randn(4, 256, 512, device=DEV)
+        was = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(backend == "EFFICIENT_ATTENTION")
         try:
             with sdpa_kernel(getattr(SDPBackend, backend)), torch.autocast("cuda", dtype=torch.bfloat16):
                 model(x).float().square().mean().backward()
         finally:
+            torch.use_deterministic_algorithms(was)
             off.remove()
         return [p.grad.clone() for p in model.parameters()], off.stats
 
@@ -181,7 +192,11 @@ def test_activation_offload_preserves_layout_for_fused_attention(backend):
     mine, stats = run(1.0)
     assert stats["packed_tensors"] > 0
     for a, b in zip(ref, mine):
-        assert torch.equal(a, b)
+        rel = ((a - b).abs().max() / a.abs().max()).item()
+        if backend == "CUDNN_ATTENTION":
+            assert rel < 1e-2, f"max relative difference {rel:.3e}"
+        else:
+            assert torch.equal(a, b), f"max relative difference {rel:.3e}"
 
 
 def test_dense_like_keeps_dimension_order():
@@ -291,7 +306,7 @@ def test_wrap_end_to_end_matches_baseline(mode):
     mine = copy.deepcopy(ref)
     hp = dict(lr=2e-3, betas=(0.9, 0.95), weight_decay=0.05)
     opt_ref = torch.optim.AdamW(ref.parameters(), foreach=False, **hp)
-    mine, opt = trainstream.wrap(mine, torch.optim.AdamW(mine.parameters(), **hp),
+    mine, opt = trainstream.wrap(mine, torch.optim.AdamW(mine.parameters(), **hp), offload=True,
                                  optimizer_mode=mode, activation_offload=1.0, min_offload_bytes=0)
     try:
         losses_ref, losses = [], []

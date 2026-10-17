@@ -3,9 +3,10 @@
     import trainstream
     model, optimizer = trainstream.wrap(model, optimizer)
 
-Optimizer state, gradients and (a profiled fraction of) activations are moved
-to pinned host RAM over dedicated CUDA copy streams, so models that would not
-fit in VRAM with a stock optimizer can still be trained on a single GPU.
+Optimizer state, gradients, a profiled fraction of activations and (when
+needed) the transformer-block weights themselves are moved to host RAM over
+dedicated CUDA copy streams, so models that would not fit in VRAM with a stock
+optimizer can still be trained on a single GPU — or on several, data parallel.
 """
 
 import sys
@@ -26,17 +27,22 @@ except ImportError:
     sys.modules[__name__ + "._C"] = _C
 
 from .hooks import ActivationOffloader, GradientOffloader, ParamReadyHooks, find_blocks
+from .losses import causal_lm_loss, chunked_cross_entropy
 from .optimizer import OffloadAdamW
+from .paging import ParamPager
 from .profiler import HardwareProfile, profile_hardware
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "wrap",
     "unwrap",
     "memory_report",
     "OffloadAdamW",
+    "ParamPager",
+    "chunked_cross_entropy",
+    "causal_lm_loss",
     "ActivationOffloader",
     "GradientOffloader",
     "ParamReadyHooks",

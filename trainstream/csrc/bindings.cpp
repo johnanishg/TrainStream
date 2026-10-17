@@ -111,15 +111,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // ---- optimizer engine -----------------------------------------------------
   py::class_<OffloadAdamW>(m, "OffloadAdamWEngine")
-      .def(py::init<int, const std::string&, int, int64_t>(), py::arg("device"), py::arg("mode") = "cpu",
-           py::arg("threads") = 0, py::arg("chunk_elems") = 1 << 20)
-      .def("add_param", &OffloadAdamW::add_param, py::arg("param"), py::arg("pin_moments") = true)
+      .def(py::init<int, const std::string&, int, int64_t, const std::string&>(), py::arg("device"),
+           py::arg("mode") = "cpu", py::arg("threads") = 0, py::arg("chunk_elems") = 1 << 20,
+           py::arg("moment_dtype") = "float32")
+      .def("add_param",
+           [](OffloadAdamW& e, const at::Tensor& p, bool pin, const std::optional<at::Tensor>& host_init) {
+             return e.add_param(p, pin, host_init.value_or(at::Tensor()));
+           },
+           py::arg("param"), py::arg("pin_moments") = true, py::arg("host_init") = py::none())
+      .def("set_paged", &OffloadAdamW::set_paged, nogil())
+      .def("set_max_inflight_grad_bytes", &OffloadAdamW::set_max_inflight_grad_bytes)
+      .def("set_max_staging_bytes", &OffloadAdamW::set_max_staging_bytes)
+      .def("host_param", &OffloadAdamW::host_param)
+      .def("wait_issued", &OffloadAdamW::wait_issued, nogil())
+      .def("set_ready", &OffloadAdamW::set_ready)
+      .def("sync_host_from_param", &OffloadAdamW::sync_host_from_param, nogil())
+      .def("grad_buffer", &OffloadAdamW::grad_buffer, nogil())
+      .def("update_slot", &OffloadAdamW::update_slot, py::arg("id"), py::arg("lr"), py::arg("beta1"),
+           py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"), py::arg("scale") = 1.0, nogil())
       .def("offload_grad", &OffloadAdamW::offload_grad, py::arg("id"), py::arg("grad"),
            py::arg("apply_update") = false, py::arg("lr") = 0.0, py::arg("beta1") = 0.9, py::arg("beta2") = 0.999,
            py::arg("eps") = 1e-8, py::arg("weight_decay") = 0.0, nogil())
       .def("step", &OffloadAdamW::step, py::arg("ids"), py::arg("lrs"), py::arg("beta1s"), py::arg("beta2s"),
            py::arg("epss"), py::arg("wds"), py::arg("grads"), py::arg("max_grad_norm") = 0.0,
-           py::arg("compute_norm") = false, nogil())
+           py::arg("compute_norm") = false, py::arg("grad_scale") = 1.0, nogil())
       .def("wait_ready", &OffloadAdamW::wait_ready, nogil())
       .def("synchronize", &OffloadAdamW::synchronize, nogil())
       .def("last_grad_norm", &OffloadAdamW::last_grad_norm, nogil())
@@ -135,5 +150,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("stats", &OffloadAdamW::stats)
       .def_property_readonly("mode", &OffloadAdamW::mode)
       .def_property_readonly("num_params", &OffloadAdamW::num_params)
-      .def_property_readonly("threads", &OffloadAdamW::threads);
+      .def_property_readonly("threads", &OffloadAdamW::threads)
+      .def_property_readonly("moment_dtype", &OffloadAdamW::moment_dtype);
 }

@@ -56,8 +56,8 @@ class ParamReadyHooks:
     parameters are used so the optimizer can update them in that order.
     """
 
-    def __init__(self, model: nn.Module, engine, slot_of: Dict[int, int], order_sink: List[int]):
-        self._engine = engine
+    def __init__(self, model: nn.Module, wait, slot_of: Dict[int, int], order_sink: List[int]):
+        self._wait = wait  # wait(slot_ids): host waits for issue, compute stream for landing
         self._order = order_sink
         self._seen = set(order_sink)
         self._recording = True
@@ -68,7 +68,7 @@ class ParamReadyHooks:
                 self._handles.append(module.register_forward_pre_hook(self._make_hook(ids)))
 
     def _make_hook(self, ids: List[int]):
-        engine = self._engine
+        wait = self._wait
 
         def hook(module, args):
             if self._recording:
@@ -76,7 +76,7 @@ class ParamReadyHooks:
                     if i not in self._seen:
                         self._seen.add(i)
                         self._order.append(i)
-            engine.wait_ready(ids)
+            wait(ids)
 
         return hook
 
@@ -271,7 +271,9 @@ class ActivationOffloader:
         self._inflight_bytes = 0
         self.enabled = True
         self.decision: Dict[str, object] = {}
-        self._param_storages = {p.untyped_storage().data_ptr() for p in model.parameters()}
+        # StorageImpl identity, not data_ptr: paged weights get a new address
+        # every time they are streamed back in.
+        self._param_storages = {p.untyped_storage()._cdata for p in model.parameters()}
         self._session: Optional[_Session] = None
         self._ctx = None
         self._depth_guard = 0
@@ -418,7 +420,7 @@ class ActivationOffloader:
         if not t.is_cuda or t.layout != torch.strided:
             return t
         nbytes = t.numel() * t.element_size()
-        is_param = t.untyped_storage().data_ptr() in self._param_storages
+        is_param = t.untyped_storage()._cdata in self._param_storages
 
         if self.calibrating:
             if not is_param and nbytes >= self.min_bytes:

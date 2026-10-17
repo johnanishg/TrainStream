@@ -42,6 +42,35 @@ struct Cvt<__nv_bfloat16> {
   __device__ __forceinline__ static __nv_bfloat16 store(float x) { return __float2bfloat16_rn(x); }
 };
 
+// Moment storage: fp32 as-is, or bf16 with stochastic rounding.
+__device__ __forceinline__ uint32_t mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+template <typename M>
+struct Moment;
+
+template <>
+struct Moment<float> {
+  __device__ __forceinline__ static float load(float x) { return x; }
+  __device__ __forceinline__ static float store(float x, uint32_t) { return x; }
+};
+
+template <>
+struct Moment<__nv_bfloat16> {
+  __device__ __forceinline__ static float load(__nv_bfloat16 x) { return __bfloat162float(x); }
+  __device__ __forceinline__ static __nv_bfloat16 store(float x, uint32_t r) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += r & 0xffffu;  // inf/nan pass through
+    return __ushort_as_bfloat16(static_cast<unsigned short>(bits >> 16));
+  }
+};
+
 inline int grid_for(int64_t n, int per_block, int sm_count) {
   int64_t blocks = (n + per_block - 1) / per_block;
   const int64_t cap = static_cast<int64_t>(sm_count > 0 ? sm_count : 80) * kBlocksPerSm;
@@ -50,12 +79,12 @@ inline int grid_for(int64_t n, int per_block, int sm_count) {
   return static_cast<int>(blocks);
 }
 
-template <typename T>
+template <typename T, typename M>
 __global__ void __launch_bounds__(kThreads)
     adamw_zero_copy_kernel(T* __restrict__ param, const T* __restrict__ grad,
-                           float* __restrict__ exp_avg, float* __restrict__ exp_avg_sq,
+                           M* __restrict__ exp_avg, M* __restrict__ exp_avg_sq,
                            float* __restrict__ master, int64_t n, AdamWParams hp,
-                           const float* __restrict__ grad_sq_norm) {
+                           const float* __restrict__ grad_sq_norm, uint32_t seed) {
   float clip = 1.0f;
   if (grad_sq_norm != nullptr) {
     const float norm = sqrtf(*grad_sq_norm);
@@ -79,8 +108,8 @@ __global__ void __launch_bounds__(kThreads)
       const int64_t i = base + static_cast<int64_t>(u) * kThreads;
       if (i < n) {
         g[u] = Cvt<T>::load(grad[i]) * clip;
-        m[u] = exp_avg[i];
-        v[u] = exp_avg_sq[i];
+        m[u] = Moment<M>::load(exp_avg[i]);
+        v[u] = Moment<M>::load(exp_avg_sq[i]);
         p[u] = master != nullptr ? master[i] : Cvt<T>::load(param[i]);
       }
     }
@@ -95,8 +124,9 @@ __global__ void __launch_bounds__(kThreads)
         const float vu = hp.beta2 * v[u] + one_minus_b2 * g[u] * g[u];
         const float denom = sqrtf(vu) / hp.bias_correction2_sqrt + hp.eps;
         pu -= hp.step_size * (mu / denom);
-        exp_avg[i] = mu;
-        exp_avg_sq[i] = vu;
+        const uint32_t r = mix32(static_cast<uint32_t>(i) * 0x9e3779b1u ^ seed);
+        exp_avg[i] = Moment<M>::store(mu, r);
+        exp_avg_sq[i] = Moment<M>::store(vu, mix32(r ^ 0x85ebca6bu));
         if (master != nullptr) master[i] = pu;
         param[i] = Cvt<T>::store(pu);
       }
@@ -127,13 +157,20 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 template <typename T>
-cudaError_t launch_adamw(void* param, const void* grad, float* m, float* v, float* master,
+cudaError_t launch_adamw(void* param, const void* grad, void* m, void* v, float* master,
                          int64_t n, const AdamWParams& hp, const float* norm, int sm_count,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool bf16_moments, uint32_t seed) {
   if (n == 0) return cudaSuccess;
   const int grid = grid_for(n, kThreads * kUnroll, sm_count);
-  adamw_zero_copy_kernel<T><<<grid, kThreads, 0, stream>>>(
-      static_cast<T*>(param), static_cast<const T*>(grad), m, v, master, n, hp, norm);
+  if (bf16_moments) {
+    adamw_zero_copy_kernel<T, __nv_bfloat16><<<grid, kThreads, 0, stream>>>(
+        static_cast<T*>(param), static_cast<const T*>(grad), static_cast<__nv_bfloat16*>(m),
+        static_cast<__nv_bfloat16*>(v), master, n, hp, norm, seed);
+  } else {
+    adamw_zero_copy_kernel<T, float><<<grid, kThreads, 0, stream>>>(
+        static_cast<T*>(param), static_cast<const T*>(grad), static_cast<float*>(m),
+        static_cast<float*>(v), master, n, hp, norm, seed);
+  }
   return cudaGetLastError();
 }
 
@@ -148,20 +185,20 @@ cudaError_t launch_sq_norm(const void* grad, int64_t n, float* out, int sm_count
 
 }  // namespace
 
-cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, float* exp_avg,
-                            float* exp_avg_sq, float* master, int64_t n,
+cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, void* exp_avg,
+                            void* exp_avg_sq, float* master, int64_t n,
                             const AdamWParams& hp, const float* grad_sq_norm, int sm_count,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, bool bf16_moments, uint32_t seed) {
   switch (dtype) {
     case DType::kFloat32:
       return launch_adamw<float>(param, grad, exp_avg, exp_avg_sq, master, n, hp, grad_sq_norm,
-                                 sm_count, stream);
+                                 sm_count, stream, bf16_moments, seed);
     case DType::kFloat16:
       return launch_adamw<__half>(param, grad, exp_avg, exp_avg_sq, master, n, hp, grad_sq_norm,
-                                  sm_count, stream);
+                                  sm_count, stream, bf16_moments, seed);
     case DType::kBFloat16:
       return launch_adamw<__nv_bfloat16>(param, grad, exp_avg, exp_avg_sq, master, n, hp,
-                                         grad_sq_norm, sm_count, stream);
+                                         grad_sq_norm, sm_count, stream, bf16_moments, seed);
   }
   return cudaErrorInvalidValue;
 }

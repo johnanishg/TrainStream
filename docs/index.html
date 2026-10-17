@@ -168,7 +168,7 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
   </button>
   <div class="brand">TrainStream <span>docs</span></div>
   <div class="spacer"></div>
-  <span class="pill opt">v0.1.0</span>
+  <span class="pill opt">v0.2.0</span>
   <span class="pill opt">C++ · CUDA · ATen</span>
   <span class="pill">zero dependencies</span>
 </header>
@@ -180,6 +180,9 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
       <li><a href="#architecture">Memory architecture</a></li>
       <li><a href="#pcie">PCIe bandwidth analysis</a></li>
       <li><a href="#results">Measured results</a></li>
+      <li><a href="#live-run">End-to-end 1.8B run</a></li>
+      <li><a href="#results-v02">0.2 measurements</a></li>
+      <li><a href="#scale">How large can it go?</a></li>
       <li><a href="#matrix">Feature matrix</a></li>
     </ul></div>
   <div class="group"><button class="gtitle">Beginner <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
@@ -197,14 +200,17 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
       <li><a href="#hooks">PyTorch backward hooks</a></li>
       <li><a href="#tuning">Profile-driven tuning</a></li>
       <li><a href="#verify">Prove it uses system RAM</a></li>
+      <li><a href="#param-paging">Parameter paging</a></li>
+      <li><a href="#extras">Chunked loss and bf16 moments</a></li>
     </ul></div>
   <div class="group"><button class="gtitle">Advanced <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
     <ul>
       <li><a href="#events"><span class="phase-dot" style="background:#e07aa2"></span>Stream sync with CUDA events</a></li>
       <li><a href="#allocator">Custom host allocator</a></li>
       <li><a href="#dma">PCIe DMA tuning</a></li>
+      <li><a href="#distributed">Data-parallel training</a></li>
+      <li><a href="#safety">Safety nets</a></li>
       <li><a href="#pitfalls">Correctness pitfalls we hit</a></li>
-      <li><a href="#multigpu">Multi-GPU pipelines</a></li>
     </ul></div>
   <div class="group"><button class="gtitle">Reference <svg viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
     <ul>
@@ -222,11 +228,11 @@ footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--borde
 <section id="mission" class="hero">
   <div class="kicker overview">Project overview</div>
   <h1>Train models larger than your GPU, over the PCIe bus you already have.</h1>
-  <p class="lead">TrainStream is a standalone C++/CUDA extension for PyTorch. It moves optimizer state, gradients and activations into pinned host RAM, streams them over dedicated CUDA copy streams, and overlaps all of it with compute. It uses no DeepSpeed, no bitsandbytes and no third-party libraries: only the C++ standard library, the CUDA runtime and PyTorch's ATen.</p>
+  <p class="lead">TrainStream is a standalone C++/CUDA extension for PyTorch. It moves optimizer state, gradients, activations and, when needed, the weights themselves into host RAM, streams them over dedicated CUDA copy streams, and overlaps all of it with compute. It uses no DeepSpeed, no bitsandbytes and no third-party libraries: only the C++ standard library, the CUDA runtime and PyTorch's ATen.</p>
   <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">import trainstream
 model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integration</pre></div>
   <div class="hero-grid">
-    <div class="stat"><div class="k">VRAM per parameter (fp32 + AdamW)</div><div class="v">16 → 4 B</div><div class="s">weights stay; grads and moments leave</div></div>
+    <div class="stat"><div class="k">VRAM per parameter (fp32 + AdamW)</div><div class="v">16 → 4 B</div><div class="s">grads and moments leave; with weight paging the weights do too</div></div>
     <div class="stat"><div class="k">Qwen2.5-1.5B full fine-tune, 24 GB GPU</div><div class="v">35.9 → 18.7 GiB</div><div class="s">peak VRAM, same losses, 3.9× faster than spilling</div></div>
     <div class="stat"><div class="k">Parity with torch.optim.AdamW</div><div class="v">≤ 3e-7</div><div class="s">max abs param difference after 20 steps</div></div>
     <div class="stat"><div class="k">Runtime dependencies</div><div class="v">0</div><div class="s">CUDA runtime + ATen only</div></div>
@@ -414,6 +420,115 @@ model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integ
   <div class="callout"><p class="t">How to read the 85M row</p><p>For small models that already fit, TrainStream costs throughput: host AdamW at about 2.6 Gelem/s needs about 33 ms of host time per step for 85M parameters, and only part of that hides under a 30 ms backward. Offloading pays off when the alternative is not fitting at all, or when the freed VRAM buys a larger batch.</p></div>
 </section>
 
+<section id="live-run">
+  <div class="kicker overview">Overview</div>
+  <h2>End-to-end run: 1.8B GPT on a 24 GB laptop GPU</h2>
+  <p>A complete 200-step training run of the 1.8B-parameter GPT (36 layers, d<sub>model</sub> 2048, fp32 weights, bf16 autocast, batch 8 × 512 tokens) with TrainStream installed from PyPI (<code>pip install trainstream</code>, 0.1.0) and default settings: cpu-mode optimizer and automatic activation paging. A small analytics script recorded every step and streamed it to a live chart view. Stock AdamW does not fit this model in 24 GB at all; see the table above.</p>
+  <div class="hero-grid">
+    <div class="stat"><div class="k">Steps completed</div><div class="v">200 / 200</div><div class="s">4 min 47 s wall, no out-of-memory</div></div>
+    <div class="stat"><div class="k">Step time (median, steps 21–200)</div><div class="v">1.14 s</div><div class="s">3.6k tokens/s; first step 1.52 s</div></div>
+    <div class="stat"><div class="k">Peak VRAM</div><div class="v">20.6 GiB</div><div class="s">step 1; 16.2 GiB median after paging settled</div></div>
+    <div class="stat"><div class="k">Moved to system RAM</div><div class="v">27.0 GiB</div><div class="s">optimizer state and gradient staging</div></div>
+    <div class="stat"><div class="k">PCIe traffic</div><div class="v">25.3 GB/s</div><div class="s">both directions combined; link measured at 28.6 GB/s</div></div>
+  </div>
+  <div class="fig">
+      <svg viewBox="0 0 900 250" role="img" aria-label="Where the 1.8B model's training memory lived: stock AdamW needs 34.1 GiB of VRAM, TrainStream used 16.2 GiB of VRAM plus 27.0 GiB of system RAM">
+        <text x="16" y="22" font-size="13" fill="#c3c2b7">GiB</text>
+        <line x1="170.0" x2="170.0" y1="34" y2="214" stroke="#2a2a28"/><text x="170.0" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">0</text><line x1="263.3" x2="263.3" y1="34" y2="214" stroke="#2a2a28"/><text x="263.3" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">6</text><line x1="356.7" x2="356.7" y1="34" y2="214" stroke="#2a2a28"/><text x="356.7" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">12</text><line x1="450.0" x2="450.0" y1="34" y2="214" stroke="#2a2a28"/><text x="450.0" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">18</text><line x1="543.3" x2="543.3" y1="34" y2="214" stroke="#2a2a28"/><text x="543.3" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">24</text><line x1="636.7" x2="636.7" y1="34" y2="214" stroke="#2a2a28"/><text x="636.7" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">30</text><line x1="730.0" x2="730.0" y1="34" y2="214" stroke="#2a2a28"/><text x="730.0" y="232" text-anchor="middle" font-size="11.5" fill="#8f8e88">36</text>
+        <line x1="541.8" x2="541.8" y1="34" y2="214" stroke="#fab219" stroke-width="1.5" stroke-dasharray="6 4"/>
+        <text x="547.8" y="46" font-size="12" fill="#fab219">24 GB card (23.9 GiB)</text>
+
+        <text x="16" y="82" font-size="13" fill="#f0efec">Stock AdamW</text>
+        <text x="16" y="98" font-size="11.5" fill="#8f8e88">VRAM, peak</text>
+        <rect x="171.0" y="64" width="369.8" height="34" rx="4" fill="#3987e5"/><text x="355.9" y="86" text-anchor="middle" font-size="12.5" fill="#fff">VRAM: weights, grads, moments, activations</text>
+        <rect x="542.8" y="64" width="156.7" height="34" rx="4" fill="#e66767"/><text x="621.1" y="86" text-anchor="middle" font-size="12.5" fill="#fff">spills 10.2 GiB</text>
+
+        <text x="16" y="134" font-size="13" fill="#f0efec">TrainStream</text>
+        <text x="16" y="150" font-size="11.5" fill="#8f8e88">VRAM, peak</text>
+        <rect x="171.0" y="116" width="103.2" height="34" rx="4" fill="#3987e5"/><text x="222.6" y="138" text-anchor="middle" font-size="12.5" fill="#fff">weights 6.8</text>
+        <rect x="276.2" y="116" width="144.8" height="34" rx="4" fill="#6da7ec"/><text x="348.6" y="138" text-anchor="middle" font-size="12.5" fill="#111">activations + workspace</text>
+
+        <text x="16" y="186" font-size="13" fill="#f0efec">TrainStream</text>
+        <text x="16" y="202" font-size="11.5" fill="#8f8e88">system RAM</text>
+        <rect x="171.0" y="168" width="103.2" height="34" rx="4" fill="#d95926"/><text x="222.6" y="190" text-anchor="middle" font-size="12.5" fill="#fff">fp32 master 6.8</text>
+        <rect x="276.2" y="168" width="103.2" height="34" rx="4" fill="#199e70"/><text x="327.7" y="190" text-anchor="middle" font-size="12.5" fill="#fff">grad staging 6.8</text>
+        <rect x="381.3" y="168" width="208.3" height="34" rx="4" fill="#d55181"/><text x="485.5" y="190" text-anchor="middle" font-size="12.5" fill="#fff">AdamW moments 13.5 (pageable)</text>
+      </svg>
+  </div>
+  <div class="tbl"><table>
+    <tr><th>Measurement</th><th class="num">Value</th><th>What it shows</th></tr>
+    <tr><td>VRAM held between steps</td><td class="num">6.84 GiB</td><td>essentially only the fp32 weights (1.815B × 4 B = 6.76 GiB); gradients and moments never stay on the GPU</td></tr>
+    <tr><td>Peak VRAM inside a step</td><td class="num">16.2 GiB median, 20.6 GiB max</td><td>the maximum is step 1, before the auto-tuner starts paging activations</td></tr>
+    <tr><td>Pinned host memory</td><td class="num">13.5 GiB</td><td>fp32 master weights 6.76 GiB + gradient staging 6.76 GiB</td></tr>
+    <tr><td>Pageable host memory</td><td class="num">13.5 GiB</td><td>AdamW moments; the 40%-of-RAM pinning budget (25.4 GiB of 63.4 GiB) kept them in ordinary memory</td></tr>
+    <tr><td>System RAM in use</td><td class="num">51.1 → 57.5 GiB of 63.4 GiB</td><td>the host side of the offload, plus the OS and other programs</td></tr>
+    <tr><td>Bytes over PCIe per step</td><td class="num">14.4 GB each way</td><td>D2H: 7.26 GB gradients + 7.13 GB activations; H2D: 7.26 GB updated weights + 7.13 GB activations back</td></tr>
+    <tr><td>PCIe rate, averaged over each step</td><td class="num">12.6 GB/s per direction</td><td>both directions run at the same time (measured duplex ceiling 28.6 GB/s)</td></tr>
+    <tr><td>Activation paging</td><td class="num">17 of 36 blocks</td><td>chosen by the auto-tuner within the 15% slowdown budget; prefetch hit rate 100%</td></tr>
+    <tr><td>Back-pressure wait</td><td class="num">≈ 194 ms per step</td><td>forward pass waiting for the link because of the 1 GiB in-flight cap, which bounds VRAM held by transfers</td></tr>
+    <tr><td>Optimizer stalls</td><td class="num">0.002 ms grad, 0.37 ms ready</td><td>host AdamW finishes during the backward pass; the next forward barely waits for weights</td></tr>
+    <tr><td>Training loss</td><td class="num">6.10 → 2.97</td><td>validation 3.27 at step 25 → 2.70 at step 200</td></tr>
+  </table></div>
+  <div class="callout warn"><p class="t">Loss spike at step 50</p><p>Train loss jumped to 6.9 at step 51 (validation 7.16 at step 50) and was back on trend by step 75. The run used learning rate 3e-4 with only 20 warm-up steps and no gradient clipping, which is aggressive for 1.8B parameters, so this looks like an optimization instability rather than an offload error: the optimizer itself is checked against <code>torch.optim.AdamW</code> to ≤ 3e-7. For long runs, use <code>wrap(..., max_grad_norm=1.0)</code> and a longer warm-up. That configuration was not re-run here.</p></div>
+
+  <h3>Automated end-to-end tests</h3>
+  <p>The same script also runs as a test: it trains a 20M model for 30 steps with TrainStream and with stock AdamW in subprocesses, then checks the recorded numbers.</p>
+  <div class="tbl"><table>
+    <tr><th>Test</th><th>Checks</th><th>trainstream 0.1.0 (PyPI)</th><th>0.1.1 wheel, plain <code>pip install</code></th></tr>
+    <tr><td>import and compile</td><td><code>import trainstream</code> loads <code>_C</code> built against the installed CUDA PyTorch</td><td>pass</td><td>pass; compiled on first import</td></tr>
+    <tr><td>train with TrainStream</td><td>all 30 steps; loss falls by more than 1.0; ≥ 12 B/param of optimizer state in host RAM; ≥ 4 B/param each way over PCIe every step; PCIe profiled; 6 of 6 blocks managed</td><td>pass</td><td>pass</td></tr>
+    <tr><td>train with stock AdamW</td><td>same script, no offload traffic or host state</td><td>pass</td><td>pass</td></tr>
+    <tr><td>less VRAM than AdamW</td><td>VRAM held between steps is lower with TrainStream</td><td>pass</td><td>pass</td></tr>
+    <tr><td>analytics server</td><td>serves the UI and returns the recorded run</td><td>pass</td><td>pass</td></tr>
+    <tr><td>library suite</td><td><code>python -m pytest tests</code>: parity, paging exactness, allocator, Hugging Face</td><td>47 passed</td><td>38 passed (Hugging Face module skipped: transformers not installed in that venv)</td></tr>
+  </table></div>
+  <p>0.1.1 install check, in a fresh venv in a normal PowerShell with no Visual Studio environment and no CUDA on PATH: <code>pip install</code> took seconds, the first <code>import trainstream</code> found MSVC and CUDA 13.4 and compiled in 16 s, and later imports took 1.7 s.</p>
+</section>
+
+<section id="results-v02">
+  <div class="kicker overview">Overview</div>
+  <h2>0.2 measurements</h2>
+  <p>Same machine, the same byte-level GPT on Python's standard-library source, bf16 autocast, batch 8 × 512 tokens. Medians over steps 21–40 (85M: 21–60). Every row is a recorded run of the analytics script with TrainStream 0.2.0.</p>
+  <div class="tbl"><table>
+    <tr><th>Model</th><th>Configuration</th><th class="num">Peak VRAM</th><th class="num">VRAM between steps</th><th class="num">Step time</th><th class="num">Host RAM used</th><th>Notes</th></tr>
+    <tr><td>85M</td><td>stock torch.optim.AdamW (fused)</td><td class="num">2.55 GiB</td><td class="num">1.04 GiB</td><td class="num">43.7 ms</td><td class="num">—</td><td></td></tr>
+    <tr><td>85M</td><td>TrainStream, offload="auto"</td><td class="num">2.56 GiB</td><td class="num">1.05 GiB</td><td class="num">43.8 ms</td><td class="num">—</td><td>switched to resident after 2 steps</td></tr>
+    <tr><td>85M</td><td>TrainStream, offload=True</td><td class="num">1.70 GiB</td><td class="num">0.58 GiB</td><td class="num">54.5 ms</td><td class="num">1.5 GiB</td><td>always offloaded</td></tr>
+    <tr><td>1.8B</td><td>TrainStream, weights resident</td><td class="num">18.87 GiB</td><td class="num">7.78 GiB</td><td class="num">1,047 ms</td><td class="num">27.0 GiB</td><td>0.1-style offload (stock AdamW does not fit)</td></tr>
+    <tr><td>1.8B</td><td>+ weight paging</td><td class="num">2.42 GiB</td><td class="num">1.21 GiB</td><td class="num">2,063 ms</td><td class="num">27.0 GiB</td><td>built on the CPU; 36 of 36 blocks paged</td></tr>
+    <tr><td>1.8B</td><td>+ weight paging + bf16 moments</td><td class="num">2.49 GiB</td><td class="num">1.21 GiB</td><td class="num">1,841 ms</td><td class="num">20.3 GiB</td><td></td></tr>
+    <tr><td>1.8B</td><td>paging + bf16 moments, 4 GB VRAM cap</td><td class="num">1.84 GiB</td><td class="num">0.59 GiB</td><td class="num">1,842 ms</td><td class="num">20.3 GiB</td><td>set_per_process_memory_fraction</td></tr>
+  </table></div>
+  <div class="hero-grid">
+    <div class="stat"><div class="k">1.8B params inside a 4 GB VRAM cap</div><div class="v">1.84 GiB</div><div class="s">peak VRAM; its fp32 weights alone are 7.3 GB</div></div>
+    <div class="stat"><div class="k">Weight paging on 1.8B</div><div class="v">18.9 → 2.4 GiB</div><div class="s">peak VRAM, same loss curve</div></div>
+    <div class="stat"><div class="k">bf16 moments on 1.8B</div><div class="v">27.0 → 20.3 GiB</div><div class="s">host memory for optimizer state</div></div>
+    <div class="stat"><div class="k">85M model, offload="auto"</div><div class="v">100%</div><div class="s">of stock AdamW's throughput after switching to resident</div></div>
+  </div>
+  <p>Loss curves of the paged runs match the unpaged one (final train loss 3.180 unpaged, 3.180 paged, 3.179 with bf16 moments, 3.179 under the 4 GB cap). The paged and unpaged code paths are bit-identical in the test suite (<code>test_paged_is_bit_identical_to_unpaged</code>); bf16 moments change the arithmetic slightly, by design.</p>
+</section>
+
+<section id="scale">
+  <div class="kicker overview">Overview</div>
+  <h2>How large can it go?</h2>
+  <p>With weight paging, VRAM no longer limits model size; system RAM does. Every trained parameter keeps its fp32 master weight and optimizer moments in host RAM, and frozen weights keep one bf16 copy there. Gradient staging buffers are pooled, so they cost a bounded working set rather than bytes per parameter. On this machine (64 GB RAM, 24 GB GPU):</p>
+  <div class="tbl"><table>
+    <tr><th>Run</th><th class="num">Parameters</th><th class="num">Peak VRAM</th><th class="num">Step time</th><th class="num">Host RAM</th><th>Notes</th></tr>
+    <tr><td>Full fine-tune, GPT, fp32 weights, bf16 moments, batch 2 × 512</td><td class="num">3.63B (all trained)</td><td class="num">3.06 GiB</td><td class="num">3.15 s</td><td class="num">29.7 GiB state, 33.9 GiB process</td><td>32 of 32 blocks paged; validation loss 6.65 → 4.00 over 15 steps. Stock AdamW would need about 58 GB of VRAM.</td></tr>
+    <tr><td>LoRA r=16, Qwen2.5-7B architecture, stock Trainer + PEFT</td><td class="num">7.62B (40.4M trained)</td><td class="num">20.3 GB</td><td class="num">0.27 s</td><td class="num">2.9 GB process</td><td>whole bf16 model in VRAM</td></tr>
+    <tr><td>LoRA r=16, Qwen2.5-7B architecture, TrainStreamTrainer</td><td class="num">7.62B (40.4M trained)</td><td class="num">4.6 GB</td><td class="num">1.25 s</td><td class="num">20.2 GB process</td><td>model passed on the CPU; 28 of 28 layers paged, 13.1 GB pinned</td></tr>
+    <tr><td>LoRA r=16, Qwen2.5-14B architecture, TrainStreamTrainer</td><td class="num">14.77B (68.8M trained)</td><td class="num">5.6 GB</td><td class="num">2.48 s</td><td class="num">36.2 GB process</td><td>29.5 GB of bf16 weights, more than the GPU holds; 48 of 48 layers paged, 26.1 GB pinned and 0.3 GB pageable past the pin budget</td></tr>
+  </table></div>
+  <p>The LoRA runs use the exact Qwen2.5 layer shapes with random weights (<code>examples/lora_large_model.py</code>; pass <code>--model</code> for a real checkpoint), batch 1 × 512, a 152,064-token vocabulary and the chunked loss. Memory and time depend only on the shapes, so the losses mean nothing here. Correctness is covered by the test suite: <code>test_trainer_takes_a_cpu_model_and_pages_its_layers</code> matches the stock Trainer step for step. In the 3.6B run the training loss jumped from 6.18 to 23.9 at step 2 and was back on trend by step 5. The 1.8B model does the same (6.10 → 13.09) with the unpaged code path too, and the paged and unpaged 1.8B runs are identical step for step, so the jump is the first Adam step of this model, not paging.</p>
+  <div class="tbl"><table>
+    <tr><th>Host RAM per parameter</th><th class="num">Trained (full fine-tune)</th><th class="num">Frozen (LoRA base)</th></tr>
+    <tr><td>fp32 weights, fp32 moments</td><td class="num">12 B</td><td class="num">4 B</td></tr>
+    <tr><td>fp32 weights, bf16 moments</td><td class="num">8 B</td><td class="num">4 B</td></tr>
+    <tr><td>bf16 weights, bf16 moments</td><td class="num">10 B (fp32 master + bf16 copy + moments)</td><td class="num">2 B</td></tr>
+  </table></div>
+  <p>On top of these come pooled gradient staging (a quarter of one step's gradients, at least 1 GiB), paged activations, and, with <code>max_grad_norm</code> or gradient accumulation, a 4-byte fp32 gradient accumulator per trained parameter. As a rule of thumb, divide free RAM by those figures: roughly 4–5B parameters for a full fine-tune and 20B+ for a LoRA base on 64 GB. Time is the other cost, because every paged weight crosses PCIe twice per step: the 14B LoRA moves about 59 GB per step.</p>
+</section>
+
 <section id="matrix">
   <div class="kicker overview">Overview</div>
   <h2>Feature matrix</h2>
@@ -431,16 +546,25 @@ model, optimizer = trainstream.wrap(model, optimizer)   # that's the whole integ
     <tr><td>LR schedulers, state_dict</td><td><span class="yes">yes</span></td><td>real <code>torch.optim.Optimizer</code> subclass; AdamW-compatible state</td></tr>
     <tr><td>Migrate an existing AdamW</td><td><span class="yes">yes</span></td><td><code>wrap()</code> moves moments to host and frees their VRAM</td></tr>
     <tr><td>Hugging Face Trainer / PEFT</td><td><span class="yes">yes</span></td><td><code>trainstream.integrations.huggingface</code>: <code>TrainStreamTrainer</code>, <code>wrap_hf</code></td></tr>
-    <tr><td>Multi-GPU pipeline parallelism</td><td><span class="part">design guide</span></td><td>per-device runtimes exist; scheduling is <a href="#multigpu">documented</a>, not shipped</td></tr>
-    <tr><td>Parameter (weight) paging</td><td><span class="no">no</span></td><td>weights stay resident (see <a href="#limits">limitations</a>)</td></tr>
+    <tr><td>Parameter (weight) paging</td><td><span class="yes">yes</span></td><td><code>paging.py</code>: block weights in host RAM, streamed in per block (<a href="#param-paging">details</a>)</td></tr>
+    <tr><td>Models larger than VRAM, built on CPU</td><td><span class="yes">yes</span></td><td><code>wrap(model_on_cpu, device="cuda", param_offload=True)</code></td></tr>
+    <tr><td>Chunked output layer + loss</td><td><span class="yes">yes</span></td><td><code>chunked_cross_entropy</code>; used by <code>TrainStreamTrainer</code></td></tr>
+    <tr><td>bf16 optimizer moments</td><td><span class="yes">yes</span></td><td>stochastic rounding, host and zero-copy paths</td></tr>
+    <tr><td>Data parallel (multi-process)</td><td><span class="yes">yes</span></td><td>gradients averaged on the host over gloo (<a href="#distributed">details</a>)</td></tr>
+    <tr><td>Automatic resident mode</td><td><span class="yes">yes</span></td><td><code>offload="auto"</code>: fused GPU AdamW when the model fits</td></tr>
+    <tr><td>Weights read outside their module</td><td><span class="yes">yes</span></td><td>parameter guard waits for in-flight updates</td></tr>
+    <tr><td><code>.to()</code> / <code>.half()</code> after wrap</td><td><span class="yes">yes</span></td><td>engine rebuilt, optimizer state carried over</td></tr>
+    <tr><td>Tensor / pipeline parallelism</td><td><span class="no">no</span></td><td>data parallel only</td></tr>
     <tr><td>AMSGrad / maximize</td><td><span class="no">no</span></td><td>rejected with a clear error</td></tr>
   </table></div>
   <div class="tbl"><table>
     <tr><th>Per-parameter cost (fp32)</th><th class="num">VRAM</th><th class="num">Host pinned</th><th class="num">Host other</th></tr>
     <tr><td>torch.optim.AdamW</td><td class="num">16 B</td><td class="num">0</td><td class="num">0</td></tr>
-    <tr><td>TrainStream · cpu mode</td><td class="num">4 B + transient grad</td><td class="num">8 B (+8 B moments if within budget)</td><td class="num">8 B moments otherwise</td></tr>
+    <tr><td>TrainStream · cpu mode</td><td class="num">4 B + transient grad</td><td class="num">4 B master (+8 B moments if within budget) + pooled staging</td><td class="num">8 B moments otherwise</td></tr>
     <tr><td>TrainStream · gpu (zero-copy) mode</td><td class="num">8 B (weights + grad)</td><td class="num">8 B mapped moments</td><td class="num">0</td></tr>
-    <tr><td>TrainStream · cpu mode, bf16 weights</td><td class="num">2 B + transient grad</td><td class="num">8 B (master + 2 staging buffers)</td><td class="num">8 B moments</td></tr>
+    <tr><td>TrainStream · cpu mode, bf16 weights</td><td class="num">2 B + transient grad</td><td class="num">6 B (master + rounded copy) + pooled staging</td><td class="num">8 B moments</td></tr>
+    <tr><td>TrainStream · cpu mode, paged fp32 weights, bf16 moments</td><td class="num">≈ 0 (2–3 blocks at a time)</td><td class="num">4 B master + pooled staging</td><td class="num">4 B moments</td></tr>
+    <tr><td>TrainStream · frozen paged weight (LoRA base, bf16)</td><td class="num">≈ 0</td><td class="num">2 B while within the pin budget</td><td class="num">2 B beyond it</td></tr>
   </table></div>
 </section>
 
@@ -481,7 +605,7 @@ build.bat                                  # Windows
 python setup.py build_ext --inplace        # Linux</pre></div></li>
     <li><strong>Verify.</strong> The test suite checks numerical parity with <code>torch.optim.AdamW</code>, bit-exact activation paging, allocator behaviour and end-to-end training.
       <div class="code"><div class="bar"><span>shell</span><button class="copy">Copy</button></div><pre data-lang="sh">pip install pytest
-python -m pytest tests -q                  # 47 passed (9 need transformers)</pre></div></li>
+python -m pytest tests -q                  # 78 passed (12 need transformers)</pre></div></li>
     <li><strong>Look at your hardware.</strong>
       <div class="code"><div class="bar"><span>python</span><button class="copy">Copy</button></div><pre data-lang="py">import trainstream
 print(trainstream.profile_hardware().summary())</pre></div></li>
@@ -742,6 +866,35 @@ print(trainstream.pinned_stats()["by_tag"])     # bytes per buffer kind in page-
 <hr>
 
 <!-- ======================================================= ADVANCED -->
+<section id="param-paging">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Parameter paging</h2>
+  <p>The optimizer already keeps an authoritative host copy of every trainable weight: the fp32 master, or its rounded bf16/fp16 staging copy. With <code>param_offload</code>, the VRAM storage of each transformer block's weights is released (<code>untyped_storage().resize_(0)</code>, the mechanism FSDP uses). The <code>ParamPager</code> streams the host copy back in on the H2D stream only while the block runs.</p>
+  <div class="tbl"><table>
+    <tr><th>Phase</th><th>What happens to block <em>i</em></th></tr>
+    <tr><td>forward, pre-hook</td><td>load <em>i</em> (usually already prefetched), make compute wait for it on the GPU, prefetch <em>i+1</em></td></tr>
+    <tr><td>forward, post-hook</td><td>clear autocast's cast-weight cache, register a hook on the block's output gradient, release <em>i</em> (the last block stays: backward starts there)</td></tr>
+    <tr><td>backward, output-gradient hook</td><td>load <em>i</em>, prefetch <em>i−1</em>, release every block above <em>i</em> (their input gradients, the last computation that reads their weights, are already queued)</td></tr>
+    <tr><td>optimizer update</td><td>never uploaded; the next load reads the updated host copy once the host threads are done, and the next update waits for that DMA to finish reading</td></tr>
+  </table></div>
+  <p>Between steps only block 0 holds weights in VRAM. Frozen weights (LoRA base layers) get a pinned host copy while that fits the page-lock budget (40% of RAM). Beyond it they stay in ordinary RAM: the tensor the model was built in is reused, so nothing is copied, and loads from it run at pageable speed. A model handed to <code>TrainStreamTrainer</code> on the CPU is placed by <code>wrap()</code> when training starts, so its decoder layers never go to the GPU all at once. <code>state_dict()</code> serves paged weights from host RAM. <code>load_state_dict()</code> materializes one block at a time, then writes the values back to the host copies. <code>unwrap()</code> loads every block back into VRAM. Activation checkpointing works too: recomputation in backward reloads the block, and the release is deferred.</p>
+  <div class="code"><div class="bar"><span>python · a model bigger than the GPU</span><button class="copy">Copy</button></div><pre data-lang="py">model = GPT(cfg)                       # built on the CPU, never moved as a whole
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+model, optimizer = trainstream.wrap(model, optimizer, device="cuda",
+                                    param_offload=True, moment_dtype="bfloat16")</pre></div>
+  <p><code>param_offload="auto"</code> (the default) pages when the weights would take more than half of the GPU, or a <code>set_per_process_memory_fraction</code> cap. <code>True</code> pages every block, and a fraction or a list of indices pages some. Paging needs <code>optimizer_mode="cpu"</code>. When weights are paged, automatic activation paging pages every block from the first step instead of calibrating, because calibration needs all activations resident. Each paged weight crosses PCIe twice per step, once for forward and once for backward. <code>examples/lora_large_model.py</code> fine-tunes a 14.8B-parameter base (<a href="#scale">results</a>). <code>examples/train_bigger_than_vram.py</code> trains the 1.8B model, 7.3 GB of fp32 weights, inside a 4 GB VRAM cap (measured: peak 1.84 GiB, 1.84 s per step).</p>
+</section>
+
+<section id="extras">
+  <div class="kicker intermediate">Intermediate phase</div>
+  <h2>Chunked loss and bf16 moments</h2>
+  <h3>Chunked output layer and cross-entropy</h3>
+  <p>For large vocabularies the logits are the biggest tensor of a step: Qwen's 151,936-token head turns a 4 × 512 batch into 1.16 GiB of fp32 logits, and their gradient is as large again. <code>trainstream.chunked_cross_entropy(hidden, weight, targets, bias=None, chunk_size=1024)</code> computes the logits a slice of rows at a time and recomputes each slice in backward, in place. On a 4,096-token batch with a 50,000-word vocabulary, peak memory for loss plus backward is 248 MiB instead of 2,346 MiB. Values and gradients match the dense computation to 1e-5 in fp32.</p>
+  <p><code>TrainStreamTrainer</code> uses it automatically for causal LMs with a plain linear head. It calls the model as usual, with every TrainStream hook active, while the output layer temporarily passes through its input. It then computes the shifted next-token loss from the final hidden states, normalised exactly as the Trainer would, including <code>num_items_in_batch</code> under gradient accumulation. Models with soft-capped or scaled logits, label smoothing or a custom <code>compute_loss_func</code> keep the stock loss, and <code>trainstream={"chunked_loss": False}</code> turns it off.</p>
+  <h3>bf16 optimizer moments</h3>
+  <p><code>moment_dtype="bfloat16"</code> stores <code>exp_avg</code> and <code>exp_avg_sq</code> in bf16: 4 instead of 8 bytes per parameter of host memory, and less RAM traffic for host AdamW. Plain round-to-nearest would freeze <code>exp_avg_sq</code> once <code>(1−β₂)·g²</code> falls below half a bf16 ulp of v. Instead the moments are written with stochastic rounding: counter-based random bits, keyed by parameter, step and element, are added below bf16's mantissa before truncation. Rounding is unbiased and runs are reproducible. The same rounding is implemented in the zero-copy CUDA kernel. Master weights stay fp32, and <code>state_dict()</code> exports fp32 moments. Over 200 steps the summed second moments stay within 3% of an fp32 run (<code>test_bf16_moments_track_fp32_moments</code>). On 1.8B the optimizer state shrinks from 27.0 GiB to 20.3 GiB of host RAM.</p>
+</section>
+
 <section id="events">
   <div class="kicker advanced">Advanced phase</div>
   <h2>Custom stream synchronization with CUDA events</h2>
@@ -802,37 +955,62 @@ for size, gbps in sorted(p.sweep_h2d.items()):
 print("duplex factor", p.duplex_factor, " break-even FLOP/B", round(p.break_even_flops_per_byte))</pre></div>
 </section>
 
+<section id="distributed">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>Data-parallel training</h2>
+  <p>With a <code>torch.distributed</code> process group of more than one rank, <code>wrap()</code> switches to data parallel (or pass <code>distributed=True</code>). Gradients already land in host RAM, so they are averaged there:</p>
+  <ol class="steps">
+    <li><strong>Same start.</strong> <code>wrap()</code> broadcasts parameters and buffers from rank 0 over a dedicated gloo group, before any host state is created.</li>
+    <li><strong>Reduce where the data is.</strong> Each gradient is streamed to host and accumulated as usual. On the last micro-batch its slot goes to a reducer thread that all-reduces the fp32 host buffer over gloo. That works under any default backend, on Windows (which has no NCCL) and Linux alike. Every rank produces gradients in the same backward order, so collectives match up.</li>
+    <li><strong>Update.</strong> Without clipping, the reducer queues that tensor's AdamW update immediately with the gradient scaled by 1/world, so host math still overlaps backward. With <code>max_grad_norm</code>, <code>step()</code> computes the global norm of the averaged gradients and clips with it.</li>
+  </ol>
+  <div class="code"><div class="bar"><span>python · one process per rank (torchrun or mp.spawn)</span><button class="copy">Copy</button></div><pre data-lang="py">dist.init_process_group("gloo")      # or "nccl"; gradients are reduced on a gloo group either way
+model = MyModel().cuda(local_rank)
+model, optimizer = trainstream.wrap(model, torch.optim.AdamW(model.parameters(), lr=3e-4))
+# each rank trains on its own shard of the data (e.g. DistributedSampler)</pre></div>
+  <p><code>tests/test_distributed.py</code> runs two processes sharing one GPU, and passes on Windows and on Linux (WSL2). Each trains on its half of every batch from different random initial weights, with and without clipping, with gradient accumulation, and with parameter paging. The ranks must end bit-identical to each other and within 1e-4 of a single process training on the whole batch. Host-side reduction is bounded by RAM and gloo bandwidth, and it has only been exercised on one machine with one GPU.</p>
+</section>
+
+<section id="safety">
+  <div class="kicker advanced">Advanced phase</div>
+  <h2>Safety nets</h2>
+  <h3>The parameter guard</h3>
+  <p><code>step()</code> returns while host threads are still updating weights. Module pre-hooks make each module wait for its own parameters, but weights can also be read elsewhere:</p>
+  <ul>
+    <li>functionally by another module</li>
+    <li>by a loss, an EMA or a logger</li>
+    <li>between <code>step()</code> and the next forward</li>
+  </ul>
+  <p>The guard is a <code>TorchFunctionMode</code>. While updates are in flight, it checks the arguments of each torch call against the parameters still being updated, by object and by data pointer, which also catches <code>.data</code> aliases. On a hit it waits for those parameters. Metadata reads such as <code>.grad</code>, <code>.shape</code> and <code>.numel()</code> pass straight through, so <code>zero_grad()</code> and schedulers never block. A forward hook on the root module also waits for everything still pending, so outputs always reflect finished weights. Measured cost: about 1 ms per step on the 85M model. Turn it off with <code>guard_params=False</code>. <code>test_guard_waits_for_weights_used_outside_their_module</code> reads a 16.8M-parameter output weight at the start of forward, before its own module runs.</p>
+  <h3><code>.to()</code>, <code>.cuda()</code>, <code>.half()</code> after <code>wrap()</code></h3>
+  <p><code>wrap()</code> intercepts <code>_apply</code> on every module. A move or cast parks the optimizer state on the host and lets PyTorch convert the model. It then rebuilds the engine for the new device or dtype and reinstalls the hooks. Paged weights travel through their host copies. Moving to the CPU suspends the optimizer, and <code>step()</code> raises until the model is back on a GPU. A cast keeps the fp32 master, so <code>model.half()</code> does not round the weights the optimizer works on.</p>
+  <h3>Resident mode (<code>offload="auto"</code>)</h3>
+  <p>For the first two steps TrainStream offloads and measures the peak. If peak + gradients + both moments in the parameter dtype fit within 85% of the free VRAM budget, it switches to <code>torch.optim.AdamW(fused=True)</code> with the migrated state. The optimizer object and its <code>param_groups</code> dicts stay the same, so LR schedulers keep working. Activation paging is removed too, so small models run at stock speed. <code>offload=True</code> always offloads.</p>
+</section>
+
 <section id="pitfalls">
   <div class="kicker advanced">Advanced phase</div>
   <h2>Correctness pitfalls we hit (and the tests that pin them down)</h2>
   <details open><summary>Saved-tensor layout must survive the round trip</summary><div>
     <p>An early pager restored every activation as contiguous. Under bf16, SDPA picks the memory-efficient attention kernel, whose backward silently returns <strong>wrong gradients</strong> when its saved q/k/v/out come back with a different stride order. The isolated reproducer showed a max gradient error of 54.75, and at 300M parameters training went to NaN. The fix copies dense tensors byte-for-byte and restores their exact strides; non-dense views (q/k/v sliced from a fused qkv) are packed densely <em>in their original dimension order</em>. <code>test_activation_offload_preserves_layout_for_fused_attention</code> checks bit-exact gradients on the efficient, cuDNN and math backends.</p></div></details>
   <details><summary>recordStream can abort the process on a full device</summary><div>
-    <p>Tagging blocks with <code>recordStream</code> for the copy streams makes PyTorch's caching allocator create CUDA events inside its <em>free</em> path. On a nearly full card that event creation failed inside a destructor, and <code>std::terminate</code> killed the process. TrainStream now keeps explicit lifetimes instead: D2H sources are held until their copy event completes, prefetch buffers come from the consumer's pool and are waited on before use or release, and streamed gradients are released by the worker once the host has consumed them. A terminate hook in the extension prints the real message (<code>[trainstream] terminate: …</code>) rather than a bare stack trace.</p></div></details>
+    <p>Tagging blocks with <code>recordStream</code> for the copy streams makes PyTorch's caching allocator create CUDA events inside its <em>free</em> path. On a nearly full card that event creation failed inside a destructor, and <code>std::terminate</code> killed the process. TrainStream now keeps explicit lifetimes instead: D2H sources are held until their copy event completes, prefetch buffers come from the consumer's pool and are waited on before use or release, and streamed gradients are released once their D2H copy has landed. A terminate hook in the extension prints the real message (<code>[trainstream] terminate: …</code>) rather than a bare stack trace.</p></div></details>
   <details><summary>A reference cycle leaked a step of pinned activations each step</summary><div>
     <p>Handles pointed to their forward session and the session listed its handles, so buffers waited for Python's cyclic garbage collector, adding about 5.9 GB of pinned memory per step on the 1.8B model. Sessions now hold only weak references, so the autograd graph owns the buffers. <code>test_paged_activations_are_freed_every_step</code> runs with the GC disabled.</p></div></details>
   <details><summary>Eager updates and step() raced</summary><div>
     <p>A slot's <code>has_grad</code> flag was cleared by the asynchronous finaliser, so a <code>step()</code> issued before it ran could update the slot a second time. It's now cleared synchronously when the eager update is queued. Five consecutive full-suite runs pass, and parity tests cover the attached, eager and accumulation paths.</p></div></details>
+  <details><summary>autocast's weight cache held every paged weight</summary><div>
+    <p>With weight paging on and the 1.8B model under a 4 GB cap, memory still grew by about 95 MB per block in forward. <code>torch.autocast</code> caches the bf16 cast of every fp32 leaf weight until the autocast region exits, so a half-size copy of every "paged" weight stayed in VRAM. The pager now calls <code>torch.clear_autocast_cache()</code> after each paged block. Each weight is cast once per forward anyway, so nothing is recomputed. Forward peak fell from 3.98 GB to 0.75 GB.</p></div></details>
+  <details><summary>Gradients piled up behind the PCIe link</summary><div>
+    <p>VRAM gradients were kept until the host had <em>finished</em> with them. Host AdamW runs behind backward, and the link is still draining forward's activations, so at 1.8B about 4 GB of gradients accumulated during backward. They are now released as soon as their D2H copy lands, since the host works from the staging copy. Beyond an in-flight cap (1 GiB, or 10% of a smaller GPU's budget) backward waits for the oldest copy, as activation paging already did. Backward peak fell from 6.4 GB to 2.4 GB without a cap.</p></div></details>
+  <details><summary>Loading state reset fused AdamW to the slow path</summary><div>
+    <p>The first resident-mode build loaded migrated state with <code>torch.optim.AdamW.load_state_dict</code>. That call replaces the param-group dicts, which would disconnect LR schedulers, and resets <code>fused</code> to None, leaving the step counters on the CPU. The optimizer step took 9.4 ms instead of 3.6 ms. The state is now placed directly, and the groups are relinked after any later load. <code>test_resident_optimizer_is_fused_and_follows_lr_schedulers</code> pins this down.</p></div></details>
+  <details><summary>Paged weights change address</summary><div>
+    <p>Activation paging recognised weights by <code>data_ptr()</code>. A paged weight gets a new address every time it is streamed back in, so it is now matched by StorageImpl identity (<code>untyped_storage()._cdata</code>), which survives <code>resize_</code>.</p></div></details>
+  <details><summary>Per-parameter gradient staging capped model size</summary><div>
+    <p>Every parameter had its own permanent pinned gradient-staging buffer, 4 B per fp32 parameter, which on a 64 GB machine is the difference between 3.6B and about 5B trainable parameters. Staging buffers now come from the pinned cache when a gradient arrives and go back once the host has consumed it. When the pool's cap is reached (a quarter of one step's gradients, at least 1 GiB), the next gradient waits. <code>test_pooled_gradient_staging_under_a_tiny_cap</code> forces one buffer at a time and checks the results are unchanged and nothing leaks.</p></div></details>
   <details><summary>bf16 attention backward isn't deterministic anyway</summary><div>
-    <p>When comparing paged and unpaged gradients under autocast, two runs <em>without any paging</em> already differ by 1.95e-3, the same amount as paged versus unpaged. Parity tests therefore compare in fp32, or fix the attention backend, where TrainStream is bit-exact.</p></div></details>
-</section>
-
-<section id="multigpu">
-  <div class="kicker advanced">Advanced phase</div>
-  <h2>Extending the engine to multi-GPU pipeline parallelism</h2>
-  <div class="callout warn"><p class="t">Status: design guide</p><p>The runtime is already per-device: streams, event pools and transfer counters are keyed by device index, and an <code>OffloadAdamW</code> engine binds to one device. The pipeline scheduling below is a worked design, not shipped or tested code.</p></div>
-  <ol class="steps">
-    <li><strong>One engine per stage.</strong> Place stage <em>i</em>'s blocks on <code>cuda:i</code> and give each stage its own <code>OffloadAdamW</code> and <code>ActivationOffloader</code>. Each stage then streams over its own PCIe lanes.
-      <div class="code"><div class="bar"><span>python · sketch</span><button class="copy">Copy</button></div><pre data-lang="py">stages = [nn.Sequential(*blocks[a:b]).to(f"cuda:{i}") for i, (a, b) in enumerate(splits)]
-opts = [trainstream.OffloadAdamW(s.parameters(), lr=3e-4).attach(s) for s in stages]
-pagers = [trainstream.ActivationOffloader(s, list(s), offload="auto",
-                                          profile=trainstream.profile_hardware(f"cuda:{i}"))
-          for i, s in enumerate(stages)]</pre></div></li>
-    <li><strong>Hand-offs with events, not syncs.</strong> Send stage <em>i</em>'s output with <code>tensor.to(f"cuda:{i+1}", non_blocking=True)</code> (peer-to-peer where available), recorded behind an event on stage <em>i</em>'s compute stream. Stage <em>i+1</em>'s stream waits on that event, the same pattern as <code>d2h_async</code>.</li>
-    <li><strong>1F1B schedule with paging.</strong> In a one-forward-one-backward schedule, stage 0 holds up to <em>P</em> micro-batches of activations, which is where VRAM peaks. Page micro-batches in the order they will be consumed, and set <code>prefetch_depth</code> to the number of micro-batches between a forward and its backward on that stage.</li>
-    <li><strong>Share the host fairly.</strong> All stages draw on one pool of RAM bandwidth for host AdamW (about 75 GB/s here). Split <code>threads</code> across engines, and on multi-socket hosts allocate each stage's pinned buffers on the NUMA node nearest its GPU's root complex.</li>
-    <li><strong>Profile per link.</strong> GPUs behind a shared PCIe switch split its bandwidth; run <code>profile_hardware</code> with all stages active and feed each pager its own profile.</li>
-  </ol>
+    <p>Memory-efficient attention's backward accumulates with atomic adds, so its last bits depend on scheduling. With no paging at all, 26 of 100 runs differed from the first (by up to 2.8e-3 relative) once other work on another stream shifted the timing. Paging shifts timing too, so the bit-exact layout test failed about one full-suite run in five. That backend is now compared in PyTorch's deterministic mode, where it is bit-exact with and without paging. cuDNN attention isn't available in that mode (PyTorch reports "cuDNN SDPA is not deterministic"), so it is compared within 1%; the layout bug produced errors of 54.75. The math backend is compared exactly.</p></div></details>
 </section>
 
 <hr>
@@ -845,17 +1023,25 @@ pagers = [trainstream.ActivationOffloader(s, list(s), offload="auto",
   <div class="tbl"><table>
     <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
     <tr><td><code>optimizer_mode</code></td><td>"cpu"</td><td>"cpu", "gpu" or "auto"</td></tr>
+    <tr><td><code>offload</code></td><td>"auto"</td><td>"auto": switch to fused GPU AdamW after 2 steps if the model fits; True: always offload</td></tr>
     <tr><td><code>activation_offload</code></td><td>"auto"</td><td>"auto", a fraction, True or False</td></tr>
+    <tr><td><code>param_offload</code></td><td>"auto"</td><td>page block weights to host RAM: "auto", True, False, a fraction, or block indices</td></tr>
+    <tr><td><code>device</code></td><td>None</td><td>target GPU when the model is passed on the CPU</td></tr>
+    <tr><td><code>moment_dtype</code></td><td>"float32"</td><td>"float32" or "bfloat16" (stochastic rounding)</td></tr>
+    <tr><td><code>distributed</code></td><td>auto</td><td>data parallel when a process group with &gt; 1 rank is initialized</td></tr>
+    <tr><td><code>guard_params</code></td><td>True</td><td>wait for in-flight updates wherever a weight is read</td></tr>
     <tr><td><code>blocks</code></td><td>auto-detected</td><td>the repeated layer stack (largest same-typed ModuleList/Sequential)</td></tr>
     <tr><td><code>max_grad_norm</code></td><td>None</td><td>global-norm clipping inside the optimizer</td></tr>
     <tr><td><code>accumulation_steps</code></td><td>1</td><td>backward passes per <code>step()</code></td></tr>
     <tr><td><code>max_activation_slowdown</code></td><td>0.15</td><td>auto-tuner tolerance</td></tr>
-    <tr><td><code>max_inflight_bytes</code></td><td>1 GiB</td><td>paging backpressure</td></tr>
+    <tr><td><code>max_inflight_bytes</code></td><td>1 GiB or 10% of VRAM</td><td>back-pressure for activations and gradients still crossing PCIe</td></tr>
     <tr><td><code>prefetch_depth</code>, <code>min_offload_bytes</code>, <code>threads</code>, <code>profile</code>, <code>lr</code>, <code>verbose</code></td><td></td><td>see <a href="#tuning">tuning</a></td></tr>
   </table></div>
   <p>Accepts <code>torch.optim.AdamW</code>/<code>Adam</code> (hyper-parameters and existing state are migrated), an <code>OffloadAdamW</code>, or <code>None</code>. Also available: <code>trainstream.unwrap(model)</code> and <code>trainstream.memory_report(model)</code>.</p>
-  <h3><code>trainstream.OffloadAdamW(params, lr, betas, eps, weight_decay, *, mode, max_grad_norm, compute_grad_norm, threads, chunk_elems, accumulation_steps, eager, pin_moments)</code></h3>
+  <h3><code>trainstream.OffloadAdamW(params, lr, betas, eps, weight_decay, *, mode, max_grad_norm, compute_grad_norm, threads, chunk_elems, accumulation_steps, eager, pin_moments, moment_dtype, distributed)</code></h3>
   <p>A real <code>torch.optim.Optimizer</code>. Methods: <code>step()</code>, <code>zero_grad()</code>, <code>attach(model)</code> / <code>detach()</code>, <code>synchronize()</code>, <code>stats()</code>, <code>state_dict()</code> / <code>load_state_dict()</code> (AdamW-compatible, plus fp32 <code>master</code>), and the properties <code>last_grad_norm</code> and <code>eager_active</code>. Without <code>attach</code>, <code>step()</code> blocks until the update has landed, so it works as a drop-in.</p>
+  <h3><code>trainstream.chunked_cross_entropy(hidden, weight, targets, bias=None, *, chunk_size=1024, ignore_index=-100, reduction="mean", num_items=None)</code></h3>
+  <p>Cross-entropy of <code>hidden @ weight.T + bias</code> without materializing the logits. <code>trainstream.causal_lm_loss(hidden, weight, labels, bias=None, **kw)</code> applies Hugging Face's one-token shift first.</p>
   <h3><code>trainstream.profile_hardware(device=None, quick=True, force=False) → HardwareProfile</code></h3>
   <p>Fields: <code>h2d_gbps</code>, <code>d2h_gbps</code>, <code>bidir_gbps</code>, <code>pageable_h2d_gbps</code>, <code>latency_us_4k</code>, <code>matmul_tflops_bf16/fp32</code>, <code>cpu_adamw_gelems</code>, <code>zero_copy_adamw_gelems</code>, <code>sweep_h2d/d2h</code>. Derived: <code>duplex_factor</code>, <code>transfer_ms()</code>, <code>link_ms()</code>, <code>activation_offload_fraction()</code>, <code>optimizer_step_ms()</code>, <code>recommend_optimizer_mode()</code>, <code>break_even_flops_per_byte</code>, <code>summary()</code>.</p>
 </section>
@@ -908,17 +1094,19 @@ docs/index.html               this page</pre></div>
   <div class="kicker reference">Reference</div>
   <h2>Limitations</h2>
   <ul>
-    <li>The output logits of large-vocabulary models are not offloaded. For Qwen (151,936 tokens), batch 4 × 512 tokens of fp32 logits alone is 1.16 GiB, plus their gradient. On small GPUs, reduce the batch size or use a chunked loss.</li>
-    <li>Weights stay resident in VRAM; only optimizer state, gradients and activations are offloaded. A model whose weights alone exceed VRAM needs parameter paging, which isn't implemented.</li>
-    <li>Parameters used outside their owning module's <code>forward</code> (functional calls on another module's weight) bypass the readiness hook. Call <code>optimizer.synchronize()</code> before such reads, or use <code>attach()</code> on that module.</li>
-    <li>Moving a wrapped model with <code>.to()</code> after <code>wrap()</code> invalidates the engine's device pointers. Wrap last.</li>
-    <li>For small models that already fit, cpu mode is slower than fused GPU AdamW; host AdamW is bounded by RAM bandwidth (about 2.6 Gelem/s here).</li>
-    <li>Multi-GPU pipeline parallelism is a documented design, not shipped code.</li>
-    <li>Tested on Windows 11 with an RTX 5090 Laptop GPU (sm_120), CUDA 13.4, PyTorch 2.14.1 and Python 3.14. Linux builds use the same <code>setup.py</code> but haven't been exercised here.</li>
+    <li>Host RAM sets the ceiling: 8–12 bytes per trained parameter and 2–4 per frozen one, plus paged activations (<a href="#scale">table</a>). Measured here: a 3.6B full fine-tune and a 14.8B-parameter LoRA base on 64 GB.</li>
+    <li>Parameter paging pages the repeated block stack. Embeddings, the final norm and the output layer stay resident. It needs <code>optimizer_mode="cpu"</code>, and each paged weight crosses PCIe twice per step.</li>
+    <li>Moving a paged model to another device with <code>.to()</code> loads all its weights onto the target briefly.</li>
+    <li>Data parallel only (no tensor or pipeline parallelism). Gradients are averaged on the host over gloo. Tested with two processes on one GPU, on Windows and Linux (WSL2). Not tested across several GPUs or machines.</li>
+    <li><code>TrainStreamTrainer</code> runs in a single process. The Trainer's own multi-GPU path (accelerate/DDP) is rejected; for data parallel, use <code>wrap()</code> in your own loop.</li>
+    <li>fp16 with a GradScaler isn't supported (use bf16 or fp32). AMSGrad and <code>maximize</code> aren't supported.</li>
+    <li>For small models that fit, offloading costs throughput. <code>offload="auto"</code> avoids it by switching to resident mode after two steps.</li>
+    <li><code>torch.compile</code> has not been tested with TrainStream's hooks.</li>
+    <li>Tested on Windows 11 (PyTorch 2.14.1 + CUDA 13.4, MSVC, Python 3.14) and on Linux: Ubuntu 24.04 under WSL2 (PyTorch 2.14.1+cu130, CUDA toolkit 13.3, GCC 13.3, Python 3.12), with a plain <code>pip install</code> of the 0.2.0 wheel. All 78 tests pass on both, on an RTX 5090 Laptop GPU (sm_120). Native Linux (not WSL) and other GPUs haven't been tested.</li>
   </ul>
 </section>
 
-<footer>TrainStream 0.1.1 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and <code>examples/verify_ram_offload.py</code> to check them on yours.</footer>
+<footer>TrainStream 0.2.0 · Measurements taken on the development machine on 2026-10-16. Re-run <code>python -m pytest tests</code> and <code>examples/verify_ram_offload.py</code> to check them on yours.</footer>
 </div>
 </main>
 

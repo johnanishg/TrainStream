@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <type_traits>
 
 namespace trainstream {
 
@@ -42,65 +44,121 @@ HostHp make_hp(double lr, double b1, double b2, double eps, double wd, int64_t s
           static_cast<float>(std::sqrt(bc2)), static_cast<float>(clip)};
 }
 
+// Counter-based random bits for stochastic rounding (same mixer as the kernel).
+inline uint32_t mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+inline uint32_t slot_seed(int64_t id, int64_t step) {
+  return mix32(static_cast<uint32_t>(id) * 0x85ebca6bu ^ mix32(static_cast<uint32_t>(step)));
+}
+
+// Moment storage: fp32 as-is, or bf16 written with stochastic rounding so the
+// small per-step changes of exp_avg_sq survive (round-to-nearest would freeze
+// it once (1 - beta2) * g^2 is below half a bf16 ulp of v).
+template <typename M>
+struct MomentIO;
+
+template <>
+struct MomentIO<float> {
+  static float load(float x) { return x; }
+  static float store(float x, uint32_t) { return x; }
+};
+
+template <>
+struct MomentIO<c10::BFloat16> {
+  static float load(c10::BFloat16 x) { return static_cast<float>(x); }
+  static c10::BFloat16 store(float x, uint32_t r) {
+    uint32_t bits;
+    std::memcpy(&bits, &x, sizeof(bits));
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += r & 0xffffu;  // inf/nan pass through
+    return c10::BFloat16(static_cast<uint16_t>(bits >> 16), c10::BFloat16::from_bits());
+  }
+};
+
 // Host AdamW over [b, e). Same arithmetic order as torch.optim.AdamW
 // (single-tensor path): decoupled decay, lerp for m, addcmul for v,
 // denom = sqrt(v)/sqrt(bc2) + eps, p -= (lr/bc1) * m/denom.
 // G is the gradient element type (fp32 accumulator or the raw DMA staging
 // buffer); with kStage the rounded weights are also written for the upload.
 // The loop is branch-free so the compiler can vectorise it.
-template <typename G, typename P, bool kStage>
-void adamw_host(float* __restrict p, float* __restrict m, float* __restrict v,
+template <typename G, typename P, bool kStage, typename M>
+void adamw_host(float* __restrict p, M* __restrict m, M* __restrict v,
                 const G* __restrict g, P* __restrict stage, int64_t b, int64_t e,
-                const HostHp& hp) {
+                const HostHp& hp, uint32_t seed) {
   const float decay = 1.0f - hp.lr * hp.weight_decay;
   const float omb1 = 1.0f - hp.beta1;
   const float omb2 = 1.0f - hp.beta2;
   for (int64_t i = b; i < e; ++i) {
     const float gi = static_cast<float>(g[i]) * hp.clip;
-    const float mi = m[i] + omb1 * (gi - m[i]);
-    const float vi = hp.beta2 * v[i] + omb2 * gi * gi;
+    const float m0 = MomentIO<M>::load(m[i]);
+    const float mi = m0 + omb1 * (gi - m0);
+    const float vi = hp.beta2 * MomentIO<M>::load(v[i]) + omb2 * gi * gi;
     const float denom = std::sqrt(vi) / hp.bc2_sqrt + hp.eps;
     const float pi = p[i] * decay - hp.step_size * (mi / denom);
-    m[i] = mi;
-    v[i] = vi;
+    if constexpr (std::is_same_v<M, float>) {
+      m[i] = mi;
+      v[i] = vi;
+    } else {
+      const uint32_t r = mix32(static_cast<uint32_t>(i) * 0x9e3779b1u ^ seed);
+      m[i] = MomentIO<M>::store(mi, r);
+      v[i] = MomentIO<M>::store(vi, mix32(r ^ 0x85ebca6bu));
+    }
     p[i] = pi;
     if constexpr (kStage) stage[i] = static_cast<P>(pi);
   }
 }
 
-template <typename G>
-void adamw_dispatch_param(float* p, float* m, float* v, const G* g, at::ScalarType pdtype,
-                          const at::Tensor& param_stage, int64_t b, int64_t e, const HostHp& hp) {
+template <typename G, typename M>
+void adamw_dispatch_param(float* p, M* m, M* v, const G* g, at::ScalarType pdtype,
+                          const at::Tensor& param_stage, int64_t b, int64_t e, const HostHp& hp,
+                          uint32_t seed) {
   switch (pdtype) {
     case at::kFloat:
-      adamw_host<G, float, false>(p, m, v, g, nullptr, b, e, hp);
+      adamw_host<G, float, false, M>(p, m, v, g, nullptr, b, e, hp, seed);
       break;
     case at::kHalf:
-      adamw_host<G, at::Half, true>(p, m, v, g, param_stage.data_ptr<at::Half>(), b, e, hp);
+      adamw_host<G, at::Half, true, M>(p, m, v, g, param_stage.data_ptr<at::Half>(), b, e, hp, seed);
       break;
     case at::kBFloat16:
-      adamw_host<G, at::BFloat16, true>(p, m, v, g, param_stage.data_ptr<at::BFloat16>(), b, e, hp);
+      adamw_host<G, at::BFloat16, true, M>(p, m, v, g, param_stage.data_ptr<at::BFloat16>(), b, e, hp, seed);
       break;
     default:
       TORCH_CHECK(false, "unsupported parameter dtype");
   }
 }
 
-void adamw_dispatch(float* p, float* m, float* v, const at::Tensor& grad, at::ScalarType pdtype,
-                    const at::Tensor& param_stage, int64_t b, int64_t e, const HostHp& hp) {
+template <typename M>
+void adamw_dispatch_m(float* p, M* m, M* v, const at::Tensor& grad, at::ScalarType pdtype,
+                      const at::Tensor& param_stage, int64_t b, int64_t e, const HostHp& hp, uint32_t seed) {
   switch (grad.scalar_type()) {
     case at::kFloat:
-      adamw_dispatch_param(p, m, v, grad.data_ptr<float>(), pdtype, param_stage, b, e, hp);
+      adamw_dispatch_param(p, m, v, grad.data_ptr<float>(), pdtype, param_stage, b, e, hp, seed);
       break;
     case at::kHalf:
-      adamw_dispatch_param(p, m, v, grad.data_ptr<at::Half>(), pdtype, param_stage, b, e, hp);
+      adamw_dispatch_param(p, m, v, grad.data_ptr<at::Half>(), pdtype, param_stage, b, e, hp, seed);
       break;
     case at::kBFloat16:
-      adamw_dispatch_param(p, m, v, grad.data_ptr<at::BFloat16>(), pdtype, param_stage, b, e, hp);
+      adamw_dispatch_param(p, m, v, grad.data_ptr<at::BFloat16>(), pdtype, param_stage, b, e, hp, seed);
       break;
     default:
       TORCH_CHECK(false, "unsupported gradient dtype");
   }
+}
+
+void adamw_dispatch(float* p, const at::Tensor& m, const at::Tensor& v, const at::Tensor& grad,
+                    at::ScalarType pdtype, const at::Tensor& param_stage, int64_t b, int64_t e,
+                    const HostHp& hp, uint32_t seed) {
+  if (m.scalar_type() == at::kBFloat16)
+    adamw_dispatch_m(p, m.data_ptr<c10::BFloat16>(), v.data_ptr<c10::BFloat16>(), grad, pdtype, param_stage, b,
+                     e, hp, seed);
+  else
+    adamw_dispatch_m(p, m.data_ptr<float>(), v.data_ptr<float>(), grad, pdtype, param_stage, b, e, hp, seed);
 }
 
 template <typename T>
@@ -169,10 +227,14 @@ void WorkerPool::submit(size_t worker, std::function<void()> fn) {
 // ===========================================================================
 // OffloadAdamW
 // ===========================================================================
-OffloadAdamW::OffloadAdamW(int device, const std::string& mode, int threads, int64_t chunk_elems)
+OffloadAdamW::OffloadAdamW(int device, const std::string& mode, int threads, int64_t chunk_elems,
+                           const std::string& moment_dtype)
     : device_(resolve_device(device)), chunk_(std::max<int64_t>(chunk_elems, 4096)) {
   TORCH_CHECK(mode == "cpu" || mode == "gpu", "OffloadAdamW mode must be 'cpu' or 'gpu', got '", mode, "'");
+  TORCH_CHECK(moment_dtype == "float32" || moment_dtype == "bfloat16",
+              "OffloadAdamW moment_dtype must be 'float32' or 'bfloat16', got '", moment_dtype, "'");
   gpu_mode_ = mode == "gpu";
+  moment_dtype_ = moment_dtype == "bfloat16" ? at::kBFloat16 : at::kFloat;
   runtime(device_);  // create streams eagerly
   if (threads <= 0) threads = std::max(1u, std::thread::hardware_concurrency() / 2);
   if (!gpu_mode_) pool_ = std::make_unique<WorkerPool>(threads, device_);
@@ -203,12 +265,17 @@ size_t OffloadAdamW::worker_for(int64_t id, int64_t chunk) const {
   return static_cast<size_t>(static_cast<uint64_t>(id) * 2654435761ull + static_cast<uint64_t>(chunk));
 }
 
-int64_t OffloadAdamW::add_param(const at::Tensor& param, bool pin_moments) {
+int64_t OffloadAdamW::add_param(const at::Tensor& param, bool pin_moments, const at::Tensor& host_init) {
   TORCH_CHECK(param.is_cuda(), "OffloadAdamW: parameters must live on a CUDA device");
   TORCH_CHECK(param.get_device() == device_, "OffloadAdamW: parameter on cuda:", param.get_device(),
               " but engine bound to cuda:", device_);
   TORCH_CHECK(param.is_contiguous(), "OffloadAdamW: parameters must be contiguous");
   to_kernel_dtype(param.scalar_type());
+  if (host_init.defined()) {
+    TORCH_CHECK(!gpu_mode_, "OffloadAdamW: host_init (paged parameters) requires cpu mode");
+    TORCH_CHECK(host_init.device().is_cpu() && host_init.numel() == param.numel(),
+                "OffloadAdamW: host_init must be a CPU tensor with the parameter's numel");
+  }
 
   auto s = std::make_unique<Slot>();
   s->id = static_cast<int64_t>(slots_.size());
@@ -221,37 +288,38 @@ int64_t OffloadAdamW::add_param(const at::Tensor& param, bool pin_moments) {
 
   if (!gpu_mode_ || s->pdtype != at::kFloat) {
     s->master = pinned_empty(shape, at::kFloat, "adamw.master_fp32", mapped, false);
-    s->master.copy_(s->param);  // device -> host with dtype conversion
+    // device -> host with dtype conversion (or straight from the CPU copy)
+    s->master.copy_(host_init.defined() ? host_init.reshape({-1}) : s->param);
   }
   // Moments: the zero-copy kernel needs them mapped+pinned. In cpu mode only
   // host threads touch them, so page-locking is optional (pin_moments) — it
   // keeps the total page-locked footprint within what the OS will tolerate.
   if (gpu_mode_ || pin_moments) {
-    s->exp_avg = pinned_empty(shape, at::kFloat, "adamw.exp_avg", mapped, false);
-    s->exp_avg_sq = pinned_empty(shape, at::kFloat, "adamw.exp_avg_sq", mapped, false);
+    s->exp_avg = pinned_empty(shape, moment_dtype_, "adamw.exp_avg", mapped, false);
+    s->exp_avg_sq = pinned_empty(shape, moment_dtype_, "adamw.exp_avg_sq", mapped, false);
     s->exp_avg.zero_();
     s->exp_avg_sq.zero_();
     pinned_state_bytes_ += s->exp_avg.nbytes() * 2;
   } else {
-    s->exp_avg = at::zeros(shape, at::TensorOptions().dtype(at::kFloat));
-    s->exp_avg_sq = at::zeros(shape, at::TensorOptions().dtype(at::kFloat));
+    s->exp_avg = at::zeros(shape, at::TensorOptions().dtype(moment_dtype_));
+    s->exp_avg_sq = at::zeros(shape, at::TensorOptions().dtype(moment_dtype_));
     pageable_state_bytes_ += s->exp_avg.nbytes() * 2;
   }
   int64_t bytes = s->exp_avg.nbytes() * 2 + (s->master.defined() ? s->master.nbytes() : 0);
   if (s->master.defined()) pinned_state_bytes_ += s->master.nbytes();
 
   if (gpu_mode_) {
-    s->d_m = static_cast<float*>(pinned_device_pointer(s->exp_avg));
-    s->d_v = static_cast<float*>(pinned_device_pointer(s->exp_avg_sq));
+    s->d_m = pinned_device_pointer(s->exp_avg);
+    s->d_v = pinned_device_pointer(s->exp_avg_sq);
     if (s->master.defined()) s->d_master = static_cast<float*>(pinned_device_pointer(s->master));
   } else {
     // grad_acc (fp32, host-only) is created lazily: the eager single-micro-batch
-    // path reads the DMA staging buffer directly and never needs it.
-    s->grad_stage = pinned_empty(shape, s->pdtype, "grad.staging", false, false);
-    bytes += s->grad_stage.nbytes();
-    pinned_state_bytes_ += s->grad_stage.nbytes();
+    // path reads the DMA staging buffer directly and never needs it. The
+    // staging buffer itself comes from a pool per gradient (acquire_stage).
     if (s->pdtype != at::kFloat) {
       s->param_stage = pinned_empty(shape, s->pdtype, "param.staging", false, false);
+      // Valid from the start: paged slots stream their weights from here.
+      s->param_stage.copy_(host_init.defined() ? host_init.reshape({-1}) : s->param);
       bytes += s->param_stage.nbytes();
       pinned_state_bytes_ += s->param_stage.nbytes();
     }
@@ -259,6 +327,67 @@ int64_t OffloadAdamW::add_param(const at::Tensor& param, bool pin_moments) {
   host_state_bytes_ += bytes;
   slots_.push_back(std::move(s));
   return slots_.back()->id;
+}
+
+void OffloadAdamW::set_max_staging_bytes(int64_t bytes) {
+  {
+    std::lock_guard<std::mutex> lock(stage_mu_);
+    max_stage_bytes_ = std::max<int64_t>(bytes, 1);
+  }
+  stage_cv_.notify_all();
+}
+
+void OffloadAdamW::acquire_stage(Slot& s, at::ScalarType dtype) {
+  const int64_t nbytes = s.numel * static_cast<int64_t>(c10::elementSize(dtype));
+  {
+    // A single tensor larger than the cap still proceeds once nothing else is staged.
+    std::unique_lock<std::mutex> lock(stage_mu_);
+    if (stage_bytes_ > 0 && stage_bytes_ + nbytes > max_stage_bytes_) {
+      const auto t0 = std::chrono::steady_clock::now();
+      stage_cv_.wait(lock, [&] { return stage_bytes_ == 0 || stage_bytes_ + nbytes <= max_stage_bytes_; });
+      grad_stall_us_ += elapsed_us(t0);
+    }
+    stage_bytes_ += nbytes;
+    stage_peak_ = std::max(stage_peak_, stage_bytes_);
+  }
+  s.grad_stage = pinned_empty({s.numel}, dtype, "grad.staging", false, true);
+}
+
+void OffloadAdamW::release_stage(Slot& s) {
+  if (!s.grad_stage.defined()) return;
+  const int64_t nbytes = static_cast<int64_t>(s.grad_stage.nbytes());
+  s.grad_stage.reset();  // back to the pinned cache
+  {
+    std::lock_guard<std::mutex> lock(stage_mu_);
+    stage_bytes_ -= nbytes;
+  }
+  stage_cv_.notify_all();
+}
+
+void OffloadAdamW::retire_grad(EventPtr d2h_done, at::Tensor grad) {
+  std::lock_guard<std::mutex> lock(retire_mu_);
+  retiring_bytes_ += static_cast<int64_t>(grad.nbytes());
+  retiring_.emplace_back(std::move(d2h_done), std::move(grad));
+}
+
+void OffloadAdamW::reap_grads(bool block) {
+  // Dropping the last reference returns the block to the compute stream's
+  // pool; the copy that read it has finished, so reuse is safe. Beyond the
+  // in-flight cap the caller (the backward pass) waits for the oldest copies.
+  const auto t0 = std::chrono::steady_clock::now();
+  bool waited = false;
+  std::lock_guard<std::mutex> lock(retire_mu_);
+  while (!retiring_.empty()) {
+    auto& front = retiring_.front();
+    if (!front.first->query()) {
+      if (!block && retiring_bytes_ <= max_inflight_grad_bytes_) break;
+      front.first->synchronize();
+      waited = true;
+    }
+    retiring_bytes_ -= static_cast<int64_t>(front.second.nbytes());
+    retiring_.pop_front();
+  }
+  if (waited && !block) grad_stall_us_ += elapsed_us(t0);
 }
 
 void OffloadAdamW::record_error(const std::string& msg) {
@@ -328,10 +457,10 @@ void OffloadAdamW::offload_grad(int64_t id, const at::Tensor& grad, bool apply_u
   grad_stall_us_ += elapsed_us(t0);
 
   at::Tensor g = grad.contiguous().view({-1});
-  if (g.scalar_type() != s.grad_stage.scalar_type())
-    s.grad_stage = pinned_empty({s.numel}, g.scalar_type(), "grad.staging", false, false);
+  acquire_stage(s, g.scalar_type());
   s.d2h_done = d2h_async(s.grad_stage, g);
-  s.grad_keep = g;  // released by the worker once the DMA has landed
+  retire_grad(s.d2h_done, g);  // VRAM copy freed as soon as the DMA has landed
+  reap_grads(false);
   grad_bytes_ += static_cast<int64_t>(g.nbytes());
 
   const bool fresh = s.acc_fresh;
@@ -374,8 +503,8 @@ void OffloadAdamW::offload_grad(int64_t id, const at::Tensor& grad, bool apply_u
     }
     accumulate_us_ += elapsed_us(t);
   });
-  // Every chunk synchronised on `landed`, so the VRAM gradient is free to go.
-  auto release = std::make_shared<std::function<void()>>([sp] { sp->grad_keep.reset(); });
+  // Accumulated: the staging buffer can go back to the pool.
+  auto release = std::make_shared<std::function<void()>>([this, sp] { release_stage(*sp); });
   run_batch(s, body, release);
   if (apply_update) {
     steps_eager_ += 1;
@@ -389,26 +518,30 @@ void OffloadAdamW::enqueue_update(Slot& s, double lr, double beta1, double beta2
   Slot* sp = &s;
   s.step += 1;
   const HostHp hp = make_hp(lr, beta1, beta2, eps, wd, s.step, clip);
+  const uint32_t seed = slot_seed(s.id, s.step);
   const EventPtr prev_ready = s.ready;
 
-  auto body = std::make_shared<ChunkFn>([this, sp, hp, prev_ready, from_stage](int64_t, int64_t b, int64_t e) {
+  auto body = std::make_shared<ChunkFn>([this, sp, hp, seed, prev_ready, from_stage](int64_t, int64_t b, int64_t e) {
     // The previous H2D may still be reading master/param_stage.
     if (prev_ready) prev_ready->synchronize();
     if (from_stage) from_stage->synchronize();  // gradient DMA landed in staging
     const auto t = std::chrono::steady_clock::now();
-    adamw_dispatch(sp->master.data_ptr<float>(), sp->exp_avg.data_ptr<float>(), sp->exp_avg_sq.data_ptr<float>(),
-                   from_stage ? sp->grad_stage : sp->grad_acc, sp->pdtype, sp->param_stage, b, e, hp);
+    adamw_dispatch(sp->master.data_ptr<float>(), sp->exp_avg, sp->exp_avg_sq,
+                   from_stage ? sp->grad_stage : sp->grad_acc, sp->pdtype, sp->param_stage, b, e, hp, seed);
     update_us_ += elapsed_us(t);
   });
 
-  auto finalize = std::make_shared<std::function<void()>>([this, sp, after] {
-    sp->grad_keep.reset();  // fused path: staging consumed, DMA long complete
-    const at::Tensor& src = sp->param_stage.defined() ? sp->param_stage : sp->master;
-    EventPtr done = h2d_async(sp->param, src, after);
-    param_bytes_ += static_cast<int64_t>(src.nbytes());
+  auto finalize = std::make_shared<std::function<void()>>([this, sp, after, from_stage] {
+    if (from_stage) release_stage(*sp);  // fused path: the update read the staging buffer directly
+    EventPtr done;
+    if (!sp->paged) {  // paged weights are streamed in by the pager instead
+      const at::Tensor& src = sp->param_stage.defined() ? sp->param_stage : sp->master;
+      done = h2d_async(sp->param, src, after);
+      param_bytes_ += static_cast<int64_t>(src.nbytes());
+    }
     {
       std::lock_guard<std::mutex> lock(sp->mu);
-      sp->ready = std::move(done);
+      if (done) sp->ready = std::move(done);
       sp->has_grad = false;
       sp->acc_fresh = true;
     }
@@ -421,7 +554,7 @@ double OffloadAdamW::step(const std::vector<int64_t>& ids, const std::vector<dou
                           const std::vector<double>& beta1s, const std::vector<double>& beta2s,
                           const std::vector<double>& epss, const std::vector<double>& wds,
                           const std::vector<at::Tensor>& grads, double max_grad_norm,
-                          bool compute_norm) {
+                          bool compute_norm, double grad_scale) {
   const size_t n = ids.size();
   TORCH_CHECK(lrs.size() == n && beta1s.size() == n && beta2s.size() == n && epss.size() == n &&
                   wds.size() == n,
@@ -433,23 +566,26 @@ double OffloadAdamW::step(const std::vector<int64_t>& ids, const std::vector<dou
     step_gpu(ids, lrs, beta1s, beta2s, epss, wds, grads, max_grad_norm, compute_norm);
     return -1.0;
   }
-  return step_cpu(ids, lrs, beta1s, beta2s, epss, wds, max_grad_norm, compute_norm);
+  return step_cpu(ids, lrs, beta1s, beta2s, epss, wds, max_grad_norm, compute_norm, grad_scale);
 }
 
 double OffloadAdamW::step_cpu(const std::vector<int64_t>& ids, const std::vector<double>& lrs,
                               const std::vector<double>& beta1s, const std::vector<double>& beta2s,
                               const std::vector<double>& epss, const std::vector<double>& wds,
-                              double max_grad_norm, bool compute_norm) {
+                              double max_grad_norm, bool compute_norm, double grad_scale) {
   // Everything enqueued on the compute stream so far (the whole backward) must
   // finish before new weights may overwrite the parameters on the GPU.
   EventPtr step_ev = record_on_current(device_);
+  reap_grads(false);
   step_start_ms_ = now_ms();
 
   std::vector<size_t> active;
   for (size_t k = 0; k < ids.size(); ++k)
     if (slot(ids[k]).has_grad) active.push_back(k);
 
-  double clip = 1.0;
+  // grad_scale multiplies the accumulated gradients (1/world_size after a
+  // data-parallel sum); the norm and the clip coefficient refer to the scaled values.
+  double clip = grad_scale;
   double norm = -1.0;
   if (max_grad_norm > 0.0 || compute_norm) {
     // Global norm needs every gradient: run a reduction batch per slot (FIFO
@@ -477,9 +613,9 @@ double OffloadAdamW::step_cpu(const std::vector<int64_t>& ids, const std::vector
     check_error();
     double sq = 0.0;
     for (double p : *partials) sq += p;
-    norm = std::sqrt(sq);
+    norm = std::sqrt(sq) * grad_scale;
     last_norm_ = norm;
-    if (max_grad_norm > 0.0) clip = std::min(1.0, max_grad_norm / (norm + 1e-6));
+    if (max_grad_norm > 0.0) clip = std::min(1.0, max_grad_norm / (norm + 1e-6)) * grad_scale;
   }
 
   for (size_t k : active)
@@ -526,7 +662,8 @@ void OffloadAdamW::step_gpu(const std::vector<int64_t>& ids, const std::vector<d
                             static_cast<float>(max_grad_norm)};
     TS_CUDA_CHECK(kernels::adamw_zero_copy(to_kernel_dtype(s.pdtype), s.param.data_ptr(), g[k].data_ptr(),
                                            s.d_m, s.d_v, s.d_master, s.numel, hp,
-                                           max_grad_norm > 0.0 ? norm_dev_ : nullptr, rt.sm_count, rt.upd));
+                                           max_grad_norm > 0.0 ? norm_dev_ : nullptr, rt.sm_count, rt.upd,
+                                           moment_dtype_ == at::kBFloat16, slot_seed(s.id, s.step)));
     // Keep the gradient alive instead of recordStream (whose free-path event
     // creation can abort on a full device). It is replaced next step, after
     // the next forward has waited on this kernel's `ready` event.
@@ -549,6 +686,7 @@ void OffloadAdamW::step_gpu(const std::vector<int64_t>& ids, const std::vector<d
 
 void OffloadAdamW::wait_ready(const std::vector<int64_t>& ids) {
   check_error();
+  if (!gpu_mode_) reap_grads(false);
   const cudaStream_t s = compute_stream(device_);
   const auto t0 = std::chrono::steady_clock::now();
   for (int64_t id : ids) {
@@ -571,6 +709,7 @@ void OffloadAdamW::wait_ready(const std::vector<int64_t>& ids) {
 }
 
 void OffloadAdamW::synchronize() {
+  reap_grads(true);
   for (auto& sp : slots_) {
     wait_idle(*sp);
     EventPtr ready;
@@ -617,13 +756,67 @@ void OffloadAdamW::load_state(int64_t id, const at::Tensor& exp_avg, const at::T
   if (master.defined() && s.master.defined()) {
     TORCH_CHECK(master.numel() == s.numel, "load_state: master shape mismatch for param ", id);
     s.master.copy_(master.reshape({-1}));
-  } else if (s.master.defined()) {
-    s.master.copy_(s.param);  // re-sync master with the live weights
+  } else if (s.master.defined() && !s.paged) {
+    s.master.copy_(s.param);  // re-sync master with the live weights (paged: the host copy already is)
   }
   s.step = step;
 }
 
 int64_t OffloadAdamW::get_step(int64_t id) { return slot(id).step; }
+
+void OffloadAdamW::set_paged(int64_t id, bool paged) {
+  TORCH_CHECK(!gpu_mode_ || !paged, "parameter paging requires cpu mode");
+  Slot& s = slot(id);
+  wait_idle(s);
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.paged = paged;
+}
+
+at::Tensor OffloadAdamW::host_param(int64_t id) {
+  Slot& s = slot(id);
+  return s.param_stage.defined() ? s.param_stage : s.master;
+}
+
+void OffloadAdamW::wait_issued(const std::vector<int64_t>& ids) {
+  check_error();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int64_t id : ids) wait_idle(slot(id));
+  ready_stall_us_ += elapsed_us(t0);
+  check_error();
+}
+
+void OffloadAdamW::set_ready(int64_t id, const EventPtr& ev) {
+  Slot& s = slot(id);
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.ready = ev;
+}
+
+void OffloadAdamW::sync_host_from_param(int64_t id) {
+  Slot& s = slot(id);
+  wait_idle(s);
+  if (s.ready) s.ready->synchronize();
+  c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_));
+  if (s.master.defined()) s.master.copy_(s.param);
+  if (s.param_stage.defined()) s.param_stage.copy_(s.param);
+}
+
+at::Tensor OffloadAdamW::grad_buffer(int64_t id) {
+  Slot& s = slot(id);
+  wait_idle(s);
+  TORCH_CHECK(s.grad_acc.defined(), "grad_buffer: parameter ", id, " has no accumulated gradient");
+  return s.grad_acc;
+}
+
+void OffloadAdamW::update_slot(int64_t id, double lr, double beta1, double beta2, double eps,
+                               double weight_decay, double scale) {
+  TORCH_CHECK(!gpu_mode_, "update_slot is only used in 'cpu' mode");
+  check_error();
+  Slot& s = slot(id);
+  TORCH_CHECK(s.grad_acc.defined(), "update_slot: parameter ", id, " has no accumulated gradient");
+  steps_eager_ += 1;
+  s.has_grad = false;  // cleared synchronously: step() must not update twice
+  enqueue_update(s, lr, beta1, beta2, eps, weight_decay, scale, record_on_current(device_), nullptr);
+}
 
 std::map<std::string, double> OffloadAdamW::stats() {
   int64_t numel = 0;
@@ -639,6 +832,8 @@ std::map<std::string, double> OffloadAdamW::stats() {
           {"host_state_bytes", static_cast<double>(host_state_bytes_.load())},
           {"pinned_state_bytes", static_cast<double>(pinned_state_bytes_.load())},
           {"pageable_state_bytes", static_cast<double>(pageable_state_bytes_.load())},
+          {"staging_bytes", static_cast<double>(stage_bytes_)},
+          {"staging_peak_bytes", static_cast<double>(stage_peak_)},
           {"grad_bytes_offloaded", static_cast<double>(grad_bytes_.load())},
           {"param_bytes_uploaded", static_cast<double>(param_bytes_.load())},
           {"update_ms_total", update_us_.load() / 1e3},
@@ -664,7 +859,7 @@ std::map<std::string, double> benchmark_cpu_adamw(int64_t numel, int threads) {
     for (int t = 0; t < threads; ++t) {
       const int64_t b = t * per, e = std::min(numel, b + per);
       if (b >= e) break;
-      ts.emplace_back([&, b, e] { adamw_host<float, float, false>(p.data(), m.data(), v.data(), g.data(), nullptr, b, e, hp); });
+      ts.emplace_back([&, b, e] { adamw_host<float, float, false, float>(p.data(), m.data(), v.data(), g.data(), nullptr, b, e, hp, 0u); });
     }
     for (auto& t : ts) t.join();
     best_ms = std::min(best_ms, elapsed_us(t0) / 1e3);

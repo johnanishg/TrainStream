@@ -1,7 +1,12 @@
 """Build script for TrainStream.
 
-    pip install -e . --no-build-isolation        # or
-    python setup.py build_ext --inplace           # (Windows: build.bat)
+    pip install trainstream --no-build-isolation   # needs PyTorch (CUDA) + CUDA toolkit + C++ compiler
+    python setup.py build_ext --inplace            # from a checkout (Windows: build.bat)
+
+TrainStream is a PyTorch C++/CUDA extension, so it is compiled against the
+PyTorch already installed on your machine. Install PyTorch first and pass
+--no-build-isolation so pip builds against it (an isolated build environment
+would not contain your CUDA-enabled PyTorch).
 
 Target architectures come from TORCH_CUDA_ARCH_LIST when set; otherwise the
 compute capability of every visible GPU is used (e.g. "12.0" for Blackwell).
@@ -12,44 +17,62 @@ import sys
 
 from setuptools import find_packages, setup
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Building the compiled module needs torch; packaging the sources (sdist,
+# metadata) does not, so CI machines without a GPU can still publish them.
+COMPILE_COMMANDS = {"build_ext", "bdist_wheel", "build", "install", "develop", "editable_wheel", "bdist_egg"}
+compiling = any(arg in COMPILE_COMMANDS for arg in sys.argv[1:])
+
 try:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-except ImportError as exc:  # pragma: no cover - build-time guard
-    raise SystemExit("TrainStream needs PyTorch installed before building: " + str(exc))
+except ImportError as exc:
+    if compiling:
+        raise SystemExit(
+            "TrainStream compiles against your installed PyTorch.\n"
+            "  1. Install a CUDA build of PyTorch, e.g.\n"
+            "       pip install torch --index-url https://download.pytorch.org/whl/cu130\n"
+            "  2. Install TrainStream without build isolation:\n"
+            "       pip install trainstream --no-build-isolation\n"
+            f"(import error: {exc})")
+    torch = None
 
 
 def _arch_list():
     if os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return os.environ["TORCH_CUDA_ARCH_LIST"]
-    if torch.cuda.is_available():
+    if torch is not None and torch.cuda.is_available():
         caps = sorted({torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
         return ";".join(f"{major}.{minor}" for major, minor in caps)
     return "8.0;8.6;8.9;9.0;12.0"
 
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = _arch_list()
+ext_modules, cmdclass = [], {}
+if torch is not None:
+    os.environ["TORCH_CUDA_ARCH_LIST"] = _arch_list()
+    if sys.platform == "win32":
+        cxx_flags = ["/O2", "/EHsc", "/W3", "/wd4244", "/wd4267", "/wd4251", "/wd4275", "/wd4996"]
+    else:
+        cxx_flags = ["-O3", "-Wall", "-Wno-unused-function", "-fvisibility=hidden"]
+    nvcc_flags = ["-O3", "--use_fast_math", "-lineinfo", "--expt-relaxed-constexpr"]
+    if sys.platform == "win32":
+        nvcc_flags += ["-Xcompiler", "/wd4819"]
+    ext_modules = [CUDAExtension(
+        name="trainstream._C",
+        sources=[
+            "csrc/bindings.cpp",
+            "csrc/memory_pinner.cpp",
+            "csrc/offload_adamw.cpp",
+            "csrc/offload_adamw_kernel.cu",
+        ],
+        include_dirs=[os.path.join(HERE, "csrc")],
+        extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
+    )]
+    cmdclass = {"build_ext": BuildExtension.with_options(use_ninja=True)}
 
-if sys.platform == "win32":
-    cxx_flags = ["/O2", "/EHsc", "/W3", "/wd4244", "/wd4267", "/wd4251", "/wd4275", "/wd4996"]
-else:
-    cxx_flags = ["-O3", "-Wall", "-Wno-unused-function", "-fvisibility=hidden"]
-
-nvcc_flags = ["-O3", "--use_fast_math", "-lineinfo", "--expt-relaxed-constexpr"]
-if sys.platform == "win32":
-    nvcc_flags += ["-Xcompiler", "/wd4819"]
-
-ext = CUDAExtension(
-    name="trainstream._C",
-    sources=[
-        "csrc/bindings.cpp",
-        "csrc/memory_pinner.cpp",
-        "csrc/offload_adamw.cpp",
-        "csrc/offload_adamw_kernel.cu",
-    ],
-    include_dirs=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")],
-    extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
-)
+with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
+    long_description = fh.read()
 
 setup(
     name="trainstream",
@@ -57,10 +80,27 @@ setup(
     author="John Anish G",
     license="Apache-2.0",
     description="Zero-dependency PCIe offloading engine for PyTorch training (optimizer, gradients, activations).",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://github.com/johnanishg/TrainStream",
+    project_urls={"Source": "https://github.com/johnanishg/TrainStream",
+                  "Issues": "https://github.com/johnanishg/TrainStream/issues"},
     packages=find_packages(include=["trainstream", "trainstream.*"]),
-    ext_modules=[ext],
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
     python_requires=">=3.9",
     install_requires=[],  # torch is a build+runtime prerequisite, not a declared dependency
+    extras_require={"hf": ["transformers", "accelerate", "peft"]},
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "Intended Audience :: Developers",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: C++",
+        "Environment :: GPU :: NVIDIA CUDA",
+        "Operating System :: Microsoft :: Windows",
+        "Operating System :: POSIX :: Linux",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
     zip_safe=False,
 )

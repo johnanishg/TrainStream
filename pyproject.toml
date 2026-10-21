@@ -1,6 +1,10 @@
 [build-system]
-# PyTorch is deliberately not listed: the extension must be compiled against the
-# CUDA build of PyTorch already installed on the user's machine, so installs use
-#   pip install trainstream --no-build-isolation
+# PyTorch is deliberately not a build requirement. Built in an isolated
+# environment (pip, uv, `python -m build`, `uv build`), this produces a
+# pure-Python wheel, and trainstream/_build.py compiles the extension on first
+# import against the user's own CUDA build of PyTorch. To compile at install
+# time against the torch already installed instead:
+#   pip install trainstream --no-binary trainstream --no-build-isolation
+#   uv pip install trainstream --no-binary trainstream --no-build-isolation
 requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"

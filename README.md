@@ -9,7 +9,11 @@ model, optimizer = trainstream.wrap(model, optimizer)
 
 TrainStream is a C++/CUDA extension for PyTorch. It uses only the C++ standard library, the CUDA runtime and PyTorch's ATen: no DeepSpeed, no bitsandbytes. Updates match `torch.optim.AdamW` (max parameter difference ≈3·10⁻⁷ after 20 steps), and activation and weight paging are bit-exact.
 
-## What's new in 0.4.0
+## What's new in 0.4
+
+- **0.4.1:** install instructions for uv (`uv pip install`, `uv add` / `uv sync`) next to pip, checked on Windows and Linux; clearer messages when the installed torch is the CPU-only build.
+
+In 0.4.0:
 
 - **Built-in weight quantization.** `wrap(..., quantize="auto" | "none" | "int8" | "nf4")` stores frozen weights quantized and expands them with TrainStream's own CUDA kernel just before each layer runs. `"auto"` (the default) quantizes only when a run can't fit otherwise; `prefer="speed"` also lets it choose NF4 when that keeps every layer in VRAM.
 - **`load_model()`** reads a Hugging Face checkpoint one tensor at a time and quantizes while reading, so a base larger than your RAM never exists in full precision.
@@ -36,20 +40,53 @@ Offloading costs throughput when a model already fits, which is why `offload="au
 
 - An NVIDIA GPU and a CUDA build of PyTorch
 - The CUDA toolkit matching PyTorch's CUDA major version, and a C++ compiler (Visual Studio 2022+ Build Tools with "Desktop development with C++" on Windows, GCC 11+ on Linux)
-- Optional, for the Hugging Face integration: `transformers`, `accelerate`, and `peft` for LoRA
+- Optional, for the Hugging Face integration: `transformers`, `accelerate`, and `peft` for LoRA (all three come with `trainstream[hf]`)
 
-Tested on an RTX 5090 Laptop GPU with Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14), where all 123 tests pass, and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1+cu130, CUDA 13.3, GCC 13.3, Python 3.12), where 122 pass and 1 is skipped (the bitsandbytes comparison, without bitsandbytes installed). Native Linux and other GPUs are untested.
+Tested on an RTX 5090 Laptop GPU with Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14), where all 123 tests pass, and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1, CUDA 13.3, GCC 13.3, Python 3.12), where 122 pass and 1 is skipped (the bitsandbytes comparison, without bitsandbytes installed). Installs were checked with pip and with uv 0.13 (`uv pip install`, `uv sync` in a project, and building from the sdist) on both. Native Linux and other GPUs are untested.
 
 ## Install
 
+TrainStream installs with **pip** or **uv**. It is a small pure-Python wheel and doesn't pull in PyTorch, because you choose the CUDA build of PyTorch that matches your driver. Install CUDA PyTorch first (or in the same command), then TrainStream.
+
+**pip**
+
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu130   # if you don't have CUDA PyTorch yet
-pip install trainstream
+pip install trainstream                                                # core library
+pip install "trainstream[hf]"                                          # + transformers, accelerate, peft
 ```
 
-The first `import trainstream` compiles the CUDA extension against your PyTorch (16 s on Windows and 18 s on Linux, measured) and caches it; later imports take about a second. On Windows it finds Visual Studio and the CUDA toolkit itself, so any terminal works. The cache is keyed by PyTorch, CUDA and Python version and GPU, so upgrading PyTorch triggers one rebuild. To upgrade TrainStream: `pip install -U --no-cache-dir trainstream`.
+**uv** (`uv pip`)
 
-To compile ahead of time instead: `pip install trainstream --no-binary trainstream --no-build-isolation`. From a checkout: `build.bat` (Windows) or `python setup.py build_ext --inplace`.
+```bash
+uv pip install torch trainstream --torch-backend=auto            # picks the CUDA build for your driver
+uv pip install torch "trainstream[hf]" --torch-backend=auto      # + transformers, accelerate, peft
+```
+
+**uv project** (`uv add` / `uv sync`). Point `torch` at the PyTorch index in your `pyproject.toml`:
+
+```toml
+[project]
+dependencies = ["torch", "trainstream"]        # or "trainstream[hf]"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+```
+
+Then `uv sync` and `uv run python train.py`.
+
+> **CPU-only torch trap.** On Windows, `torch` from PyPI is the CPU build. If something else that depends on torch (for example `transformers` or `accelerate`) is installed without the CUDA index, the installer may fetch it, and `import trainstream` then stops with a message saying so. Fix: `pip install torch --index-url https://download.pytorch.org/whl/cu130 --force-reinstall`, or `uv pip install torch --torch-backend=auto --reinstall-package torch`.
+
+The first `import trainstream` compiles the CUDA extension against your PyTorch (16–19 s on Windows and 18 s on Linux, measured) and caches it; later imports take about a second. On Windows it finds Visual Studio and the CUDA toolkit itself, so any terminal works. The cache is keyed by PyTorch, CUDA and Python version and GPU, so upgrading PyTorch triggers one rebuild.
+
+Upgrade: `pip install -U --no-cache-dir trainstream` or `uv pip install -U trainstream` (`uv lock --upgrade-package trainstream` in a project).
+
+To compile at install time instead of on first import: `pip install trainstream --no-binary trainstream --no-build-isolation` (or the same flags with `uv pip install`). From a checkout: `build.bat` (Windows) or `python setup.py build_ext --inplace`.
 
 ## Quick start
 
@@ -208,8 +245,6 @@ NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); Trai
 | `trainstream.profile_hardware(device=None, quick=True, force=False)` | returns a `HardwareProfile` |
 | `trainstream.memory_report(model)`, `trainstream.unwrap(model)` | a wrapped model |
 
-The full reference, with every argument of every function, is in `TrainStreamDocs.html`.
-
 ### Environment variables
 
 | Variable | Effect |
@@ -235,8 +270,6 @@ The full reference, with every argument of every function, is in `TrainStreamDoc
 | `examples/hf_finetune.py` | fine-tune a Hugging Face model, optionally beside the stock Trainer | `--model`, `--lora`, `--compare`, `--activation-offload` |
 | `examples/train_bigger_than_vram.py` | 1.8B model (7.3 GB of fp32 weights) inside a 4 GB VRAM cap | `--vram-gb`, `--moments fp32\|bf16`, `--layers`, `--d-model` |
 | `examples/verify_ram_offload.py` | proves where training memory lives, with a PASS/FAIL verdict | `--gpt`, `--hf`, `--vram-cap-gb`, `--engine both\|baseline\|trainstream` |
-
-Also in the repository: `TrainStreamDocs.html` (full documentation, including every option and the values it accepts) and `TrainStreamReport.html` (what TrainStream does, how it compares with other libraries, and every measured result). Open them in a browser.
 
 ## Limitations
 

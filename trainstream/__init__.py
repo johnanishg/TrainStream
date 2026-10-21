@@ -17,7 +17,8 @@ try:
 except ImportError as _exc:  # pragma: no cover - depends on the environment
     raise ImportError(
         "TrainStream needs PyTorch with CUDA. Install it first, e.g.\n"
-        "    pip install torch --index-url https://download.pytorch.org/whl/cu130") from _exc
+        "    pip install torch --index-url https://download.pytorch.org/whl/cu130\n"
+        "    uv pip install torch --torch-backend=auto") from _exc
 
 try:
     from . import _C  # prebuilt (build.bat / setup.py build_ext / --no-build-isolation install)
@@ -35,7 +36,7 @@ from .profiler import HardwareProfile, profile_hardware
 from .quant import quantize_model
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "wrap",

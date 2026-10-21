@@ -1,6 +1,7 @@
 """Build script for TrainStream.
 
     pip install trainstream                      # pure-Python wheel; _C compiles on first import
+    uv pip install trainstream / uv add trainstream   # the same wheel, through uv
     python setup.py build_ext --inplace          # from a checkout (Windows: build.bat)
     pip install . --no-build-isolation           # compile _C ahead of time into the install
 
@@ -68,7 +69,7 @@ with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="trainstream",
-    version="0.4.0",
+    version="0.4.1",
     author="John Anish G",
     license="Apache-2.0",
     description="Zero-dependency PyTorch training offload: optimizer, gradients, activations and weights to host RAM, with a memory planner and built-in int8/NF4 quantization.",

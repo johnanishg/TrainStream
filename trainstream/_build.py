@@ -1,7 +1,7 @@
 """Compile-on-first-import for trainstream._C.
 
-`pip install trainstream` installs a pure-Python wheel that carries the C++/CUDA
-sources in trainstream/csrc. The first `import trainstream` compiles them
+`pip install trainstream` (or `uv pip install trainstream`, `uv add trainstream`)
+installs a pure-Python wheel that carries the C++/CUDA sources in trainstream/csrc. The first `import trainstream` compiles them
 against the PyTorch that is installed (a few minutes) and caches the result;
 later imports load the cached module directly, without a compiler.
 
@@ -157,8 +157,11 @@ def load():
     if torch.version.cuda is None:
         raise BuildError(
             f"TrainStream needs a CUDA build of PyTorch, but torch {torch.__version__} is CPU-only. "
-            "Install one from https://pytorch.org/get-started/locally/ , e.g.\n"
-            "    pip install torch --index-url https://download.pytorch.org/whl/cu130")
+            "(On Windows, torch from PyPI is the CPU build; installing a package that depends on torch, "
+            "such as transformers or accelerate, can pull it in.) Install a CUDA build, e.g.\n"
+            "    pip install torch --index-url https://download.pytorch.org/whl/cu130 --force-reinstall\n"
+            "    uv pip install torch --torch-backend=auto --reinstall-package torch\n"
+            "See https://pytorch.org/get-started/locally/")
     if not torch.cuda.is_available() and not os.environ.get("TORCH_CUDA_ARCH_LIST"):
         raise BuildError("TrainStream needs an NVIDIA GPU, but torch.cuda.is_available() is False "
                          "(set TORCH_CUDA_ARCH_LIST to compile without one).")

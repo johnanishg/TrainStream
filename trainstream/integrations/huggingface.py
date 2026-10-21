@@ -38,7 +38,7 @@ try:
 except ImportError as exc:  # pragma: no cover - depends on the environment
     raise ImportError(
         "trainstream.integrations.huggingface needs the `transformers` package "
-        "(pip install transformers accelerate)"
+        "(pip install \"trainstream[hf]\", or uv pip install \"trainstream[hf]\" --torch-backend=auto)"
     ) from exc
 
 GiB = float(1 << 30)

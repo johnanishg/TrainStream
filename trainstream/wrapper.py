@@ -13,7 +13,9 @@ from .hooks import ActivationOffloader, find_blocks
 from .optimizer import OffloadAdamW
 from .paging import ParamPager, pageable_params
 from .planner import MemoryPlanner, explain_ram_shortfall, host_bytes_needed, measure_budget
+from . import lowp
 from . import quant as Q
+from .attention import CHOICES as ATTENTION_CHOICES, AttentionSelector
 from .profiler import HardwareProfile, profile_hardware
 
 _ATTR = "_trainstream_session"
@@ -41,6 +43,8 @@ class TrainStreamSession:
         self.events: List[str] = []
         self._applying = False
         self._orig_apply: Dict[int, object] = {}
+        self.lowp_modules: List[nn.Module] = []
+        self.attention: Optional[AttentionSelector] = None
 
     # -- install / teardown ----------------------------------------------------------
     def install(self, frozen_init=None) -> None:
@@ -49,18 +53,27 @@ class TrainStreamSession:
         opt.attach(self.model, guard=cfg["guard_params"])
         if opt.resident:
             return
+        if self.config.get("quantize") in Q.BLOCKSCALED_KINDS:
+            self.lowp_modules = lowp.install(self.blocks, opt.device)  # before the pager reads the flags
+        if cfg.get("attention") is not None and self.blocks:
+            self.attention = AttentionSelector(self.model, self.blocks, cfg["attention"], opt.device)
+            self.attention.events = self.events
         if self.paged_blocks or self.config.get("quantize") or (self.planner is not None and not self.planner.done):
             if self.candidates is None:
                 self.candidates = pageable_params(self.model, self.blocks, range(len(self.blocks)))
             self.pager = ParamPager(self.model, self.blocks, opt, self.paged_blocks, candidates=self.candidates,
                                     frozen_init=frozen_init, prefetch_depth=cfg["prefetch_depth"])
-        if cfg["activation_offload"] not in (False, 0, 0.0, None) and self.blocks:
+        rc = cfg.get("recompute", "auto")
+        explicit_rc = rc not in ("auto", False, None, 0, 0.0)
+        if (cfg["activation_offload"] not in (False, 0, 0.0, None) or explicit_rc) and self.blocks:
             act = cfg["activation_offload"] if not cfg.get("_act_fixed") else cfg["_act_fixed"]
             self.activations = ActivationOffloader(
-                self.model, self.blocks, act, min_bytes=cfg["min_offload_bytes"],
+                self.model, self.blocks, act if act not in (None,) else False, min_bytes=cfg["min_offload_bytes"],
                 prefetch_depth=cfg["prefetch_depth"], profile=self.profile,
                 max_slowdown=cfg["max_activation_slowdown"], reserved_link_bytes=cfg["_reserved"],
-                max_inflight_bytes=cfg["max_inflight_bytes"])
+                max_inflight_bytes=cfg["max_inflight_bytes"], recompute=rc,
+                memory_pressure=bool(cfg.get("_act_forced")), vram_target=cfg.get("_vram_target"))
+            self.activations.events = self.events
 
     def teardown(self, materialize: bool = True) -> None:
         if self.pager is not None:
@@ -72,12 +85,31 @@ class TrainStreamSession:
         if self.pager is not None:
             self.pager.remove(materialize=materialize)
             self.pager = None
+        lowp.uninstall(self.lowp_modules)
+        self.lowp_modules = []
+        if self.attention is not None:
+            self.attention.remove()
+            self.attention = None
 
     def remove(self) -> None:
         self.teardown(materialize=True)
         for m in self.model.modules():
             if "_apply" in m.__dict__:
                 del m.__dict__["_apply"]
+
+    @property
+    def adapting(self) -> bool:
+        """True while TrainStream is still choosing how to run (the memory plan, which
+        blocks' activations are paged or recomputed, the switch to resident mode):
+        until it turns False, step times are not yet steady."""
+        act = self.activations
+        if act is not None and act.phase != "fixed":
+            return True
+        if self.planner is not None and self.pager is not None and not self.planner.done:
+            return True
+        if self._resident_check_step is not None:
+            return True
+        return self.config.get("offload") == "auto" and not self.optimizer.resident and self.steps < 2
 
     # -- resident switch -------------------------------------------------------------
     def _after_step(self) -> None:
@@ -99,8 +131,12 @@ class TrainStreamSession:
         if self.config["offload"] != "auto":
             return
         opt = self.optimizer
-        if (self.pager is not None and self.pager.paged) or opt._dp is not None or opt.resident:
+        streaming = self.pager is not None and (self.pager.remote or opt._paged_ids)
+        if streaming or opt._dp is not None or opt.resident:
             return
+        act = self.activations
+        if act is not None and (act.recompute or act.offload):
+            return  # the measured peak relies on them; the resident switch would drop them
         if self._fits_resident():
             opt._post_step_cb = None
             if self.activations is not None:
@@ -245,18 +281,24 @@ class TrainStreamSession:
             "resident": self.optimizer.resident,
             "events": list(self.events),
         }
+        if self.attention is not None:
+            out["attention"] = dict(mode=self.attention.mode, backend=self.attention.choice,
+                                    timings_ms=dict(self.attention.timings))
         if self.activations is not None:
             out["activations"] = dict(self.activations.stats)
             out["activations"]["offloaded_blocks"] = sorted(self.activations.offload)
             out["activations"]["total_blocks"] = self.activations.n
             out["activations"]["calibrating"] = self.activations.calibrating
             out["activations"]["decision"] = dict(self.activations.decision)
+            out["activations"]["policy"] = self.activations.policy
+            out["activations"]["recompute_blocks"] = sorted(self.activations.recompute)
         if self.pager is not None:
             out["params"] = dict(self.pager.stats, paged_blocks=sorted(self.pager.remote),
                                  paged_bytes=self.pager.bytes_paged, total_blocks=self.pager.n,
                                  quantized_blocks=sorted(self.pager.quant_blocks),
                                  quantized_bytes=self.pager.quantized_bytes, quantize=self.config.get("quantize"),
                                  frozen_pinned_bytes=self.pager.frozen_pinned_bytes,
+                                 frozen_shared_bytes=self.pager.frozen_shared_bytes,
                                  frozen_pageable_bytes=self.pager.frozen_pageable_bytes)
         if self.planner is not None:
             out["plan"] = dict(target_vram=self.planner.target, settled=self.planner.done,
@@ -363,6 +405,8 @@ def wrap(
     quantize: Optional[str] = "auto",
     quant_block_size: int = 64,
     prefer: str = "exact",
+    recompute: Union[str, float, bool, Sequence[int]] = "auto",
+    attention: Optional[str] = "auto",
     verbose: bool = False,
 ):
     """Enable TrainStream offloading for `model` and return ``(model, optimizer)``.
@@ -410,6 +454,17 @@ def wrap(
         prefer: "exact" (default) or "speed". With "speed", quantize="auto" also
             picks NF4 when the bf16 weights would have to stream from RAM but the
             4-bit ones fit in VRAM — usually faster, no longer bit-exact.
+        recompute: run a block's forward again in backward instead of keeping
+            or paging its activations. "auto" (default) does it only under
+            memory pressure (weights paged, all activations over PCIe), for as
+            many blocks as balances the link against the GPU, measured in the
+            first steps. True: every block but the last; False: never; a
+            fraction or block indices fix it. Off when the model already uses
+            gradient checkpointing (Hugging Face).
+        attention: scaled_dot_product_attention backend. "auto" (default)
+            times the backends once on the model's head shape and runs the
+            fastest first (others stay as fallbacks); "cudnn", "efficient",
+            "flash" or "math" put that one first; None leaves PyTorch's order.
         vram_headroom: fraction of the usable VRAM the planner leaves free.
         check_memory: raise MemoryError at wrap() when the host state cannot
             fit in the available RAM, instead of failing later.
@@ -425,9 +480,15 @@ def wrap(
     if quantize in (None, False):
         quantize = "none"
     if quantize not in ("auto", "none") + Q.KINDS:
-        raise ValueError(f"quantize must be 'auto', 'none', 'int8' or 'nf4', got {quantize!r}")
+        raise ValueError(f"quantize must be 'auto', 'none', 'int8', 'nf4', 'fp8' or 'nvfp4', got {quantize!r}")
     if prefer not in ("exact", "speed"):
         raise ValueError(f"prefer must be 'exact' or 'speed', got {prefer!r}")
+    if not (recompute in ("auto", True, False, None) or isinstance(recompute, (float, int, list, tuple, set))):
+        raise ValueError(f"recompute must be 'auto', True, False, a fraction or block indices, got {recompute!r}")
+    if getattr(model, "is_gradient_checkpointing", False):
+        recompute = False  # the model recomputes its own layers already
+    if attention is not None and attention not in ATTENTION_CHOICES:
+        raise ValueError(f"attention must be one of {ATTENTION_CHOICES} or None, got {attention!r}")
     params = list(_unique_params(model))
     if not params:
         raise ValueError("trainstream.wrap needs a model with parameters")
@@ -492,7 +553,7 @@ def wrap(
         bf16_need = host_bytes_needed(trainable_params, frozen_eligible, moment_bytes=2, grad_acc=grad_acc)
         if bf16_need > have:  # bf16 cannot be held even with bf16 moments: try int8, then nf4
             qwhy = "bf16 frozen weights do not fit in RAM"
-            for kind in Q.KINDS[::-1]:
+            for kind in ("int8", "nf4"):
                 packed = sum(Q.packed_bytes(p.numel(), kind, quant_block_size) for p in qparams)
                 if host_bytes_needed(trainable_params, packed, moment_bytes=2, grad_acc=grad_acc) <= have:
                     qkind = kind
@@ -504,22 +565,28 @@ def wrap(
             bf16_plan = MemoryPlanner(budget, block_bytes, fixed_vram=fixed0, inflight_bytes=max_inflight_bytes,
                                       margin=vram_headroom)
             if bf16_plan.initial_paged():
-                qset = {id(p) for p in qparams}
-                near = [sum(Q.packed_bytes(p.numel(), "nf4", quant_block_size) if id(p) in qset
+                # NF4: NVFP4 compute is faster on Blackwell but also quantizes activations
+                # (perplexity +11% vs +6% for NF4 on Qwen2.5-1.5B, benchmarks/quality.py),
+                # so it stays an explicit choice
+                speed_kind = "nf4"
+                qset = {id(p) for p in qparams if Q.eligible(p, speed_kind)}
+                near = [sum(Q.packed_bytes(p.numel(), speed_kind, quant_block_size, p.shape) if id(p) in qset
                             else p.numel() * p.element_size() for p in candidates[i]) for i in range(len(stack))]
-                nf4_plan = MemoryPlanner(budget, near, fixed_vram=fixed0, inflight_bytes=max_inflight_bytes,
-                                         margin=vram_headroom, window_block_bytes=max(block_bytes))
-                if not nf4_plan.initial_paged():
-                    qkind = "nf4"
+                q4_plan = MemoryPlanner(budget, near, fixed_vram=fixed0, inflight_bytes=max_inflight_bytes,
+                                        margin=vram_headroom, window_block_bytes=max(block_bytes))
+                if not q4_plan.initial_paged():
+                    qkind = speed_kind
                     qwhy = "prefer='speed': 4-bit weights fit in VRAM, bf16 would stream from RAM"
     else:
         qkind = None
     if qkind is not None:
         from .optimizer import physical_ram_bytes
         pin_budget = int(0.40 * (physical_ram_bytes() or 1 << 40))
+        # block-scaled formats take only tensor-core shapes; other weights stay as they are
+        qparams = [p for p in qparams if Q.quantized_of(p) is not None or Q.eligible(p, qkind)]
         for p in qparams:  # one tensor at a time: the model never exists twice
             if Q.quantized_of(p) is None:
-                nb = Q.packed_bytes(p.numel(), qkind, quant_block_size)
+                nb = Q.packed_bytes(p.numel(), qkind, quant_block_size, p.shape)
                 Q.attach(p, Q.make_quantized(p, qkind, quant_block_size,
                                              pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget))
     qset = {id(p) for p in qparams} if qkind is not None else set()
@@ -550,6 +617,14 @@ def wrap(
     frozen_paged = sum(p.numel() * p.element_size() for i in paged_set for p in candidates.get(i, [])
                        if not p.requires_grad and id(p) not in qset)
     frozen_paged += sum(Q.quantized_of(p).nbytes for p in qparams if id(p) in qset)  # packed host copies
+    if distributed:
+        from . import shared
+        if shared.enabled():
+            import os as _os
+            import torch.distributed as _dist
+            if int(_os.environ.get("LOCAL_WORLD_SIZE", _dist.get_world_size())) == _dist.get_world_size():
+                # one shared copy for the machine: each rank's share of the RAM pays a part of it
+                frozen_paged //= _dist.get_world_size()
     need32 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=4, grad_acc=grad_acc)
     need16 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=2, grad_acc=grad_acc)
     if moment_dtype == "auto":
@@ -565,10 +640,14 @@ def wrap(
 
     host_init: Dict[int, torch.Tensor] = {}
     frozen_init: Dict[int, torch.Tensor] = {}
+    # Trained parameters of quantized blocks (adapters on a quantized base) stay
+    # in VRAM; only the other paged blocks put their trained weights on the host.
+    quant_idx = {i for i in range(len(stack)) if any(id(p) in qset for p in candidates.get(i, []))}
+    paged_plain = [i for i in paged_blocks if i not in quant_idx]
     if on_cpu:
         # Move everything except the paged block weights; those go to host RAM
         # and get a VRAM tensor with empty storage, filled block by block later.
-        paged_ids = {id(p) for ps in pageable_params(model, stack, paged_blocks).values() for p in ps} | qset
+        paged_ids = {id(p) for ps in pageable_params(model, stack, paged_plain).values() for p in ps} | qset
         with torch.no_grad():
             for m in model.modules():
                 for name, b in list(m._buffers.items()):
@@ -596,7 +675,7 @@ def wrap(
 
     paged_trainable = set(host_init)
     if not on_cpu:
-        paged_trainable = {id(p) for ps in pageable_params(model, stack, paged_blocks).values()
+        paged_trainable = {id(p) for ps in pageable_params(model, stack, paged_plain).values()
                            for p in ps if p.requires_grad}
     opt = _convert_optimizer(optimizer, model, optimizer_mode, max_grad_norm, threads, lr,
                              moment_dtype=moment_dtype, distributed=bool(distributed), _broadcast=False,
@@ -633,7 +712,8 @@ def wrap(
     if activation_offload not in (False, 0, 0.0, None) and not stack and verbose:
         print("[trainstream] no repeated block stack found; activation offload disabled")
 
-    config = dict(quantize=qkind, quant_block_size=quant_block_size, prefer=prefer,
+    config = dict(quantize=qkind, quant_block_size=quant_block_size, prefer=prefer, recompute=recompute,
+                  attention=attention,
                   optimizer_mode=optimizer_mode, offload=offload, activation_offload=activation_offload,
                   param_offload=param_offload, paged_blocks=len(paged_blocks), moment_dtype=opt.moment_dtype,
                   distributed=bool(distributed), accumulation_steps=opt.accumulation_steps,
@@ -641,6 +721,7 @@ def wrap(
                   min_offload_bytes=min_offload_bytes, guard_params=guard_params,
                   max_activation_slowdown=max_activation_slowdown, max_inflight_bytes=max_inflight_bytes,
                   verbose=verbose, _reserved=reserved, _act_forced=act_forced,
+                  _vram_target=planner.target if planner is not None else int(budget.vram_usable * (1 - vram_headroom)),
                   plan=dict(budget=budget.describe(), host_bytes=need, blocks=len(stack),
                             initial_paged=len(paged_blocks), auto=planner is not None))
     session = TrainStreamSession(model, opt, hw, config, stack, paged_blocks)
@@ -652,6 +733,14 @@ def wrap(
         session.events.append(f"quantized {len(qparams)} frozen weights to {qkind} ({qbytes / 2**30:.2f} GiB; "
                               f"{qwhy}); training uses their dequantized values and is no longer bit-exact "
                               f"with the bf16 model")
+        if qkind in Q.BLOCKSCALED_KINDS:
+            cap = torch.cuda.get_device_capability(target)
+            if session.lowp_modules:
+                session.events.append(f"{len(session.lowp_modules)} {qkind} matmuls run on tensor cores "
+                                      f"(sm_{cap[0]}{cap[1]}); activations are quantized to {qkind} on the fly")
+            else:
+                session.events.append(f"this GPU (sm_{cap[0]}{cap[1]}) has no {qkind} tensor-core matmul: "
+                                      f"weights are expanded before use, like nf4 / int8")
     if planner is not None:
         session.events.append(f"memory plan: {budget.describe()}; starting with {len(stack) - len(paged_blocks)} "
                               f"of {len(stack)} blocks resident, {len(paged_blocks)} paged; "

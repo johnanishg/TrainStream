@@ -58,6 +58,7 @@ if torch is not None:
             "trainstream/csrc/offload_adamw_kernel.cu",
             "trainstream/csrc/quant.cpp",
             "trainstream/csrc/quant_kernel.cu",
+            "trainstream/csrc/shm.cpp",
         ],
         include_dirs=[os.path.join(HERE, "trainstream", "csrc")],
         extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
@@ -69,10 +70,10 @@ with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="trainstream",
-    version="0.4.1",
+    version="0.5.0",
     author="John Anish G",
     license="Apache-2.0",
-    description="Zero-dependency PyTorch training offload: optimizer, gradients, activations and weights to host RAM, with a memory planner and built-in int8/NF4 quantization.",
+    description="Zero-dependency PyTorch training offload: optimizer, gradients, activations and weights to host RAM, with a memory planner and built-in int8/NF4/FP8/NVFP4 quantization.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/johnanishg/TrainStream",

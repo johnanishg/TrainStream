@@ -44,6 +44,8 @@ desktop.ini
 # --- Personal tools and notes (kept locally, not part of the library) ---
 # Live analytics reference project (train.py + UI)
 trainstream-analytics/
+# Test runner UI and its saved reports
+test-ui/
 # Development dashboard and research-paper material
 dashboard/
 start_dashboard.bat

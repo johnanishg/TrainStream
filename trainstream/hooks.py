@@ -6,7 +6,8 @@
                        D2H the moment autograd finishes it, then freed in VRAM.
 * ActivationOffloader  saved-tensor hooks: activations of selected blocks are
                        paged out to pinned RAM during forward and prefetched
-                       back block-by-block (ping-pong window) during backward.
+                       back block-by-block (ping-pong window) during backward;
+                       other blocks can be recomputed in backward instead.
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ from __future__ import annotations
 import collections
 import statistics
 import time
+import types
 import weakref
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -219,6 +221,38 @@ class _Session:
         self.dedup: Dict[int, tuple] = {}
 
 
+def recompute_count(offloaded: int, blocks: int, fwd_ms: float, link_ms: float, reserved_link_ms: float) -> int:
+    """How many of the `offloaded` blocks to recompute instead of streaming.
+
+    Per step the link carries `reserved_link_ms` (paged weights, gradients,
+    updates) plus `link_ms` per streamed block; the GPU spends about three
+    forwards per block (forward + backward) plus one per recomputed block.
+    The step takes about the longer of the two, so r balances them:
+    reserved + (m - r) * link = 3 * n * fwd + r * fwd.
+    """
+    if offloaded <= 0 or fwd_ms <= 0 or link_ms <= 0:
+        return 0
+    r = (reserved_link_ms + offloaded * link_ms - 3.0 * blocks * fwd_ms) / (link_ms + fwd_ms)
+    return int(min(max(round(r), 0), offloaded))
+
+
+def _checkpointed_forward(self, *args, **kwargs):
+    """A block forward that saves nothing for backward and runs again there."""
+    import torch.utils.checkpoint as cp
+    order = getattr(self, "_ts_sdpa_order", None)
+    if order is None:
+        return cp.checkpoint(type(self).forward, self, *args, use_reentrant=False, **kwargs)
+    return cp.checkpoint(_forward_with_sdpa_order, self, order, *args, use_reentrant=False, **kwargs)
+
+
+def _forward_with_sdpa_order(module, order, *args, **kwargs):
+    """The block's forward under the session's attention-backend order, so the
+    recomputation in backward picks the same kernels as the original forward."""
+    from torch.nn.attention import sdpa_kernel
+    with sdpa_kernel(order, set_priority=True):
+        return type(module).forward(module, *args, **kwargs)
+
+
 class ActivationOffloader:
     """Pages saved activations of the selected blocks to pinned host RAM.
 
@@ -229,6 +263,22 @@ class ActivationOffloader:
               staged H2D on the high-priority prefetch stream, so with depth=1
               exactly two blocks are resident at a time — the one computing and
               the one landing (a ping-pong window over the caching allocator).
+
+    Recompute: a block in ``recompute`` saves nothing for backward; its
+    forward runs under ``torch.utils.checkpoint`` (non-reentrant) and is run
+    again in backward. Its inner saved-tensor hooks take precedence, so a
+    recomputed block is never also offloaded.
+
+    ``recompute="auto"`` engages only under memory pressure (weights paged,
+    every block's activations sent over PCIe): the first steps measure each
+    block's forward time and saved bytes, then the number of recomputed blocks
+    balances the link against the GPU — PCIe already carries the paged weights,
+    so streaming activations can cost more than computing them again.
+
+    With ``vram_target`` set, ``"auto"`` first runs one probe step with every
+    block's activations paged (always safe), to measure them: only if they then
+    fit next to everything else is the calibration below run with them
+    resident; otherwise paging stays on (and the recompute balance runs).
 
     ``offload`` may be a float fraction, an explicit set of block indices, or
     ``"auto"``, which runs a closed loop:
@@ -255,6 +305,9 @@ class ActivationOffloader:
         reserved_link_bytes: Tuple[float, float] = (0.0, 0.0),
         tune_window: int = 3,
         max_inflight_bytes: int = 1 << 30,
+        recompute="auto",
+        memory_pressure: bool = False,
+        vram_target: Optional[int] = None,
     ):
         self.model = model
         self.blocks = list(blocks)
@@ -291,8 +344,23 @@ class ActivationOffloader:
         # in flight to the host. Weak so they never extend a handle's life.
         self._inflight: "collections.deque[tuple]" = collections.deque()  # (weakref, nbytes)
         self.phase = "fixed"
+        self.recompute: Set[int] = set()
+        self._recompute_auto = False
+        self._measure_left = 0
+        self._measure_bytes: Dict[int, int] = {}
+        self.vram_target = vram_target
+        self._trial_ms: List[float] = []
+        self._trials: List[int] = []
+        self._trial_results: Dict[int, float] = {}
+        self._offload_all: Set[int] = set()
+        self.events: List[str] = []  # the session replaces this with its own list
+        self._calibrate_steps = max(2, int(calibrate_steps))
+        self._probe_steps = 0
 
-        if offload == "auto":
+        if offload == "auto" and vram_target:
+            self.offload = set(range(self._blocks_for_fraction(1.0)))
+            self.phase = "probe"
+        elif offload == "auto":
             self.offload = set()
             self.phase = "calibrate"
             self._calib_target = max(2, int(calibrate_steps))
@@ -301,6 +369,31 @@ class ActivationOffloader:
         else:
             frac = 1.0 if offload is True else float(offload or 0.0)
             self.offload = set(range(self._blocks_for_fraction(frac)))
+
+        self._recompute_pending = recompute == "auto"
+        self._forced_recompute: Set[int] = set()
+        self._probe_block: Optional[int] = None
+        self._probe_forced = False
+        if recompute == "auto":
+            # A probe step that is safe for VRAM *and* host RAM: one block's
+            # activations are paged (to measure them), every other block is
+            # recomputed. Then: resident calibration if they fit in VRAM, else
+            # as many paged as host RAM holds, the rest recomputed, and the
+            # measured trials (_finish_measure) choose the split.
+            if self.n >= 2 and (self.phase == "probe" or (memory_pressure and self.offload)):
+                self._probe_forced = memory_pressure
+                self._probe_block = (self.n - 1) // 2
+                self.phase = "probe"
+                self.offload = {self._probe_block}
+                self.set_recompute(set(range(self.n - 1)) - {self._probe_block})
+        elif recompute not in (False, None, 0, 0.0):
+            if recompute is True:
+                rc = set(range(max(self.n - 1, 0)))
+            elif isinstance(recompute, (set, frozenset, list, tuple)):
+                rc = {int(i) for i in recompute if 0 <= int(i) < self.n}
+            else:
+                rc = set(range(self._blocks_for_fraction(float(recompute))))
+            self.set_recompute(rc)
 
         self._handles = [
             model.register_forward_pre_hook(self._root_pre),
@@ -324,8 +417,27 @@ class ActivationOffloader:
     def calibrating(self) -> bool:
         return self.phase == "calibrate"
 
+    def set_recompute(self, blocks: Set[int]) -> None:
+        """Recompute exactly these blocks in backward (instead of keeping or paging
+        their activations). They leave the offloaded set."""
+        blocks = {int(i) for i in blocks if 0 <= int(i) < self.n}
+        for i in self.recompute - blocks:
+            self.blocks[i].__dict__.pop("forward", None)
+        for i in blocks - self.recompute:
+            self.blocks[i].forward = types.MethodType(_checkpointed_forward, self.blocks[i])
+        self.recompute = blocks
+        self.offload -= blocks
+
+    def _measuring(self) -> bool:
+        return self.phase == "measure"
+
     # -- step clock (wall time between successive training forwards) ---------
     def _on_step_time(self, ms: float) -> None:
+        if self.phase in ("measure", "trial"):
+            self._trial_ms.append(ms)
+            if self.phase == "trial" and len(self._trial_ms) > self.tune_window:
+                self._next_trial()
+            return
         if self.phase == "calibrate":
             self._calib_steps_ms.append(ms)
             if len(self._calib_steps_ms) >= self._calib_target:
@@ -342,8 +454,13 @@ class ActivationOffloader:
                     self._tune_samples = []
                     if not self.offload:
                         self.phase = "fixed"
+                    self.events.append(f"activations: {k} blocks paged ran {t:.0f} ms/step, more than "
+                                       f"{base * (1.0 + self.max_slowdown):.0f} ms allowed; "
+                                       + (f"trying {len(self.offload)}" if self.offload else "paging none"))
                 else:
                     self.phase = "fixed"
+                    self.events.append(f"activations: settled on {k} of {self.n} blocks paged "
+                                       f"({t:.0f} ms/step against {base:.0f} ms with none)")
                 self.decision["offloaded_blocks"] = float(len(self.offload))
 
     # -- module hooks --------------------------------------------------------
@@ -357,6 +474,19 @@ class ActivationOffloader:
         self._last_fwd = now
         self.stats["forwards"] += 1
         self._session = _Session(self.n)
+        if self.phase == "probe":
+            self._probe_steps += 1
+            if self._probe_steps > 1:
+                self._finish_probe()
+            else:
+                self._measure_bytes = {}
+        if self._measuring():
+            self._measure_left -= 1
+            if self._measure_left < 0:  # two measured steps are in: decide
+                self._finish_measure()
+            else:
+                self._calib_events.append([])
+                self._measure_bytes = {}
         if self.calibrating:
             self._calib_bytes.append({})
             self._calib_events.append([])
@@ -379,14 +509,14 @@ class ActivationOffloader:
         def hook(module, args):
             self._block = i
             self._reap()
-            if self.calibrating and self._session is not None:
+            if (self.calibrating or self._measuring()) and self._session is not None:
                 self._calib_events[-1].append((i, _C.record_event(-1, True)))
 
         return hook
 
     def _make_block_post(self, i: int):
         def hook(module, args, output):
-            if self.calibrating and self._session is not None:
+            if (self.calibrating or self._measuring()) and self._session is not None:
                 self._calib_events[-1].append((i, _C.record_event(-1, True)))
             self._block = None
 
@@ -451,6 +581,8 @@ class ActivationOffloader:
         session.dedup[id(t)] = (weakref.ref(t), packed)
         self.stats["packed_tensors"] += 1
         self.stats["packed_bytes"] += nbytes
+        if self._measuring() or self.phase == "probe":
+            self._measure_bytes[b] = self._measure_bytes.get(b, 0) + nbytes
         return packed
 
     def _unpack(self, obj):
@@ -538,9 +670,125 @@ class ActivationOffloader:
         )
         self.phase = "tune" if self.offload and base_ms > 0 else "fixed"
         self._tune_samples = []
+        self.events.append(f"activations: calibrated at {base_ms:.0f} ms/step; "
+                           + (f"paging {len(self.offload)} of {self.n} blocks to host RAM, measuring the slowdown"
+                              if self.phase == "tune" else "kept in VRAM"))
+
+    def _finish_probe(self) -> None:
+        """After the probe step: resident calibration only if the measured
+        activations fit next to what stays allocated between steps; otherwise
+        page what host RAM can hold and recompute the rest."""
+        from .planner import available_ram_bytes, local_processes
+        n_eligible = max(self.n - 1, 0)  # the last block is never paged
+        if self._probe_block is not None:
+            blk = self._measure_bytes.get(self._probe_block, 0)
+            total = blk * n_eligible
+        else:
+            total = sum(self._measure_bytes.values())
+            blk = total // max(len(self._measure_bytes), 1)
+        steady = torch.cuda.memory_allocated()
+        self.decision = dict(self.decision, probe_activation_bytes=float(total), probe_steady_bytes=float(steady),
+                             probe_vram_target=float(self.vram_target or 0))
+        fits = self.vram_target and steady + 1.25 * total <= self.vram_target
+        if fits and not self._probe_forced:
+            self.set_recompute(set())
+            self.offload = set()
+            self.phase = "calibrate"
+            self._calib_target = self._calibrate_steps
+            return
+        self.phase = "fixed"
+        if self._probe_block is None:  # recompute disabled: keep paging all of them
+            self.decision["probe"] = "activations do not fit in VRAM: all paged"
+            self.events.append(f"activations: {total / 2**30:.1f} GiB per step do not fit next to "
+                               f"{steady / 2**30:.1f} GiB of weights in the {(self.vram_target or 0) / 2**30:.1f} GiB "
+                               f"target: all paged")
+            return
+        # page as many as host RAM can hold (pinned, plus room for everything else), recompute the rest
+        ram = available_ram_bytes() // max(local_processes(), 1)
+        k = n_eligible if blk <= 0 else min(n_eligible, int(0.6 * ram // blk))
+        order = list(range(n_eligible))
+        self.offload = set(order[:k])  # the earliest blocks: backward reaches them last, prefetch has time
+        self._forced_recompute = set(order[k:])
+        self.set_recompute(self._forced_recompute)
+        why = "the weights already page over PCIe" if self._probe_forced else \
+            f"{total / 2**30:.1f} GiB do not fit next to {steady / 2**30:.1f} GiB in VRAM"
+        self.events.append(f"activations: {blk / 2**20:.0f} MiB per block ({why}); host RAM holds {k} of "
+                           f"{n_eligible} blocks' activations, the other {n_eligible - k} are recomputed")
+        if self.offload:
+            self._recompute_auto = True
+            self._measure_left = 3
+            self.phase = "measure"
+
+    def _finish_measure(self) -> None:
+        """Choose how many offloaded blocks to recompute instead: the number r
+        that balances PCIe (time already reserved + the blocks still streamed)
+        against the GPU (about 3 forwards per block per step + r extra)."""
+        events = self._calib_events[-1] if self._calib_events else []
+        times: Dict[int, float] = {}
+        opened: Dict[int, object] = {}
+        for i, ev in events:
+            if i in opened:
+                times[i] = times.get(i, 0.0) + opened.pop(i).elapsed_ms(ev)
+            else:
+                opened[i] = ev
+        self._calib_events.clear()
+        fwd_ms = statistics.median(times.values()) if times else 0.0
+        blk_bytes = statistics.median(self._measure_bytes.values()) if self._measure_bytes else 0
+        self.phase = "fixed"
+        if fwd_ms <= 0 or blk_bytes <= 0:
+            return
+        p = self.profile
+        link_ms = p.link_ms(blk_bytes, blk_bytes) if p else 2 * blk_bytes / 25e9 * 1e3
+        reserved = p.link_ms(*self.reserved_link_bytes) if p else 0.0
+        m = len(self.offload)
+        r = recompute_count(m, self.n, fwd_ms, link_ms, reserved)
+        self.decision = dict(self.decision, recompute_block_fwd_ms=fwd_ms, recompute_block_bytes=float(blk_bytes),
+                             recompute_block_link_ms=link_ms, recompute_reserved_link_ms=reserved,
+                             recompute_model_blocks=r)
+        # The model assumes transfers hide behind compute; real steps decide.
+        # Baseline (nothing recomputed) was just measured; try the model's
+        # answer and recomputing every streamed block, keep the fastest.
+        base = self._trial_ms[1:] or self._trial_ms
+        self._trial_results = {0: statistics.median(base)} if base else {}
+        self._offload_all = set(self.offload)
+        self._trials = [k for k in dict.fromkeys([r, m]) if k > 0]
+        self._next_trial(first=True)
+
+    def _apply_recompute_count(self, r: int) -> None:
+        ordered = sorted(self._offload_all)
+        self.offload = set(self._offload_all)
+        # the latest ones: backward reaches them first; plus those host RAM cannot hold
+        self.set_recompute(self._forced_recompute | (set(ordered[len(ordered) - r:]) if r else set()))
+
+    def _next_trial(self, first: bool = False) -> None:
+        if not first and self._trial_ms:
+            current = len(self.recompute)
+            samples = self._trial_ms[1:]  # the first step after a switch warms up
+            self._trial_results[current] = statistics.median(samples)
+        self._trial_ms = []
+        if self._trials:
+            self._apply_recompute_count(self._trials.pop(0))
+            self.phase = "trial"
+            return
+        best = min(self._trial_results, key=self._trial_results.get) if self._trial_results else 0
+        self._apply_recompute_count(best)
+        self.phase = "fixed"
+        self.decision = dict(self.decision, recompute_blocks=sorted(self.recompute),
+                             recompute_trials_ms={str(k): v for k, v in sorted(self._trial_results.items())},
+                             offloaded_blocks=float(len(self.offload)))
+        tried = ", ".join(f"{k} recomputed {v:.0f} ms" for k, v in sorted(self._trial_results.items()))
+        self.events.append(f"activations: {len(self.recompute)} of {self.n} blocks recomputed in backward, "
+                           f"{len(self.offload)} paged (measured step times: {tried})")
+
+    @property
+    def policy(self) -> List[str]:
+        """Per block: "recompute", "offload" or "keep"."""
+        return ["recompute" if i in self.recompute else "offload" if i in self.offload else "keep"
+                for i in range(self.n)]
 
     # -- lifecycle -----------------------------------------------------------
     def remove(self) -> None:
+        self.set_recompute(set())
         if self._ctx is not None:
             self._ctx.__exit__(None, None, None)
             self._ctx = None

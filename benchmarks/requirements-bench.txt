@@ -1,0 +1,8 @@
+# Only for benchmarks/compare.py and benchmarks/quality.py: the libraries TrainStream is
+# compared against. TrainStream itself needs none of them.
+transformers
+accelerate
+peft
+bitsandbytes
+deepspeed
+unsloth

@@ -7,6 +7,7 @@
     python examples/lora_large_model.py --size 14b --quantize nf4               # NF4 base weights
     python examples/lora_large_model.py --size 14b --quantize auto --prefer speed
     python examples/lora_large_model.py --size 32b --quantize nf4  # 65 GB in bf16: more than 64 GB of RAM
+    python examples/lora_large_model.py --size 14b --quantize nvfp4 --seq 2048 --attention auto
 
 By default the model is built from the architecture's config with random
 weights (no download): memory use and step time depend only on the shapes. It
@@ -17,12 +18,15 @@ the 152k-token vocabulary's logits from ever existing in full.
 
 TrainStream runs read the weights with trainstream's streaming loader
 (load_model), which quantizes decoder-layer matrices as they are read when
---quantize is int8 / nf4, or when "auto" finds the bf16 weights would not fit
-in RAM. With --prefer speed, "auto" also picks NF4 when that lets every layer
-stay in VRAM. Quantized runs are not bit-exact with the bf16 base.
+--quantize is int8 / nf4 / fp8 / nvfp4, or when "auto" finds the bf16 weights
+would not fit in RAM. With --prefer speed, "auto" also picks NF4 when that lets
+every layer stay in VRAM. fp8 and nvfp4 multiply on Blackwell tensor cores
+(activations quantized too); elsewhere they are expanded like nf4. Quantized
+runs are not bit-exact with the bf16 base. --recompute and --attention set the
+activation-recompute and attention-backend choices (both "auto" by default).
 
-Host RAM needed: about 2 bytes per base parameter in bf16 (1.06 int8, 0.56
-NF4), plus activations.
+Host RAM needed: about 2 bytes per base parameter in bf16 (1.06 int8, 1.03
+fp8, 0.56 NF4 / NVFP4), plus activations.
 Writes a JSON summary to --out. With the analytics project present, every
 step also streams to its live UI (--no-ui to turn that off).
 """
@@ -117,10 +121,14 @@ def main():
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--stock", action="store_true", help="stock Trainer with the model in VRAM, for comparison")
-    ap.add_argument("--quantize", default="auto", choices=["auto", "none", "int8", "nf4"],
+    ap.add_argument("--quantize", default="auto", choices=["auto", "none", "int8", "nf4", "fp8", "nvfp4"],
                     help="frozen base weight format (TrainStream runs)")
     ap.add_argument("--prefer", default="exact", choices=["exact", "speed"],
                     help="speed: let quantize=auto pick NF4 when it keeps every layer in VRAM")
+    ap.add_argument("--recompute", default="auto", choices=["auto", "on", "off"],
+                    help="recompute activations in backward instead of streaming them (auto: when PCIe is the bottleneck)")
+    ap.add_argument("--attention", default="auto", choices=["auto", "cudnn", "efficient", "flash", "math", "default"],
+                    help="attention backend (auto: the fastest measured one; default: PyTorch's own order)")
     ap.add_argument("--out", default=None)
     _live.add_args(ap)
     args = ap.parse_args()
@@ -173,7 +181,9 @@ def main():
         trainer = Trainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks)
     else:
         trainer = TrainStreamTrainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks,
-                                     trainstream={"quantize": args.quantize, "prefer": args.prefer})
+                                     trainstream={"quantize": args.quantize, "prefer": args.prefer,
+                                                  "recompute": {"auto": "auto", "on": True, "off": False}[args.recompute],
+                                                  "attention": None if args.attention == "default" else args.attention})
     status = "finished"
     try:
         trainer.train()
@@ -197,6 +207,14 @@ def main():
                            frozen_pageable_gb=st["frozen_pageable_bytes"] / GB, quantize=st.get("quantize"),
                            quantized_blocks=len(st.get("quantized_blocks", [])),
                            quantized_gb=st.get("quantized_bytes", 0) / GB)
+        if session is not None:
+            full = session.stats()
+            if "activations" in full:
+                pol = full["activations"]["policy"]
+                summary.update(activation_policy={k: pol.count(k) for k in ("keep", "offload", "recompute")})
+            if "attention" in full:
+                summary.update(attention=full["attention"]["backend"])
+            summary.update(events=full["events"])
     print(json.dumps(summary, indent=1))
     if args.out:
         json.dump(summary, open(args.out, "w"), indent=1)

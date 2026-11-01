@@ -1,6 +1,6 @@
 # TrainStream
 
-Train and fine-tune models larger than your GPU's memory. TrainStream moves optimizer state, gradients, activations and, when needed, the weights themselves into system RAM, and streams them back over PCIe exactly when the GPU needs them. Frozen weights (a LoRA base) can also be stored as int8 or 4-bit NF4. It takes one line of code and has no third-party dependencies.
+Train and fine-tune models larger than your GPU's memory. TrainStream moves optimizer state, gradients, activations and, when needed, the weights themselves into system RAM, and streams them back over PCIe exactly when the GPU needs them. Frozen weights (a LoRA base) can also be stored as int8, NF4, FP8 or NVFP4, the last two multiplied directly by Blackwell tensor cores. It takes one line of code and has no third-party dependencies.
 
 ```python
 import trainstream
@@ -9,16 +9,72 @@ model, optimizer = trainstream.wrap(model, optimizer)
 
 TrainStream is a C++/CUDA extension for PyTorch. It uses only the C++ standard library, the CUDA runtime and PyTorch's ATen: no DeepSpeed, no bitsandbytes. Updates match `torch.optim.AdamW` (max parameter difference ≈3·10⁻⁷ after 20 steps), and activation and weight paging are bit-exact.
 
+## What's new in 0.5
+
+- **FP8 and NVFP4 on tensor cores.** `quantize="fp8"` or `"nvfp4"` store frozen weights block-scaled. On Blackwell GPUs (RTX 50-series, B200) the forward matmuls run on 8- and 4-bit tensor cores through PyTorch's own `scaled_mm`: 0.188 ms for a 512×5120×13824 FP4 matmul against 1.215 ms in bf16. Real Qwen2.5-14B LoRA (Windows, same session): 0.586 s/step with NVFP4 against 0.642 s with NF4 at the same memory. NVFP4 also quantizes activations, so it costs more quality (perplexity +5.2 % on 14B, +11 % on 1.5B, against +3.1 % / +5.9 % for NF4). It stays opt-in: `prefer="speed"` still picks NF4.
+- **Recompute instead of stream** (`recompute="auto"`). Under memory pressure, activations are recomputed in backward where measured trials show that's faster than sending them over PCIe. Paged bf16 14B LoRA: 1.39 → 0.98 s/step. 14B 4-bit LoRA at 2,048 tokens: 5.10 → 1.96 s/step, together with the next item.
+- **Attention backend selection** (`attention="auto"`). It times PyTorch's attention kernels once on your model's shape and uses the fastest. On an RTX 5090 that is usually cuDNN, 1.5–2.8× faster than PyTorch's default pick on the shapes measured. Under `torch.use_deterministic_algorithms(True)` the non-deterministic kernels (cuDNN, flash) are left out; with `warn_only=True` the memory-efficient kernel is left out too, because PyTorch then keeps its non-deterministic backward. The choice is re-read on every training forward, so switching deterministic mode after `wrap()` reaches recomputed blocks as well.
+- **It says what it decided.** `memory_report(model)["events"]` now also logs the activation tuner (calibration, how many blocks it pages, each slowdown it measured and where it settled), and `model._trainstream_session.adapting` is `True` while TrainStream is still tuning itself, so you can tell when step times are steady.
+- **Several GPUs in one machine.** Data-parallel ranks share one host copy of the frozen base and reduce gradients through shared memory instead of loopback sockets. Tested with two processes on one GPU, not yet on a multi-GPU machine.
+- **Benchmarks against other libraries**: `benchmarks/compare.py` (stock PyTorch, bitsandbytes QLoRA, Unsloth, DeepSpeed) and `benchmarks/quality.py` (perplexity per format). Results are below. The harness keeps the comparison fair:
+  - every engine in a scenario uses the same learning rate (2e-4 for LoRA, 2e-5 for full fine-tuning)
+  - engines that only train adapters on a 4-bit base are skipped in the full fine-tune
+  - every engine's step time is the median of the same number of steps, taken after its warm-up; for TrainStream the warm-up runs until it has finished tuning itself
+  - peak VRAM is the peak over the whole run, even when an engine resets PyTorch's peak counter
+  - `--live` streams every step and memory sample as JSON lines
+- **Fixes:**
+  - `load_model` with quantization kept every checkpoint shard mapped in memory (40.5 GB instead of 14.2 GB for 14B).
+  - Activation calibration could overcommit VRAM at long sequences. A probe step now measures one block's activations first, recomputing the others, so it is safe for host RAM too.
+  - LoRA adapters on a quantized base stay in VRAM instead of being paged with the block (14B NVFP4 LoRA: 0.60 → 0.52 s/step).
+
 ## What's new in 0.4
 
-- **0.4.1:** install instructions for uv (`uv pip install`, `uv add` / `uv sync`) next to pip, checked on Windows and Linux; clearer messages when the installed torch is the CPU-only build.
+- **0.4.1:** install instructions for uv; clearer messages when the installed torch is the CPU-only build.
+- **0.4.0:** built-in int8 / NF4 weight quantization (`quantize=`), `load_model()` (quantize while reading a checkpoint), `quantize_model()`. Real Qwen2.5-14B LoRA 1.37 → 0.87 s/step; a 32B-shaped base trains on 64 GB of RAM.
 
-In 0.4.0:
+## Against other libraries (same laptop, WSL2 with 31 GB RAM)
 
-- **Built-in weight quantization.** `wrap(..., quantize="auto" | "none" | "int8" | "nf4")` stores frozen weights quantized and expands them with TrainStream's own CUDA kernel just before each layer runs. `"auto"` (the default) quantizes only when a run can't fit otherwise; `prefer="speed"` also lets it choose NF4 when that keeps every layer in VRAM.
-- **`load_model()`** reads a Hugging Face checkpoint one tensor at a time and quantizes while reading, so a base larger than your RAM never exists in full precision.
-- **`trainstream.quantize_model()`** quantizes a model you've already loaded, in place.
-- Real Qwen2.5-14B LoRA on a 24 GB laptop GPU: **1.37 → 0.87 s/step**. A 32B-shaped base (65.5 GB in bf16, more than the machine's 64 GB of RAM) trains at 2.53 s/step.
+> These tables were measured before the harness fixes in this release. TrainStream's step time could include steps where it was still tuning itself, and its peak VRAM could miss a peak from before its memory planner reset PyTorch's counter. The engines also used two learning rates, which changes losses but not step times. Re-run `benchmarks/compare.py` for numbers measured the new way.
+
+**LoRA r=16, Qwen2.5-14B, batch 1 × 512**
+
+| Engine | Step time | Peak VRAM | Outcome |
+|---|---|---|---|
+| TrainStream, NVFP4 base (FP4 tensor cores) | 0.52 s | 19.1 GB | fastest |
+| bitsandbytes QLoRA (NF4) + PEFT | 0.59 s | 17.4 GB | 1.14× the fastest |
+| TrainStream, NF4 base | 0.64 s | 19.1 GB | 1.22× the fastest |
+| Unsloth (4-bit) | 0.74 s | 11.5 GB | 1.42× the fastest |
+| TrainStream (auto) | 0.87 s | 20.6 GB | 1.67× the fastest |
+| bitsandbytes QLoRA + gradient checkpointing | 0.89 s | 12.7 GB | 1.71× the fastest |
+| DeepSpeed ZeRO-2, optimizer offload | 75.44 s | 35.9 GB | 145.28× the fastest |
+| Stock PyTorch (+ PEFT) | 79.60 s | 37.6 GB | 153.30× the fastest |
+
+**LoRA r=16, Qwen2.5-14B, batch 1 × 2048**
+
+| Engine | Step time | Peak VRAM | Outcome |
+|---|---|---|---|
+| TrainStream, NVFP4 base (FP4 tensor cores) | 2.01 s | 17.8 GB | fastest |
+| Unsloth (4-bit) | 2.55 s | 11.7 GB | 1.27× the fastest |
+| bitsandbytes QLoRA + gradient checkpointing | 2.89 s | 16.3 GB | 1.44× the fastest |
+| TrainStream, NF4 base | 3.15 s | 17.6 GB | 1.57× the fastest |
+| TrainStream (auto) | 3.18 s | 22.0 GB | 1.58× the fastest |
+| bitsandbytes QLoRA (NF4) + PEFT | 151.37 s | 34.7 GB | 75.30× the fastest |
+| Stock PyTorch (+ PEFT) | 280.24 s | 57.9 GB | 139.40× the fastest |
+| DeepSpeed ZeRO-2, optimizer offload | — | — | did not finish 12 steps in 50 min (weights spill past VRAM) |
+
+**Full fine-tune, Qwen2.5-1.5B, batch 4 × 512**
+
+| Engine | Step time | Peak VRAM | Outcome |
+|---|---|---|---|
+| Stock PyTorch (+ PEFT) | 1.33 s | 32.4 GB | fastest |
+| TrainStream (auto) | 1.61 s | 20.0 GB | 1.21× the fastest |
+| DeepSpeed ZeRO-2, optimizer offload | — | — | killed: out of host RAM (31 GB in WSL) |
+- With an NVFP4 base, TrainStream had the fastest step in both 14B LoRA runs: 0.52 s at 512 tokens and 2.01 s at 2,048. It holds more in VRAM than Unsloth (18–19 GB against 11.5), and NVFP4 costs quality (see the perplexity table).
+- With an NF4 base, the format bitsandbytes and Unsloth use, TrainStream was 7 % slower than bitsandbytes at 512 tokens, and behind Unsloth and bitsandbytes with checkpointing at 2,048.
+- Stock PyTorch, bitsandbytes without checkpointing at 2,048 tokens, and DeepSpeed did not fit in 24 GB of VRAM. The driver spilled into system RAM (75–280 s per step), or the run did not finish or was killed.
+- The 1.5B full fine-tune ran with 29 of WSL's 31 GB of RAM in use, and TrainStream's step time varied between runs (1.80, 1.09 and 1.61 s; the table shows the latest). On Windows with 64 GB it holds 1.18 s. Stock PyTorch (1.33 s) allocated 32 GB on the 24 GB GPU, the excess in shared system memory.
+
+Each engine runs in a fresh process with the same model, random-token data, LoRA settings (r=16, all projections), learning rate and loop. Step time is the median of the steps after the warm-up: 2 steps, plus, for TrainStream, the steps until it has finished tuning itself. Unsloth uses its own defaults. Re-run with `benchmarks/compare.py`.
 
 ## Results (RTX 5090 Laptop GPU 24 GB, 64 GB RAM)
 
@@ -42,7 +98,7 @@ Offloading costs throughput when a model already fits, which is why `offload="au
 - The CUDA toolkit matching PyTorch's CUDA major version, and a C++ compiler (Visual Studio 2022+ Build Tools with "Desktop development with C++" on Windows, GCC 11+ on Linux)
 - Optional, for the Hugging Face integration: `transformers`, `accelerate`, and `peft` for LoRA (all three come with `trainstream[hf]`)
 
-Tested on an RTX 5090 Laptop GPU with Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14), where all 123 tests pass, and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1, CUDA 13.3, GCC 13.3, Python 3.12), where 122 pass and 1 is skipped (the bitsandbytes comparison, without bitsandbytes installed). Installs were checked with pip and with uv 0.13 (`uv pip install`, `uv sync` in a project, and building from the sdist) on both. Native Linux and other GPUs are untested.
+Tested on an RTX 5090 Laptop GPU with Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14), where all 171 tests pass with no warnings, and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1, CUDA 13.3, GCC 13.3, Python 3.12), where 170 pass and 1 is skipped (the bitsandbytes comparison, without bitsandbytes installed), both from a wheel installed with pip and with uv. Installs were checked with pip and with uv 0.13 (`uv pip install`, `uv sync` in a project, and building from the sdist) on both. Native Linux and other GPUs are untested.
 
 ## Install
 
@@ -163,10 +219,13 @@ model, optimizer = trainstream.wrap(MyModel().cuda(), torch.optim.AdamW(...))   
 
 ```python
 r = trainstream.memory_report(model)
-r["events"]                    # plain-text log: quantization, memory plan, resident mode, .to()
+r["events"]                    # plain-text log: quantization, memory plan, attention backend,
+                               # activation paging / recompute decisions, resident mode, .to()
 r["params"]["paged_blocks"]    # layers whose weights stream from host RAM
-r["params"]["quantize"]        # None, "int8" or "nf4"
+r["params"]["quantize"]        # None, "int8", "nf4", "fp8" or "nvfp4"
+r["activations"]["policy"]     # per block: "keep", "offload" or "recompute"
 r["plan"]["history"]           # every planner move, with the measured peaks
+model._trainstream_session.adapting   # True while it is still tuning itself
 ```
 
 ### Rules of thumb
@@ -187,9 +246,11 @@ r["plan"]["history"]           # every planner move, with the measured peaks
 | `offload` | `"auto"`, `True` | `"auto"` | `"auto"` switches to fused torch AdamW after 2 steps if the model fits |
 | `activation_offload` | `"auto"`, `True`, `False`, fraction 0.0–1.0 | `"auto"` | how many blocks' activations are paged to RAM |
 | `param_offload` | `"auto"`, `True`, `False`, fraction 0.0–1.0, list of block indices | `"auto"` | `"auto"`: the memory planner decides which layers stay in VRAM |
-| `quantize` | `"auto"`, `"none"`, `None`, `False`, `"int8"`, `"nf4"` | `"auto"` | frozen weights only; `"auto"` quantizes only when the run can't fit otherwise (int8 before NF4) |
-| `quant_block_size` | even integer ≥ 2 | `64` | values per fp32 scale |
+| `quantize` | `"auto"`, `"none"`, `None`, `False`, `"int8"`, `"nf4"`, `"fp8"`, `"nvfp4"` | `"auto"` | frozen weights only; `"auto"` quantizes only when the run can't fit otherwise (int8 before NF4); fp8 / nvfp4 run on Blackwell tensor cores |
+| `quant_block_size` | even integer ≥ 2 | `64` | values per fp32 scale (int8 / nf4; fp8 and nvfp4 use fixed 32 / 16) |
 | `prefer` | `"exact"`, `"speed"` | `"exact"` | `"speed"` lets `quantize="auto"` choose NF4 when it keeps every layer in VRAM |
+| `recompute` | `"auto"`, `True`, `False`, fraction 0.0–1.0, list of block indices | `"auto"` | recompute blocks in backward instead of keeping or paging their activations; `"auto"`: under memory pressure, as many as measured trials show is fastest |
+| `attention` | `"auto"`, `"cudnn"`, `"efficient"`, `"flash"`, `"math"`, `None` | `"auto"` | attention backend: the fastest measured on your model's shape, a named one first, or PyTorch's own order; deterministic mode leaves out the non-deterministic kernels |
 | `moment_dtype` | `"auto"`, `"float32"`, `"bfloat16"`, `"bf16"`, `torch.bfloat16` | `"auto"` | fp32 unless that wouldn't fit in RAM; bf16 uses stochastic rounding |
 | `device` | `None`, `"cuda"`, `"cuda:N"`, `torch.device` | `None` | target GPU when the model is on the CPU |
 | `blocks` | `None`, list of layer modules | `None` | the repeated layer stack; auto-detected |
@@ -217,6 +278,8 @@ Anything else raises `ValueError` (for example `quantize="fp4"`).
 | `"none"` | 2 (bf16) | 0 (bit-exact) | it fits |
 | `"int8"` | 1.06 | 0.6 % | bf16 doesn't fit in RAM |
 | `"nf4"` | 0.56 | 9 % | int8 doesn't fit either, or with `prefer="speed"` |
+| `"fp8"` | 1.03 | perplexity +1.8 % (1.5B) | FP8 tensor-core matmuls on Blackwell, near-bf16 quality |
+| `"nvfp4"` | 0.56 | perplexity +5–11 % | the fastest 4-bit path on Blackwell, when its quality is acceptable |
 | `"auto"` | — | — | decided from the measured RAM and VRAM |
 
 NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); TrainStream doesn't depend on bitsandbytes. A quantized run trains on the dequantized weights, as QLoRA does, so it isn't bit-exact with the bf16 base.
@@ -226,7 +289,7 @@ NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); Trai
 | Argument | Accepted values | Default |
 |---|---|---|
 | `name_or_path` | Hub id or local folder with `.safetensors` files | — |
-| `quantize` | `"auto"`, `"none"`, `None`, `False`, `"int8"`, `"nf4"` | `"auto"` (quantize only if bf16 wouldn't fit in `ram_fraction` of free RAM) |
+| `quantize` | `"auto"`, `"none"`, `None`, `False`, `"int8"`, `"nf4"`, `"fp8"`, `"nvfp4"` | `"auto"` (quantize only if bf16 wouldn't fit in `ram_fraction` of free RAM) |
 | `dtype` | `torch.bfloat16`, `torch.float16`, `torch.float32` | `torch.bfloat16` |
 | `quant_block_size` | even integer ≥ 2 | `64` |
 | `random_weights` | `True`, `False` | `False` (build the shapes without reading a checkpoint) |
@@ -238,7 +301,7 @@ NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); Trai
 
 | Function | Arguments |
 |---|---|
-| `trainstream.quantize_model(model, quantize="nf4", *, blocks=None, block_size=64, pin_budget=None)` | `quantize`: `"int8"`, `"nf4"`; returns `{"tensors", "bytes_before", "bytes_after"}` |
+| `trainstream.quantize_model(model, quantize="nf4", *, blocks=None, block_size=64, pin_budget=None)` | `quantize`: `"int8"`, `"nf4"`, `"fp8"`, `"nvfp4"`; returns `{"tensors", "bytes_before", "bytes_after"}` |
 | `TrainStreamTrainer(..., trainstream={...})` | any `wrap()` option, plus `"chunked_loss"` (`True`/`False`, default `True`) and `"loss_chunk_size"` (default `1024`) |
 | `trainstream.OffloadAdamW(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, *, mode="cpu", max_grad_norm=None, accumulation_steps=1, moment_dtype="float32", ...)` | `mode`: `"cpu"`, `"gpu"`; `moment_dtype`: `"float32"`, `"bfloat16"` |
 | `trainstream.chunked_cross_entropy(hidden, weight, targets, bias=None, *, chunk_size=1024, ignore_index=-100, reduction="mean", num_items=None)` | `reduction`: `"mean"`, `"sum"`; `causal_lm_loss` takes the same and shifts labels |
@@ -253,7 +316,8 @@ NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); Trai
 | `TRAINSTREAM_VERBOSE_BUILD=1` | show compiler output |
 | `TORCH_CUDA_ARCH_LIST` | GPU architectures to compile for (default: the GPUs present) |
 | `CUDA_HOME` / `CUDA_PATH` | CUDA toolkit to use, if it isn't found automatically |
-| `LOCAL_WORLD_SIZE` / `SLURM_NTASKS_PER_NODE` | processes sharing the machine; the planner splits RAM between them |
+| `LOCAL_WORLD_SIZE` / `SLURM_NTASKS_PER_NODE` | processes sharing the machine; the planner splits RAM between them, and data parallel shares host memory when all ranks are local |
+| `TRAINSTREAM_SHM=0` | data parallel without shared host memory (per-rank copies, gloo reduction) |
 
 ## How it works
 
@@ -266,17 +330,19 @@ NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); Trai
 
 | Script | What it does | Main flags |
 |---|---|---|
-| `examples/lora_large_model.py` | LoRA on bases larger than the GPU, bf16 or quantized | `--size 1.5b\|7b\|14b\|32b`, `--model HUB_ID`, `--quantize auto\|none\|int8\|nf4`, `--prefer exact\|speed`, `--stock`, `--steps`, `--batch`, `--seq`, `--rank` |
+| `examples/lora_large_model.py` | LoRA on bases larger than the GPU, bf16 or quantized | `--size 1.5b\|7b\|14b\|32b`, `--model HUB_ID`, `--quantize auto\|none\|int8\|nf4\|fp8\|nvfp4`, `--prefer exact\|speed`, `--recompute auto\|on\|off`, `--attention auto\|cudnn\|efficient\|flash\|math\|default`, `--stock`, `--steps`, `--batch`, `--seq`, `--rank` |
 | `examples/hf_finetune.py` | fine-tune a Hugging Face model, optionally beside the stock Trainer | `--model`, `--lora`, `--compare`, `--activation-offload` |
 | `examples/train_bigger_than_vram.py` | 1.8B model (7.3 GB of fp32 weights) inside a 4 GB VRAM cap | `--vram-gb`, `--moments fp32\|bf16`, `--layers`, `--d-model` |
 | `examples/verify_ram_offload.py` | proves where training memory lives, with a PASS/FAIL verdict | `--gpt`, `--hf`, `--vram-cap-gb`, `--engine both\|baseline\|trainstream` |
+| `benchmarks/compare.py` | head-to-head with stock PyTorch, bitsandbytes QLoRA, Unsloth, DeepSpeed | `--scenario full1.5b\|lora14b\|lora14b_2k`, `--engines ...`, `--steps` (2 warm-up + measured; default 10), `--timeout`, `--out` |
+| `benchmarks/quality.py` | perplexity of each quantization format, before and after a short LoRA fine-tune | `--model`, `--formats none int8 nf4 fp8 nvfp4`, `--windows`, `--train-steps` |
 
 ## Limitations
 
 - Host RAM is the ceiling: 8–12 bytes per trained parameter and 2–4 per frozen one (1.06 with int8, 0.56 with NF4), plus activations. Measured on 64 GB: a 3.6B full fine-tune, and LoRA on a 32.8B NF4 base.
-- Quantization covers frozen block weights only (not embeddings, the output layer or trained weights) and isn't bit-exact. `load_model` reads `.safetensors` causal-LM checkpoints only.
+- Quantization covers frozen block weights only (not embeddings, the output layer or trained weights) and isn't bit-exact. FP8 / NVFP4 tensor-core matmuls need a Blackwell GPU and quantize activations too. `load_model` reads `.safetensors` causal-LM checkpoints only.
 - Weight paging covers the repeated block stack and needs `optimizer_mode="cpu"`; each paged weight crosses PCIe twice per step.
-- Data parallel only (no tensor or pipeline parallelism); tested with 2 processes on 1 GPU, not across several GPUs or machines.
+- Data parallel only (no tensor or pipeline parallelism). Ranks on one machine share host memory; tested with 2 processes on 1 GPU, not on a multi-GPU machine or across machines. VRAM pooling over NVLink / peer-to-peer isn't built.
 - `TrainStreamTrainer` is single-process. fp16 with a GradScaler and AMSGrad aren't supported; `torch.compile` hasn't been tested.
 - Host AdamW speed is bounded by system RAM bandwidth.
 

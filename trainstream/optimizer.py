@@ -418,7 +418,15 @@ class OffloadAdamW(torch.optim.Optimizer):
                     host = p.detach().to("cpu", copy=True)
                     dist.broadcast(host, src=0, group=group)
                     p.copy_(host)
-        self._dp = {"group": group, "world": world, "queue": queue.Queue(), "error": None}
+        self._dp = {"group": group, "world": world, "queue": queue.Queue(), "error": None,
+                    "local": None, "shm_reduce": None}
+        from . import shared
+        if shared.enabled():
+            local = shared.LocalGroup(group, world, dist.get_rank())
+            if local.single_node:  # every rank on this machine: share host RAM
+                self._dp["local"] = local
+                cap = max((p.numel() for g in self.param_groups for p in g["params"] if p.requires_grad), default=1)
+                self._dp["shm_reduce"] = shared.ShmAllReduce(local, cap)
         t = threading.Thread(target=self._reduce_loop, name="trainstream-allreduce", daemon=True)
         self._dp["thread"] = t
         t.start()
@@ -434,7 +442,11 @@ class OffloadAdamW(torch.optim.Optimizer):
                 return
             try:
                 buf = self.engine.grad_buffer(slot)  # waits for this slot's accumulation
-                dist.all_reduce(buf, group=dp["group"])  # same order on every rank (backward order)
+                shm = dp["shm_reduce"]
+                if shm is not None and buf.dtype == torch.float32 and buf.is_contiguous():
+                    shm(buf)  # through shared memory, same order on every rank (backward order)
+                else:
+                    dist.all_reduce(buf, group=dp["group"])
                 if not self.max_grad_norm and not self.compute_grad_norm:
                     g = self._slot_group[slot]
                     self.engine.update_slot(slot, float(g["lr"]), float(g["betas"][0]), float(g["betas"][1]),

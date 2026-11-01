@@ -26,7 +26,7 @@ import torch
 NAME = "trainstream_C"
 CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 SOURCES = ["bindings.cpp", "memory_pinner.cpp", "offload_adamw.cpp", "offload_adamw_kernel.cu",
-           "quant.cpp", "quant_kernel.cu"]
+           "quant.cpp", "quant_kernel.cu", "shm.cpp"]
 HEADERS = ["kernels.h", "offload_adamw.h", "trainstream.h"]
 
 if sys.platform == "win32":

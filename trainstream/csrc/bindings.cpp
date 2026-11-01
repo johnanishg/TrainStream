@@ -94,6 +94,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("transfer_stats", &transfer_stats, py::arg("device") = -1);
   m.def("dequantize_async", &dequantize_async, py::arg("dst"), py::arg("q"), py::arg("absmax"), py::arg("kind"),
         py::arg("block"), py::arg("after") = EventPtr());
+  m.def("shared_host", &shared_host, py::arg("name"), py::arg("bytes"), py::arg("create"), py::arg("pin") = true);
+  m.def("shm_reducer_bytes", &shm_reducer_bytes, py::arg("world"), py::arg("capacity"));
+  m.def("shm_allreduce", &shm_allreduce, py::arg("buf"), py::arg("segment"), py::arg("rank"), py::arg("world"),
+        py::arg("capacity"), py::arg("seq"), nogil());
+  m.def("quantize_blockscaled", &quantize_blockscaled, py::arg("x"), py::arg("kind"),
+        py::arg("global_decode") = c10::optional<at::Tensor>());
+  m.def("dequantize_blockscaled", &dequantize_blockscaled, py::arg("dst"), py::arg("q"), py::arg("scales"),
+        py::arg("kind"), py::arg("global_decode") = 1.0);
+  m.def("dequantize_blockscaled_async", &dequantize_blockscaled_async, py::arg("dst"), py::arg("q"),
+        py::arg("scales"), py::arg("kind"), py::arg("global_decode") = 1.0, py::arg("after") = EventPtr());
   m.def("synchronize_streams", [](int device) {
         Runtime& rt = runtime(device);
         TS_CUDA_CHECK(cudaStreamSynchronize(rt.d2h));

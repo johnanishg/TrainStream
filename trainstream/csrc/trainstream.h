@@ -128,6 +128,28 @@ std::tuple<EventPtr, std::vector<at::Tensor>> dequantize_async(const at::Tensor&
                                                                const at::Tensor& absmax, const std::string& kind,
                                                                int64_t block, const EventPtr& after);
 
+// Host memory shared by the processes of one machine (see shm.cpp).
+at::Tensor shared_host(const std::string& name, int64_t bytes, bool create, bool pin);
+int64_t shm_reducer_bytes(int64_t world, int64_t capacity);
+void shm_allreduce(const at::Tensor& buf, const at::Tensor& segment, int64_t rank, int64_t world, int64_t capacity,
+                   int64_t seq);
+
+// Block-scaled formats ("nvfp4", "fp8" = MXFP8) that Blackwell tensor cores
+// multiply directly (torch's scaled_mm). quantize_blockscaled runs on the
+// current stream and returns (packed values, swizzled scales); nvfp4 also
+// takes a 1-element device tensor with the global decode scale.
+std::tuple<at::Tensor, at::Tensor> quantize_blockscaled(const at::Tensor& x, const std::string& kind,
+                                                        const c10::optional<at::Tensor>& global_decode);
+// Expand into a contiguous 2-D `dst` on the current stream.
+void dequantize_blockscaled(const at::Tensor& dst, const at::Tensor& q, const at::Tensor& scales,
+                            const std::string& kind, double global_decode);
+// The same on the H2D stream after `after`; `q`/`scales` may be in host RAM.
+std::tuple<EventPtr, std::vector<at::Tensor>> dequantize_blockscaled_async(const at::Tensor& dst, const at::Tensor& q,
+                                                                           const at::Tensor& scales,
+                                                                           const std::string& kind,
+                                                                           double global_decode,
+                                                                           const EventPtr& after);
+
 // ---------------------------------------------------------------------------
 // Micro-benchmarks (CUDA-event timed)
 // ---------------------------------------------------------------------------

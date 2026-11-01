@@ -114,6 +114,7 @@ class ParamPager:
                                for p, _, nb in self._entries[i]) for i in range(self.n)]
         self.qnear: Set[int] = set()
         self._keep: Dict[int, list] = {}
+        self._native_expanded: Dict[int, bool] = {}
         self._host_frozen: Dict[int, torch.Tensor] = {}
         ram = physical_ram_bytes()
         self.pin_budget = 0.40 * ram if ram else float("inf")
@@ -126,6 +127,11 @@ class ParamPager:
         self.events: Dict[int, object] = {}
         self.stats = dict(loads=0, load_bytes=0, releases=0, pages=0, unpages=0)
         frozen_init = frozen_init if frozen_init is not None else {}
+        self._shared_frozen: Dict[int, torch.Tensor] = {}
+        self.frozen_shared_bytes = 0
+        local = (optimizer._dp or {}).get("local") if getattr(optimizer, "_dp", None) else None
+        if local is not None:
+            self._share_frozen(local, frozen_init)
         for i in sorted(set(paged) | self.quant_blocks):
             self.page(i, frozen_init)
         for i in sorted(self.quant_blocks - set(paged)):
@@ -166,6 +172,62 @@ class ParamPager:
     def _prev_paged(self, i: int) -> List[int]:
         return [j for j in reversed(self._sorted) if j < i][: self.depth]
 
+    def _share_frozen(self, local, frozen_init) -> None:
+        """Data parallel on one machine: every rank maps the same host copy of
+        the frozen block weights (and of the packed quantized ones), written
+        once by local rank 0. Collective: the same order on every rank."""
+        from .shared import view_as
+        specs, where = [], {}
+        for i in range(self.n):
+            for k, (p, slot, nbytes) in enumerate(self._entries[i]):
+                if slot is not None:
+                    continue
+                qw = self._quant.get(id(p))
+                if qw is not None:
+                    for part, t in (("q", qw.host_q), ("s", qw.host_absmax)):
+                        key = f"q{i}_{k}_{part}"
+                        specs.append((key, t.numel() * t.element_size()))
+                        where[key] = (qw, part, t.dtype, tuple(t.shape))
+                else:
+                    key = f"f{i}_{k}"
+                    specs.append((key, nbytes))
+                    where[key] = (p, None, p.dtype, (p.numel(),))
+
+        def fill(key, seg):
+            obj, part, dt, shape = where[key]
+            dst = view_as(seg, dt, shape)
+            if part is not None:
+                dst.copy_(obj.host_q if part == "q" else obj.host_absmax)
+            else:
+                src = frozen_init.get(id(obj))
+                dst.copy_((src if src is not None else obj.detach()).reshape(-1))
+
+        segs = local.segments(specs, fill, pin_budget=self.pin_budget - _C.pinned_stats()["live_bytes"])
+        for key, seg in segs.items():
+            obj, part, dt, shape = where[key]
+            view = view_as(seg, dt, shape)
+            view._ts_pinned = True
+            if part == "q":
+                obj.host_q = view
+            elif part == "s":
+                obj.host_absmax = view
+            else:
+                self._shared_frozen[id(obj)] = view
+            self.frozen_shared_bytes += view.numel() * view.element_size()
+
+    def _resident_trainable(self, i: int, slot) -> bool:
+        """Trained parameters of a quantized block (LoRA adapters on a
+        quantized base) are small: they stay in VRAM, updated in place."""
+        return slot is not None and i in self.quant_blocks
+
+    def _native(self, p) -> bool:
+        qw = self._quant.get(id(p))
+        return qw is not None and getattr(qw, "native", False)
+
+    @property
+    def _native_blocks(self) -> Set[int]:
+        return {i for i in self.quant_blocks if any(self._native(p) for p, _, _ in self._entries[i])}
+
     def _source(self, p, slot) -> torch.Tensor:
         return self.opt.engine.host_param(slot) if slot is not None else self._host_frozen[id(p)]
 
@@ -187,11 +249,13 @@ class ParamPager:
         if i in self.paged or not self._entries[i]:
             return
         entries = self._entries[i]
-        slots = [s for _, s, _ in entries if s is not None]
+        slots = [s for _, s, _ in entries if s is not None and not self._resident_trainable(i, s)]
         if slots:
             self.opt.engine.wait_ready(slots)  # an in-flight upload into VRAM must land first
         for p, slot, nbytes in entries:
             if slot is not None:
+                if self._resident_trainable(i, slot):
+                    continue  # an adapter on a quantized base: small, stays in VRAM
                 self.opt.engine.set_paged(slot, True)
                 self.opt._paged_ids.add(id(p))
                 continue
@@ -201,6 +265,10 @@ class ParamPager:
             # budget, else ordinary RAM (the CPU tensor a model was built in is
             # reused as is). Taken one by one, so a model never exists twice.
             src = frozen_init.pop(id(p), None) if frozen_init is not None else None
+            if id(p) in self._shared_frozen:  # one copy for every rank on this machine
+                del src
+                self._host_frozen[id(p)] = self._shared_frozen[id(p)]
+                continue
             if _C.pinned_stats()["live_bytes"] + nbytes <= self.pin_budget:
                 host = _C.pinned_empty([p.numel()], p.dtype, "param.frozen", False, False)
                 host.copy_(src.reshape(-1) if src is not None else p.detach().reshape(-1))
@@ -243,6 +311,8 @@ class ParamPager:
                 self.opt._paged_ids.discard(id(p))
                 continue
             host = self._host_frozen.pop(id(p))
+            if id(p) in self._shared_frozen:
+                continue  # the shared copy stays for the other ranks
             if getattr(host, "_ts_pinned", False):
                 self.frozen_pinned_bytes -= nbytes
             else:
@@ -255,27 +325,57 @@ class ParamPager:
 
     # -- streaming ------------------------------------------------------------------
     def load(self, i: int) -> None:
-        """Queue the H2D copy of block i's weights (does not block the GPU)."""
-        if i not in self.paged or self.fresh[i]:
+        """Queue the H2D copy of block i's weights (does not block the GPU).
+
+        Tensor-core (block-scaled) weights stay packed in forward. In backward
+        they are expanded here, on the H2D stream and prefetched like nf4, so
+        the input-gradient matmul finds a ready bf16 copy instead of expanding
+        on the compute stream."""
+        if i not in self.paged:
             return
+        backward = _in_backward()
+        expand_native = backward and i in self._native_blocks and not self._native_expanded.get(i)
+        if self.fresh[i] and not expand_native:
+            return
+        only_native = self.fresh[i]  # already loaded in forward: add the expansions only
         entries = self._entries[i]
-        slots = [s for _, s, _ in entries if s is not None]
+        slots = [] if only_native else [s for _, s, _ in entries
+                                         if s is not None and not self._resident_trainable(i, s)]
         if slots:
             self.opt.engine.wait_issued(slots)  # host copies hold this step's update
-        if not self.allocated[i]:
-            for p, _, nbytes in entries:
-                p.untyped_storage().resize_(nbytes)
+        if not self.allocated[i] or expand_native:
+            for p, slot, nbytes in entries:
+                if self._resident_trainable(i, slot):
+                    continue
+                native = self._native(p)
+                if (not native or expand_native) and p.untyped_storage().nbytes() == 0:
+                    p.untyped_storage().resize_(nbytes)
             self.allocated[i] = True
         after = _C.record_event(self.device.index or 0)  # memory reuse ordered after queued compute
-        last = None
-        keep = []
+        last = self.events.get(i) if only_native else None
+        keep = list(self._keep.get(i, [])) if only_native else []
+        dev = self.device.index or 0
         for p, slot, nbytes in entries:
             qw = self._quant.get(id(p))
+            native = qw is not None and getattr(qw, "native", False)
+            if (only_native and not native) or self._resident_trainable(i, slot):
+                continue
             if qw is not None:
                 near = qw.dev_q is not None
-                last, held = _C.dequantize_async(p.detach().view(-1), qw.dev_q if near else qw.host_q,
-                                                 qw.dev_absmax if near else qw.host_absmax, qw.kind,
-                                                 qw.block_size, after)
+                if native and not expand_native:
+                    if not near:  # stage the packed bytes; the matmul reads them as they are
+                        tq, _ = _C.h2d_alloc_async(qw.host_q, after, dev)
+                        ts, last = _C.h2d_alloc_async(qw.host_absmax, after, dev)
+                        qw._staged = (tq, ts)
+                        self.stats["load_bytes"] += qw.nbytes
+                    continue
+                q = qw.dev_q if near else qw.host_q
+                s = qw.dev_absmax if near else qw.host_absmax
+                if qw.blockscaled:
+                    last, held = _C.dequantize_blockscaled_async(p.detach().view(qw.shape[0], -1), q, s, qw.kind,
+                                                                 qw.global_decode, after)
+                else:
+                    last, held = _C.dequantize_async(p.detach().view(-1), q, s, qw.kind, qw.block_size, after)
                 keep.extend(held)
                 if not near:
                     self.stats["load_bytes"] += qw.nbytes
@@ -287,6 +387,8 @@ class ParamPager:
             self.opt.engine.set_ready(s, last)  # the next update waits until this read is done
         self.events[i] = last
         self.fresh[i] = True
+        if expand_native:
+            self._native_expanded[i] = True
         self.stats["loads"] += 1
 
     def wait(self, i: int) -> None:
@@ -298,8 +400,14 @@ class ParamPager:
         if i not in self.paged or not self.allocated[i]:
             return
         self.wait(i)  # an unconsumed prefetch must land before its memory is reused
-        for p, _, _ in self._entries[i]:
+        for p, slot, _ in self._entries[i]:
+            if self._resident_trainable(i, slot):
+                continue
             p.untyped_storage().resize_(0)
+            qw = self._quant.get(id(p))
+            if qw is not None:
+                qw._staged = None
+        self._native_expanded[i] = False
         self._keep.pop(i, None)
         self.allocated[i] = False
         self.fresh[i] = False
@@ -309,6 +417,12 @@ class ParamPager:
         """Make every block resident (e.g. before unwrap). Quantized weights are
         expanded for good: the model then holds their dequantized values."""
         for i in sorted(self.quant_blocks):
+            for p, _, _ in self._entries[i]:
+                qw = self._quant.get(id(p))
+                if qw is not None:
+                    qw.native = False  # expand this time (unwrap restores the plain Linear forward)
+                    qw._staged = None
+            self.allocated[i] = False
             self.fresh[i] = False
             self.load(i)
             self.wait(i)
@@ -402,6 +516,9 @@ class ParamPager:
             if i in self.paged:
                 self.load(i)  # real storage for the copy_ that follows
                 self.wait(i)
+                for p, _, nbytes in self._entries[i]:
+                    if self._native(p) and p.untyped_storage().nbytes() == 0:
+                        p.untyped_storage().resize_(nbytes)  # load_state_dict copies into it
         return hook
 
     def _make_load_post(self, i: int):
@@ -415,8 +532,11 @@ class ParamPager:
                     new = make_quantized(p.detach(), qw.kind, qw.block_size, pin=qw.pinned)
                     if qw.dev_q is not None:
                         new.to_device(self.device)
+                    new.native = getattr(qw, "native", False)
                     self._quant[id(p)] = new
                     p._ts_qweight = new
+                    if new.native:
+                        p.untyped_storage().resize_(0)
                 elif slot is not None:
                     self.opt.engine.sync_host_from_param(slot)
                 else:

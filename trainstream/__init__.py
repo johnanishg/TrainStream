@@ -36,7 +36,7 @@ from .profiler import HardwareProfile, profile_hardware
 from .quant import quantize_model
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "wrap",

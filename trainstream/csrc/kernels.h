@@ -45,11 +45,32 @@ cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, void* ex
                             cudaStream_t stream, bool bf16_moments = false, uint32_t seed = 0);
 
 // Blockwise-quantized frozen weights (see quant_kernel.cu).
-enum class QKind : int { kNF4 = 0, kInt8 = 1 };
+enum class QKind : int { kNF4 = 0, kInt8 = 1, kNVFP4 = 2, kMXFP8 = 3 };
 
 // out[0..n) = dequantized values; one fp32 absmax per `block` values (block even).
 cudaError_t dequantize(QKind kind, DType out_dtype, const void* q, const float* absmax, void* out, int64_t n,
                        int block, int sm_count, cudaStream_t stream);
+
+// Block-scaled formats that Blackwell tensor cores multiply directly, for a
+// row-major [rows, cols] matrix with cols % 32 == 0:
+//   kNVFP4  E2M1 codes, two per byte (first value in the low nibble), one e4m3
+//           scale per 16 values; value = e2m1 * scale * global_decode
+//   kMXFP8  e4m3 values, one e8m0 (power-of-two) scale per 32 values
+// Scales are written in cuBLAS's swizzled layout (128 x 4 tiles); the scale
+// buffer must be blockscaled_scale_bytes() long and zero-filled beforehand.
+inline int64_t blockscaled_group(QKind kind) { return kind == QKind::kNVFP4 ? 16 : 32; }
+inline int64_t blockscaled_scale_bytes(QKind kind, int64_t rows, int64_t cols) {
+  const int64_t sc = cols / blockscaled_group(kind);
+  return ((rows + 127) / 128) * 128 * ((sc + 3) / 4) * 4;
+}
+// `global_decode` (nvfp4 only) is read from device memory, so it can be
+// computed on the GPU without a host round trip.
+cudaError_t quantize_blockscaled(QKind kind, DType in_dtype, const void* x, int64_t rows, int64_t cols,
+                                 const float* global_decode, uint8_t* q, uint8_t* scales, int sm_count,
+                                 cudaStream_t stream);
+cudaError_t dequantize_blockscaled(QKind kind, DType out_dtype, const uint8_t* q, const uint8_t* scales,
+                                   float global_decode, void* out, int64_t rows, int64_t cols, int sm_count,
+                                   cudaStream_t stream);
 
 // out[0] += sum(grad[i]^2). Used for global gradient-norm clipping on the GPU path.
 cudaError_t grad_sq_norm_accumulate(DType dtype, const void* grad, int64_t n, float* out,

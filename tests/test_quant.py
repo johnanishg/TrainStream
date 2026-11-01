@@ -18,7 +18,7 @@ HP = dict(lr=2e-3, betas=(0.9, 0.95), weight_decay=0.05)
 
 
 # --------------------------------------------------------------------------- kernels and format
-@pytest.mark.parametrize("kind", Q.KINDS)
+@pytest.mark.parametrize("kind", Q.EXPAND_KINDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("where", ["cuda", "host"])
 def test_kernel_matches_reference(kind, dtype, where):
@@ -124,7 +124,7 @@ def trainable(m):
     return [p for p in m.parameters() if p.requires_grad]
 
 
-@pytest.mark.parametrize("kind", Q.KINDS)
+@pytest.mark.parametrize("kind", Q.EXPAND_KINDS)
 @pytest.mark.parametrize("placement", ["near", "far"])
 def test_quantized_training_equals_training_on_the_dequantized_weights(kind, placement):
     base = make()
@@ -225,11 +225,12 @@ def test_auto_refuses_when_even_nf4_cannot_fit(monkeypatch):
         trainstream.wrap(m, torch.optim.AdamW(trainable(m), **HP), offload=True, activation_offload=False)
 
 
-def test_prefer_speed_picks_nf4_when_it_fits_in_vram_and_bf16_would_stream(monkeypatch):
+def test_prefer_speed_picks_4bit_when_it_fits_in_vram_and_bf16_would_stream(monkeypatch):
+    kind = "nf4"  # NVFP4 compute stays opt-in: it quantizes activations too
     m = make()
     blocks = list(m.blocks)
     bf16 = sum(p.numel() * p.element_size() for b in blocks for p in b.parameters())
-    nf4 = sum(Q.packed_bytes(p.numel(), "nf4") if Q.eligible(p) else p.numel() * p.element_size()
+    nf4 = sum(Q.packed_bytes(p.numel(), kind, 64, p.shape) if Q.eligible(p, kind) else p.numel() * p.element_size()
               for b in blocks for p in b.parameters())
     outside = sum(p.numel() * p.element_size() for p in m.parameters()) - bf16
     # With a small budget V the planner keeps 0.6 V - outside - 96 MiB for block weights
@@ -240,7 +241,7 @@ def test_prefer_speed_picks_nf4_when_it_fits_in_vram_and_bf16_would_stream(monke
     m, opt = trainstream.wrap(m, torch.optim.AdamW(trainable(m), **HP), offload=True, activation_offload=False,
                               prefer="speed", check_memory=False)
     try:
-        assert trainstream.wrapper.unwrap_session(m).config["quantize"] == "nf4"
+        assert trainstream.wrapper.unwrap_session(m).config["quantize"] == kind
     finally:
         trainstream.unwrap(m)
     m2 = make()

@@ -78,7 +78,8 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     """Load a causal LM for TrainStream training, streaming its checkpoint.
 
     The model is built with no weights allocated, then its ``.safetensors``
-    files are read one tensor at a time. With ``quantize="int8"`` or ``"nf4"``
+    files are read one tensor at a time. With ``quantize="int8"``, ``"nf4"``,
+    ``"fp8"`` or ``"nvfp4"``
     (or ``"auto"`` when the bf16 weights would not fit in ``ram_fraction`` of
     the available RAM) every decoder-layer matrix is quantized the moment it
     is read, so a base larger than RAM never exists in full precision.
@@ -104,7 +105,7 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     if quantize is None or quantize is False:
         quantize = "none"
     if quantize not in ("auto", "none") + Q.KINDS:
-        raise ValueError(f"quantize must be 'auto', 'none', 'int8' or 'nf4', got {quantize!r}")
+        raise ValueError(f"quantize must be 'auto', 'none', 'int8', 'nf4', 'fp8' or 'nvfp4', got {quantize!r}")
     Q._check("nf4", quant_block_size)
     cfg = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
     for k, v in config_overrides.items():
@@ -114,7 +115,8 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     inside = {id(m) for layer in decoder_layers(model) for m in layer.modules()}
     params = dict(model.named_parameters())  # tied weights appear once
     elig = {n for n, p in params.items() if p.is_floating_point() and p.dim() >= 2 and p.numel() >= Q.MIN_NUMEL
-            and p.numel() % 2 == 0 and id(_owner(model, n)) in inside}
+            and p.numel() % 2 == 0 and id(_owner(model, n)) in inside
+            and (quantize not in Q.BLOCKSCALED_KINDS or (p.dim() == 2 and p.shape[1] % 32 == 0 and p.shape[0] % 16 == 0))}
     esize = torch.finfo(dtype).bits // 8
     total = sum(p.numel() for p in params.values()) * esize
     if quantize == "auto":
@@ -136,7 +138,7 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
         module, attr = _owner(model, name), name.rsplit(".", 1)[-1]
         old = module._parameters[attr]
         if quantize in Q.KINDS and name in elig:
-            nb = Q.packed_bytes(value.numel(), quantize, quant_block_size)
+            nb = Q.packed_bytes(value.numel(), quantize, quant_block_size, value.shape)
             qw = Q.make_quantized(value.to(dtype), quantize, quant_block_size,
                                   pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget)
             holder = nn.Parameter(torch.empty(tuple(value.shape), dtype=dtype), requires_grad=False)
@@ -144,7 +146,8 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
             module._parameters[attr] = holder
             qcount += 1
         else:
-            v = value.to(dtype) if value.is_floating_point() else value
+            # an owned copy: a view would keep the whole memory-mapped shard alive
+            v = value.to(dtype, copy=True) if value.is_floating_point() else value.clone()
             module._parameters[attr] = nn.Parameter(v.contiguous(), requires_grad=old.requires_grad and v.is_floating_point())
 
     if random_weights:

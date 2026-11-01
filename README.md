@@ -297,22 +297,112 @@ NF4 is bit-identical to bitsandbytes' NF4 (same codes, packing and scales); Trai
 | `trust_remote_code` | `True`, `False` | `False` |
 | `**config_overrides` | any config field, e.g. `num_hidden_layers=4` | — |
 
-### Other functions
+### `trainstream.quantize_model(model, quantize="nf4", *, blocks=None, block_size=64, pin_budget=None)`
+
+Quantizes the frozen block weights in place, one tensor at a time, before `wrap()`. Returns `{"tensors": count, "bytes_before": ..., "bytes_after": ...}`.
+
+| Argument | Accepted values | Default | What it does |
+|---|---|---|---|
+| `model` | `nn.Module` | — | the model; only frozen (`requires_grad=False`) weights of the block stack are quantized |
+| `quantize` | `"int8"`, `"nf4"`, `"fp8"`, `"nvfp4"` | `"nf4"` | the storage format (see the table above) |
+| `blocks` | `None`, list of layer modules | `None` | the layer stack to quantize; auto-detected with `find_blocks` |
+| `block_size` | even integer ≥ 2 | `64` | values per scale for int8 / NF4 (FP8 and NVFP4 use fixed 32 / 16) |
+| `pin_budget` | `None`, bytes | `None` (40 % of physical RAM) | how much of the quantized data may be page-locked; the rest stays pageable |
+
+### `trainstream.OffloadAdamW(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, *, ...)`
+
+AdamW with its moments and fp32 master weights in host RAM. `wrap()` creates or converts one for you; you can also build it yourself.
+
+| Argument | Accepted values | Default | What it does |
+|---|---|---|---|
+| `params` | parameters or param-group dicts, on a CUDA device | — | what it trains (frozen parameters are skipped) |
+| `lr`, `betas`, `eps`, `weight_decay` | as `torch.optim.AdamW` | `1e-3`, `(0.9, 0.999)`, `1e-8`, `1e-2` | same math as `torch.optim.AdamW` (decoupled weight decay) |
+| `mode` | `"cpu"`, `"gpu"` | `"cpu"` | `"cpu"`: gradients stream to RAM and host threads run AdamW; `"gpu"`: a CUDA kernel updates in place, reading the moments from pinned RAM (zero-copy) |
+| `max_grad_norm` | `None`, float | `None` | global-norm gradient clipping inside the optimizer |
+| `compute_grad_norm` | `True`, `False` | `False` | compute the global gradient norm without clipping (read it from `last_grad_norm`) |
+| `threads` | `None`, integer | `None` (all cores) | host AdamW worker threads |
+| `chunk_elems` | integer | `1048576` | elements per work chunk when a tensor's update is split across threads |
+| `accumulation_steps` | integer ≥ 1 | `1` | backward passes per `step()`; an extra backward before `step()` raises |
+| `eager` | `None`, `True`, `False` | `None` (on when there is no clipping or norm) | start each tensor's update as soon as its last gradient lands, during backward |
+| `pin_moments` | `None`, `True`, `False` | `None` (pin unless it would lock more than 40 % of RAM) | page-lock the moments in host RAM (`"gpu"` mode always pins) |
+| `moment_dtype` | `"float32"`, `"fp32"`, `"bfloat16"`, `"bf16"`, `torch.float32`, `torch.bfloat16` | `"float32"` | bf16 halves moment memory and traffic, with stochastic rounding |
+| `distributed` | `True`, `False` | `False` | data parallel: broadcast from rank 0, gradients averaged on the host (`"cpu"` mode only) |
+
+Methods and attributes: `step(closure=None)`, `zero_grad()`, `attach(model, guard=True)` (install the streaming hooks; `wrap()` does this), `detach()`, `synchronize()` (block until every queued update has landed), `stats()`, `state_dict()` / `load_state_dict()` (compatible with `torch.optim.AdamW`, plus the fp32 `master` weights), `add_param_group()`, `last_grad_norm`.
+
+### `trainstream.integrations.huggingface`
+
+| Function / class | Arguments | What it does |
+|---|---|---|
+| `TrainStreamTrainer(*args, trainstream=None, **kwargs)` | everything `transformers.Trainer` takes, plus `trainstream`: a dict of any `wrap()` option and `"chunked_loss"` (`True`/`False`, default `True`: the causal-LM loss is computed in chunks so the logits never exist) and `"loss_chunk_size"` (tokens per chunk, default `1024`) | a `Trainer` whose optimizer state, gradients and activations live in host RAM |
+| `wrap_hf(model, optimizer=None, **options)` | `options`: any `wrap()` option | `wrap()` with `blocks` preset to the decoder layers |
+| `load_model(name_or_path, ...)` | see the table above | streams a checkpoint, quantizing while it reads |
+| `TrainStreamCallback(optimizer)` | `optimizer`: an `OffloadAdamW` | for a stock `Trainer` that you gave an `OffloadAdamW`: prints the TrainStream metrics at each log step |
+
+How `TrainStreamTrainer` uses `TrainingArguments`:
+- `optim` must be an Adam/AdamW variant.
+- `learning_rate`, `adam_beta1`, `adam_beta2`, `adam_epsilon`, `weight_decay` and the decay / no-decay split carry over.
+- `max_grad_norm` is applied inside the optimizer.
+- `gradient_accumulation_steps` becomes `accumulation_steps`.
+- Use `bf16=True` or fp32; `fp16=True` is rejected.
+- It is single-GPU per process.
+
+Its log lines add these metrics:
+- `ts_vram_alloc_gb`, `ts_vram_peak_gb` (since the previous log)
+- `ts_pinned_gb`, `ts_host_state_gb`
+- `ts_d2h_gb` / `ts_h2d_gb` (bytes over PCIe since the previous log)
+
+### Losses
 
 | Function | Arguments |
 |---|---|
-| `trainstream.quantize_model(model, quantize="nf4", *, blocks=None, block_size=64, pin_budget=None)` | `quantize`: `"int8"`, `"nf4"`, `"fp8"`, `"nvfp4"`; returns `{"tensors", "bytes_before", "bytes_after"}` |
-| `TrainStreamTrainer(..., trainstream={...})` | any `wrap()` option, plus `"chunked_loss"` (`True`/`False`, default `True`) and `"loss_chunk_size"` (default `1024`) |
-| `trainstream.OffloadAdamW(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, *, mode="cpu", max_grad_norm=None, accumulation_steps=1, moment_dtype="float32", ...)` | `mode`: `"cpu"`, `"gpu"`; `moment_dtype`: `"float32"`, `"bfloat16"` |
-| `trainstream.chunked_cross_entropy(hidden, weight, targets, bias=None, *, chunk_size=1024, ignore_index=-100, reduction="mean", num_items=None)` | `reduction`: `"mean"`, `"sum"`; `causal_lm_loss` takes the same and shifts labels |
-| `trainstream.profile_hardware(device=None, quick=True, force=False)` | returns a `HardwareProfile` |
-| `trainstream.memory_report(model)`, `trainstream.unwrap(model)` | a wrapped model |
+| `trainstream.chunked_cross_entropy(hidden, weight, targets, bias=None, *, chunk_size=1024, ignore_index=-100, reduction="mean", num_items=None)` | cross-entropy of `hidden @ weight.T (+ bias)` without building the logits. `hidden` `[..., D]` (after the last norm), `weight` `[V, D]`, `bias` `[V]` or `None`, `targets` class indices. `chunk_size`: tokens per chunk. `ignore_index`: positions that don't count. `reduction`: `"mean"` or `"sum"`. `num_items`: divide by this instead of the counted positions (as Hugging Face does with gradient accumulation) |
+| `trainstream.causal_lm_loss(hidden, weight, labels, bias=None, **kwargs)` | the next-token loss as Hugging Face computes it (labels shifted by one); `kwargs` as above |
+
+### Inspection and utilities
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `trainstream.memory_report(model=None)` | a wrapped model, or `None` | for a wrapped model, a dict with these keys: `"events"` (the decision log), `"gpu"` (`allocated`, `reserved`, `peak_allocated`), `"pinned"`, `"pinned_by_tag"`, `"transfers"`, `"optimizer"`, `"resident"`, and when used, `"attention"` (`mode`, `backend`, `timings_ms`), `"activations"` (`policy`, `offloaded_blocks`, `recompute_blocks`, `decision`, ...), `"params"` (`paged_blocks`, `quantize`, `quantized_blocks`, ...) and `"plan"` (`target_vram`, `settled`, `history`, `budget`). Without a model: `"gpu"`, `"pinned"`, `"pinned_by_tag"` |
+| `trainstream.unwrap(model)` | a wrapped model | loads every weight back into VRAM, removes the hooks, returns the model |
+| `trainstream.profile_hardware(device=None, quick=True, force=False, threads=None)` | `device`: GPU to measure (default the current one). `quick`: shorter benchmarks. `force`: re-measure instead of using the cache. `threads`: host threads for the AdamW benchmark | a `HardwareProfile` (PCIe bandwidth, matmul and host AdamW throughput; `.summary()` prints it) |
+| `trainstream.pinned_stats()` | — | page-locked allocator counters, plus live bytes per tag in `"by_tag"` |
+| `trainstream.transfer_stats(device=None)` | `device`: GPU (default the current one) | cumulative bytes and copies on TrainStream's D2H and H2D streams |
+| `trainstream.find_blocks(model)` | a model | the repeated layer stack `wrap()` would use (the largest `ModuleList` / `Sequential` of ≥ 2 same-type children), or `[]` |
+
+The session behind a wrapped model is `model._trainstream_session` (`trainstream.TrainStreamSession`):
+- `.adapting`: `True` while it is still tuning itself
+- `.events`: the decision log
+- `.config`: the options in effect
+- `.steps`: optimizer steps so far
+
+### `trainstream.ActivationOffloader(model, blocks, offload="auto", *, ...)`: activation paging on its own
+
+`wrap()` creates this for you. Use it directly to page the activations of any model with a layer stack, without the rest of TrainStream. Call `.remove()` to take it off.
+
+| Argument | Accepted values | Default | What it does |
+|---|---|---|---|
+| `model`, `blocks` | the model and its layer stack | — | whose saved activations are paged |
+| `offload` | `"auto"`, `True`, `False`, fraction 0.0–1.0, set / list of block indices | `"auto"` | which blocks' activations go to host RAM; `"auto"` calibrates, then halves until the slowdown is within `max_slowdown` |
+| `min_bytes` | bytes | `1048576` | smaller tensors stay on the GPU |
+| `prefetch_depth` | integer ≥ 1 | `1` | blocks fetched back ahead of backward |
+| `calibrate_steps` | integer ≥ 2 | `3` | steps measured with nothing paged before tuning |
+| `profile` | `None`, `HardwareProfile` | `None` | link model used to size the first guess |
+| `max_slowdown` | float | `0.15` | how much slower `"auto"` may make a step |
+| `tune_window` | integer ≥ 1 | `3` | steps measured per setting while tuning (the first after a change is discarded) |
+| `max_inflight_bytes` | bytes | `1073741824` | VRAM held by copies still crossing PCIe |
+| `recompute` | `"auto"`, `True`, `False`, fraction, list of block indices | `"auto"` | blocks to recompute in backward instead of keeping or paging |
+| `reserved_link_bytes`, `memory_pressure`, `vram_target` | set by `wrap()` | `(0, 0)`, `False`, `None` | PCIe already used by the optimizer per step; whether weights page; the VRAM target for the probe step |
+
+Attributes: `.policy` (per block: `"keep"`, `"offload"` or `"recompute"`), `.decision`, `.stats`, `.events`.
+
+`ParamPager`, `GradientOffloader`, `ParamReadyHooks` and `HardwareProfile` are also exported. `wrap()` and `OffloadAdamW` build and use them internally; they aren't meant to be constructed by hand.
 
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
-| `TRAINSTREAM_CACHE_DIR` | where builds are cached (default `%LOCALAPPDATA%\trainstream\build`, Linux `~/.cache/trainstream`) |
+| `TRAINSTREAM_CACHE_DIR` | where builds are cached (default `%LOCALAPPDATA%\trainstream\build`; Linux `$XDG_CACHE_HOME/trainstream`, else `~/.cache/trainstream`) |
 | `TRAINSTREAM_VERBOSE_BUILD=1` | show compiler output |
 | `TORCH_CUDA_ARCH_LIST` | GPU architectures to compile for (default: the GPUs present) |
 | `CUDA_HOME` / `CUDA_PATH` | CUDA toolkit to use, if it isn't found automatically |

@@ -95,10 +95,17 @@ at::Tensor pinned_empty(const std::vector<int64_t>& sizes, at::ScalarType dtype,
                         const std::string& tag, bool mapped, bool cached);
 std::map<std::string, int64_t> pinned_stats();
 std::map<std::string, int64_t> pinned_tag_bytes();
-// (timestamp_ms, op, bytes, tag) — op is one of "alloc", "free", "hit", "release".
+// (timestamp_ms, op, bytes, tag) — op is one of "alloc", "free", "hit",
+// "release", "arena" (served from the arena) or "slab" (the arena grew).
 std::vector<std::tuple<double, std::string, int64_t, std::string>> pinned_log(int64_t limit);
 void pinned_empty_cache();
 void pinned_set_cache_limit(int64_t bytes);
+// Pinned arena: page-locked slabs (`slab` bytes each; <= 0 keeps the current
+// size), `bytes` of them reserved now, from which every non-mapped block is
+// then carved. Grows on demand up to `cap` (at least `bytes`); returns the
+// bytes reserved so far.
+int64_t pinned_reserve(int64_t bytes, int64_t slab, int64_t cap);
+void pinned_arena_trim();  // give empty slabs back to the OS
 void* pinned_device_pointer(const at::Tensor& t);  // for mapped allocations
 
 // ---------------------------------------------------------------------------
@@ -118,6 +125,14 @@ EventPtr h2d_async(const at::Tensor& dst, const at::Tensor& src, const EventPtr&
 std::tuple<at::Tensor, EventPtr> h2d_alloc_async(const at::Tensor& src, const EventPtr& after,
                                                  int device, const std::vector<int64_t>& sizes = {},
                                                  const std::vector<int64_t>& strides = {});
+// H2D from pageable (not page-locked) host tensors: staged with all CPU cores
+// into one of `slots` pinned slots, then copied on the H2D stream after
+// `after`. The host blocks only for the slot's previous copy.
+EventPtr h2d_bounce_async(const std::vector<at::Tensor>& dsts, const std::vector<at::Tensor>& srcs,
+                          const EventPtr& after, int64_t slots);
+// Pinned host pages copied back to back into the start of a contiguous device
+// tensor on the H2D stream, after `after` (the paged KV cache's gather).
+EventPtr h2d_pages_async(const at::Tensor& dst, const std::vector<at::Tensor>& pages, const EventPtr& after);
 std::map<std::string, int64_t> transfer_stats(int device);
 
 // Expand blockwise-quantized weights (kind "nf4" or "int8") into `dst` on the
@@ -134,12 +149,35 @@ int64_t shm_reducer_bytes(int64_t world, int64_t capacity);
 void shm_allreduce(const at::Tensor& buf, const at::Tensor& segment, int64_t rank, int64_t world, int64_t capacity,
                    int64_t seq);
 
+// Peer GPUs (see peer.cpp). Topology: one row per ordered pair of visible
+// devices (src, dst, can_access, performance_rank, native_atomics, gbps — the
+// measured dst <- src copy rate when probe_bytes > 0).
+std::vector<std::map<std::string, double>> peer_topology(int64_t probe_bytes);
+std::string pci_bus_id(int device);
+// A cudaMalloc'd byte pool on `device` and its CUDA IPC handle.
+std::tuple<at::Tensor, std::vector<uint8_t>> peer_pool(int64_t bytes, int device);
+int64_t peer_open(const std::vector<uint8_t>& handle, int device);  // -> device address in this process
+void peer_close(int64_t ptr, int device);
+// dst (this GPU) <- [src_ptr + offset, + dst.nbytes()) on src_device, on the H2D stream after `after`.
+EventPtr peer_copy_async(const at::Tensor& dst, int64_t src_ptr, int64_t offset, int src_device,
+                         const EventPtr& after);
+// Measured GB/s of copies into `device` from an opened peer address (no context on the peer GPU).
+double peer_copy_gbps(int64_t src_ptr, int src_device, int64_t bytes, int device);
+
 // Block-scaled formats ("nvfp4", "fp8" = MXFP8) that Blackwell tensor cores
 // multiply directly (torch's scaled_mm). quantize_blockscaled runs on the
 // current stream and returns (packed values, swizzled scales); nvfp4 also
-// takes a 1-element device tensor with the global decode scale.
+// takes a 1-element device tensor with the global decode scale and, optionally,
+// a uint8 column mask (non-zero: quantize that column as 0).
 std::tuple<at::Tensor, at::Tensor> quantize_blockscaled(const at::Tensor& x, const std::string& kind,
-                                                        const c10::optional<at::Tensor>& global_decode);
+                                                        const c10::optional<at::Tensor>& global_decode,
+                                                        const c10::optional<at::Tensor>& mask);
+// Per-column max |x| of a 2-D CUDA tensor, as float32 [cols] (current stream).
+at::Tensor col_absmax(const at::Tensor& x);
+// Columns `idx` of an nvfp4-packed [rows, cols] matrix, expanded to `dtype`
+// as a [rows, idx.numel()] tensor (current stream).
+at::Tensor dequantize_blockscaled_cols(const at::Tensor& q, const at::Tensor& scales, const at::Tensor& idx,
+                                       int64_t rows, int64_t cols, double global_decode, at::ScalarType dtype);
 // Expand into a contiguous 2-D `dst` on the current stream.
 void dequantize_blockscaled(const at::Tensor& dst, const at::Tensor& q, const at::Tensor& scales,
                             const std::string& kind, double global_decode);

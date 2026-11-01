@@ -219,6 +219,7 @@ class QuantizedWeight:
     dev_q: Optional[torch.Tensor] = None
     dev_absmax: Optional[torch.Tensor] = None
     global_decode: float = 1.0
+    outliers: float = 0.0  # nvfp4 tensor-core path: input channels kept in bf16 (trainstream.lowp)
     _gdev: Optional[torch.Tensor] = None
 
     @property

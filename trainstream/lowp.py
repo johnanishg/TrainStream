@@ -16,6 +16,20 @@ and FP8 training recipes).
 Support is probed once per device and kind with a tiny matmul; elsewhere the
 same weights are expanded before use like nf4 / int8, so results only differ
 by the activation quantization.
+
+Outlier channels (nvfp4, ``outliers`` > 0). A few hidden dimensions of an LLM's
+activations are far larger than the rest; one of them sets the scale of its
+16-value block and rounds the other 15 to zero. Per call, on the GPU and
+without a host sync: the per-channel absmax picks the largest ``outliers``
+fraction of input channels; they are quantized as 0 (so the remaining values,
+and the tensor scale, follow the ordinary activations) and multiplied in
+bf16 against the same weight columns instead:
+
+    y = scaled_mm(nvfp4(x without them), W) + x[:, idx] @ W[:, idx].T
+
+Both terms use the stored weight, so the input gradient is unchanged. The
+weight itself stays 4-bit: this removes the activation part of NVFP4's error,
+not the weight part.
 """
 
 from __future__ import annotations
@@ -54,6 +68,24 @@ def _quantize(x2: torch.Tensor, kind: str):
     g = global_decode_scale(x2) if kind == "nvfp4" else None
     q, s = _C.quantize_blockscaled(x2, kind, g)
     return q, s, g
+
+
+def outlier_count(fraction: float, K: int) -> int:
+    """Input channels kept in bf16 for a fraction (0 = none; at least one otherwise)."""
+    if not fraction or fraction <= 0:
+        return 0
+    return min(K - 1, max(1, int(round(fraction * K))))
+
+
+def _quantize_split(x2: torch.Tensor, k: int):
+    """nvfp4 of x2 without its k largest channels: (q, scales, global_decode, idx)."""
+    amax = _C.col_absmax(x2)
+    vals, idx = torch.topk(amax, k + 1)
+    idx = idx[:k]
+    g = (vals[k:].clamp_min(1e-12) / (6.0 * 448.0)).contiguous()  # absmax of the channels that stay
+    mask = torch.zeros(x2.shape[1], dtype=torch.uint8, device=x2.device).index_fill_(0, idx, 1)
+    q, s = _C.quantize_blockscaled(x2, "nvfp4", g, mask)
+    return q, s, g, idx
 
 
 def native_supported(kind: str, device) -> bool:
@@ -110,7 +142,11 @@ class QuantLinearFn(torch.autograd.Function):
         if x2.dtype not in _FLOAT_DTYPES:
             x2 = x2.float()
         wq, ws = packed_on_device(qw, x.device)
-        xq, xs, xg = _quantize(x2, qw.kind)
+        k = outlier_count(qw.outliers, K) if qw.kind == "nvfp4" else 0
+        if k:
+            xq, xs, xg, idx = _quantize_split(x2.contiguous(), k)
+        else:
+            xq, xs, xg = _quantize(x2, qw.kind)
         one = None
         if qw.kind == "nvfp4":
             wg = qw.global_tensor(x.device)
@@ -118,6 +154,9 @@ class QuantLinearFn(torch.autograd.Function):
             one = torch.ones(1, device=x.device)
             xg = wg = one
         y = _mm(qw.kind, xq, xs, xg, wq, ws, wg, out_dtype)
+        if k:  # the outlier channels, in bf16 against the same (stored) weight columns
+            w_out = _C.dequantize_blockscaled_cols(wq, ws, idx, N, K, qw.global_decode, out_dtype)
+            y.addmm_(x2.index_select(1, idx).to(out_dtype), w_out.t())
         if bias is not None:
             y = y + bias.to(y.dtype)
         ctx.qw = qw
@@ -154,9 +193,10 @@ def _forward(self, x):
     return QuantLinearFn.apply(x, qw, self.bias, self.weight)
 
 
-def install(blocks, device) -> List[nn.Module]:
+def install(blocks, device, outliers: float = 0.0) -> List[nn.Module]:
     """Route the frozen block-scaled Linears of `blocks` through tensor-core
-    matmuls where this GPU supports them. Returns the patched modules."""
+    matmuls where this GPU supports them; nvfp4 ones keep the `outliers`
+    fraction of input channels in bf16. Returns the patched modules."""
     patched = []
     for b in blocks:
         for m in b.modules():
@@ -166,6 +206,7 @@ def install(blocks, device) -> List[nn.Module]:
             if qw is None or not qw.blockscaled or not native_supported(qw.kind, device):
                 continue
             qw.native = True
+            qw.outliers = float(outliers) if qw.kind == "nvfp4" else 0.0
             m.forward = types.MethodType(_forward, m)
             patched.append(m)
     return patched
@@ -176,5 +217,6 @@ def uninstall(modules) -> None:
         qw = quantized_of(m.weight)
         if qw is not None:
             qw.native = False
+            qw.outliers = 0.0
         if "forward" in m.__dict__:
             del m.forward

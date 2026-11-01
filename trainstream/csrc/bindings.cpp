@@ -84,6 +84,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("pinned_log", &pinned_log, py::arg("limit") = 256);
   m.def("pinned_empty_cache", &pinned_empty_cache, nogil());
   m.def("pinned_set_cache_limit", &pinned_set_cache_limit);
+  m.def("pinned_reserve", &pinned_reserve, py::arg("bytes"), py::arg("slab") = 0, py::arg("cap") = 0, nogil());
+  m.def("pinned_arena_trim", &pinned_arena_trim, nogil());
 
   // ---- transfers ------------------------------------------------------------
   m.def("d2h_async", &d2h_async, py::arg("dst"), py::arg("src"));
@@ -91,15 +93,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("h2d_alloc_async", &h2d_alloc_async, py::arg("src"), py::arg("after") = EventPtr(),
         py::arg("device") = -1, py::arg("sizes") = std::vector<int64_t>{},
         py::arg("strides") = std::vector<int64_t>{});
+  m.def("h2d_bounce_async", &h2d_bounce_async, py::arg("dsts"), py::arg("srcs"), py::arg("after") = EventPtr(),
+        py::arg("slots") = 3, nogil());
+  m.def("h2d_pages_async", &h2d_pages_async, py::arg("dst"), py::arg("pages"), py::arg("after") = EventPtr());
   m.def("transfer_stats", &transfer_stats, py::arg("device") = -1);
   m.def("dequantize_async", &dequantize_async, py::arg("dst"), py::arg("q"), py::arg("absmax"), py::arg("kind"),
         py::arg("block"), py::arg("after") = EventPtr());
+  m.def("peer_topology", &peer_topology, py::arg("probe_bytes") = 0, nogil());
+  m.def("peer_copy_gbps", &peer_copy_gbps, py::arg("src_ptr"), py::arg("src_device"), py::arg("bytes"),
+        py::arg("device") = -1, nogil());
+  m.def("pci_bus_id", &pci_bus_id, py::arg("device"));
+  m.def("peer_pool",
+        [](int64_t bytes, int device) {
+          auto [t, raw] = peer_pool(bytes, device);
+          return py::make_tuple(t, py::bytes(reinterpret_cast<const char*>(raw.data()), raw.size()));
+        },
+        py::arg("bytes"), py::arg("device") = -1);
+  m.def("peer_open",
+        [](py::bytes handle, int device) {
+          const std::string s = handle;
+          return peer_open(std::vector<uint8_t>(s.begin(), s.end()), device);
+        },
+        py::arg("handle"), py::arg("device") = -1);
+  m.def("peer_close", &peer_close, py::arg("ptr"), py::arg("device") = -1);
+  m.def("peer_copy_async", &peer_copy_async, py::arg("dst"), py::arg("src_ptr"), py::arg("offset"),
+        py::arg("src_device"), py::arg("after") = EventPtr());
   m.def("shared_host", &shared_host, py::arg("name"), py::arg("bytes"), py::arg("create"), py::arg("pin") = true);
   m.def("shm_reducer_bytes", &shm_reducer_bytes, py::arg("world"), py::arg("capacity"));
   m.def("shm_allreduce", &shm_allreduce, py::arg("buf"), py::arg("segment"), py::arg("rank"), py::arg("world"),
         py::arg("capacity"), py::arg("seq"), nogil());
   m.def("quantize_blockscaled", &quantize_blockscaled, py::arg("x"), py::arg("kind"),
-        py::arg("global_decode") = c10::optional<at::Tensor>());
+        py::arg("global_decode") = c10::optional<at::Tensor>(), py::arg("mask") = c10::optional<at::Tensor>());
+  m.def("col_absmax", &col_absmax, py::arg("x"));
+  m.def("dequantize_blockscaled_cols", &dequantize_blockscaled_cols, py::arg("q"), py::arg("scales"), py::arg("idx"),
+        py::arg("rows"), py::arg("cols"), py::arg("global_decode"), py::arg("dtype") = at::kBFloat16);
   m.def("dequantize_blockscaled", &dequantize_blockscaled, py::arg("dst"), py::arg("q"), py::arg("scales"),
         py::arg("kind"), py::arg("global_decode") = 1.0);
   m.def("dequantize_blockscaled_async", &dequantize_blockscaled_async, py::arg("dst"), py::arg("q"),

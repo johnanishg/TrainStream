@@ -21,6 +21,7 @@ core ``trainstream`` package does not.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Dict, Optional
 
 import torch
@@ -29,7 +30,8 @@ from torch import nn
 import trainstream
 from trainstream import _C
 from trainstream.hooks import find_blocks
-from trainstream.losses import causal_lm_loss
+from trainstream.kvcache import PagedKVCache
+from trainstream.losses import causal_lm_loss, sequence_logprobs
 from trainstream.optimizer import OffloadAdamW
 from trainstream.wrapper import unwrap_session
 
@@ -227,6 +229,139 @@ class _CaptureHidden:
 
     def __exit__(self, *exc):
         del self.head.forward
+
+
+def causal_lm_logprobs(model: nn.Module, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
+                       attention_mask: Optional[torch.Tensor] = None, *, chunk_size: int = 1024,
+                       average: bool = False, **model_kwargs) -> torch.Tensor:
+    """Log-probability of each sequence's labels under a causal LM, shape [B].
+
+    Labels follow the Hugging Face convention (the input ids, shifted inside;
+    -100 marks tokens that do not count, e.g. the prompt). The log-probs come
+    from the final hidden states a chunk of tokens at a time, so the
+    [batch, seq, vocab] logits never exist; models with soft-capped or scaled
+    logits fall back to the model's own logits. Differentiable (the policy side
+    of DPO); see reference_logprobs for the reference side.
+    """
+    labels = input_ids if labels is None else labels
+    head = lm_head_of(model)
+    if head is None:
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs).logits
+        t = labels[:, 1:].to(logits.device)
+        valid = t != -100
+        lp = torch.log_softmax(logits[:, :-1].float(), dim=-1).gather(-1, t.clamp_min(0)[..., None]).squeeze(-1)
+        out = (lp * valid).sum(-1)
+        return out / valid.sum(-1).clamp_min(1) if average else out
+    with _CaptureHidden(head) as cap:
+        model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
+    return sequence_logprobs(cap.hidden, head.weight, labels.to(cap.hidden.device), head.bias,
+                             chunk_size=chunk_size, average=average)
+
+
+@torch.no_grad()
+def reference_logprobs(model: nn.Module, batches, *, chunk_size: int = 1024, average: bool = False) -> torch.Tensor:
+    """DPO's reference log-probabilities, without a second model.
+
+    For a PEFT model the reference is the same (paged, quantized) base with
+    the adapters switched off, so it costs no extra weights. `batches` is an
+    iterable of dicts with ``input_ids`` and optionally ``labels`` and
+    ``attention_mask``; runs in eval mode (no dropout) and returns one float32
+    CPU tensor with the log-prob of every sequence, in order. Compute it once
+    for the dataset before training (one forward pass over it) instead of a
+    second forward every step.
+    """
+    disable = getattr(model, "disable_adapter", None)
+    ctx = disable() if callable(disable) else contextlib.nullcontext()
+    was_training = model.training
+    model.eval()
+    out = []
+    try:
+        with ctx:
+            for batch in batches:
+                lp = causal_lm_logprobs(model, batch["input_ids"], batch.get("labels"), batch.get("attention_mask"),
+                                        chunk_size=chunk_size, average=average)
+                out.append(lp.float().cpu())
+    finally:
+        model.train(was_training)
+    return torch.cat(out) if out else torch.empty(0)
+
+
+try:  # the per-layer Cache API (transformers >= 4.56)
+    from transformers.cache_utils import Cache as _HFCache, CacheLayerMixin as _HFCacheLayer
+except ImportError:  # pragma: no cover - older transformers
+    _HFCache = _HFCacheLayer = None
+
+
+if _HFCacheLayer is not None:
+    class _PagedKVLayer(_HFCacheLayer):
+        """One attention layer of a TrainStreamCache (delegates to PagedKVCache)."""
+
+        is_sliding = False
+        is_croppable = False
+        supports_early_init = False
+
+        def __init__(self, kv: PagedKVCache, idx: int):
+            super().__init__()
+            self.kv = kv
+            self.idx = idx
+
+        def lazy_initialization(self, key_states, value_states) -> None:
+            self.dtype, self.device = key_states.dtype, key_states.device
+            self.is_initialized = True
+
+        def update(self, key_states, value_states, *args, **kwargs):
+            if not self.is_initialized:
+                self.lazy_initialization(key_states, value_states)
+            self.keys, self.values = self.kv.update(self.idx, key_states, value_states)
+            return self.keys, self.values
+
+        def get_mask_sizes(self, query_length: int):
+            return self.get_seq_length() + query_length, 0
+
+        def get_seq_length(self) -> int:
+            return self.kv.seq_length(self.idx)
+
+        def get_max_length(self) -> int:
+            return -1
+
+        def reset(self) -> None:
+            self.kv.reset()
+            self.keys = self.values = None
+            self.is_initialized = False
+
+        def _unsupported(self, *args, **kwargs):
+            raise NotImplementedError("TrainStreamCache does not support beam search or batch reshuffling; "
+                                      "use sampling or greedy decoding")
+
+        reorder_cache = batch_repeat_interleave = batch_select_indices = crop = _unsupported
+
+
+class TrainStreamCache(_HFCache if _HFCache is not None else object):
+    """A Hugging Face ``Cache`` whose keys and values live partly in host RAM
+    (``trainstream.PagedKVCache``): as many layers as fit in a share of the free
+    VRAM stay resident, the others are paged in while earlier layers run.
+
+        cache = TrainStreamCache(model, max_tokens=prompt_len + max_new_tokens)
+        out = model.generate(**inputs, past_key_values=cache, max_new_tokens=...)
+
+    For decoder models with full attention in every layer (Llama, Qwen2, Mistral
+    without sliding windows, ...); greedy decoding or sampling, no beam search.
+    Call ``cache.reset()`` (or make a new one) before the next batch of prompts.
+    """
+
+    def __init__(self, model: nn.Module, max_tokens: int, *, resident_layers="auto", page_tokens: int = 256,
+                 vram_fraction: float = 0.5):
+        if _HFCache is None:
+            raise ImportError("TrainStreamCache needs transformers >= 4.56 (per-layer Cache API)")
+        base = model.get_base_model() if hasattr(model, "get_base_model") else model
+        cfg = base.config.get_text_config() if hasattr(base.config, "get_text_config") else base.config
+        types = getattr(cfg, "layer_types", None) or []
+        if any(t != "full_attention" for t in types) or getattr(cfg, "use_sliding_window", False):
+            raise ValueError("TrainStreamCache supports models with full attention in every layer; this one has "
+                             f"sliding-window or other layer types ({sorted(set(types))})")
+        self.kv = PagedKVCache(int(cfg.num_hidden_layers), max_tokens, resident_layers=resident_layers,
+                               page_tokens=page_tokens, vram_fraction=vram_fraction)
+        super().__init__(layers=[_PagedKVLayer(self.kv, i) for i in range(self.kv.num_layers)])
 
 
 class TrainStreamMetrics:

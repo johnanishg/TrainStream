@@ -129,6 +129,8 @@ def main():
                     help="recompute activations in backward instead of streaming them (auto: when PCIe is the bottleneck)")
     ap.add_argument("--attention", default="auto", choices=["auto", "cudnn", "efficient", "flash", "math", "default"],
                     help="attention backend (auto: the fastest measured one; default: PyTorch's own order)")
+    ap.add_argument("--outliers", type=float, default=0.0,
+                    help="with --quantize nvfp4: fraction of input channels multiplied in bf16 (e.g. 0.01)")
     ap.add_argument("--out", default=None)
     _live.add_args(ap)
     args = ap.parse_args()
@@ -183,7 +185,8 @@ def main():
         trainer = TrainStreamTrainer(model=model, args=targs, train_dataset=ds, callbacks=callbacks,
                                      trainstream={"quantize": args.quantize, "prefer": args.prefer,
                                                   "recompute": {"auto": "auto", "on": True, "off": False}[args.recompute],
-                                                  "attention": None if args.attention == "default" else args.attention})
+                                                  "attention": None if args.attention == "default" else args.attention,
+                                                  "outliers": args.outliers})
     status = "finished"
     try:
         trainer.train()

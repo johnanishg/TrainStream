@@ -9,6 +9,25 @@ model, optimizer = trainstream.wrap(model, optimizer)
 
 TrainStream is a C++/CUDA extension for PyTorch. It uses only the C++ standard library, the CUDA runtime and PyTorch's ATen: no DeepSpeed, no bitsandbytes. Updates match `torch.optim.AdamW` (max parameter difference ≈3·10⁻⁷ after 20 steps), and activation and weight paging are bit-exact.
 
+## What's new in 0.6
+
+- **Outlier channels in bf16 for NVFP4** (`outliers=`). A few hidden dimensions of an LLM's activations are far larger than the rest. In NVFP4, one of them sets the scale of its 16-value block and rounds the other 15 to zero. With `outliers=0.01`, each matmul picks its largest 1% of input channels on the GPU (no host sync). It quantizes them as zero and multiplies them in bf16 against the same weight columns: `y = scaled_mm(nvfp4(x without them), W) + x[:, idx] @ W[:, idx].T`. The input gradient is unchanged. This removes the activation part of NVFP4's error, not the weight part: the weights stay 4-bit. `benchmarks/quality.py --formats nvfp4-w nvfp4 nvfp4-o` measures the split (`nvfp4-w` = 4-bit weights only). Off by default until that measurement is in.
+- **DPO without a second model or four logit tensors.**
+  - `sequence_logprobs()` gives per-sequence log-probabilities from the hidden states in chunks, and `dpo_loss()` combines them.
+  - `reference_logprobs()` (Hugging Face) runs the reference as the same paged or quantized base with the LoRA adapters switched off, once before training.
+  - See `examples/dpo_lora.py`.
+- **Paged KV cache for generation during training** (online DPO, GRPO, PPO).
+  - `PagedKVCache` keeps as many layers' keys and values in VRAM as a budget allows. The others go to pinned host pages, which are copied back into a device slot on TrainStream's H2D stream while the earlier layers run.
+  - `TrainStreamCache` plugs it into `model.generate()`.
+  - VRAM holds the resident layers plus two or three one-layer slots.
+- **Pinned host arena** (`host_arena="auto"`).
+  - Page-locked memory is reserved in slabs at `wrap()` and carved into blocks, so a training step never page-locks memory, which stalls on Windows (WDDM).
+  - Frozen weights that don't fit the page-lock budget no longer go through the driver's synchronous pageable copy. All CPU cores stage them into a ring of pinned slots, which are then copied asynchronously.
+- **Peer GPUs** (`peer="auto"`, data parallel on one machine).
+  - When the GPUs can read each other's memory (NVLink, or PCIe P2P where the driver allows it), the frozen blocks every rank streams are split among the GPUs' VRAM. Each rank maps the others' pools through CUDA IPC and copies GPU to GPU instead of from host RAM.
+  - Where peer access or CUDA IPC isn't available it stays off, and the events say why. Two GeForce cards in one machine usually report no P2P.
+  - Tested with two processes sharing one GPU on Windows 11 and WSL2: the pools mapped through CUDA IPC, and training matched host streaming bit for bit. Copies between two real GPUs are untested.
+
 ## What's new in 0.5
 
 - **FP8 and NVFP4 on tensor cores.** `quantize="fp8"` or `"nvfp4"` store frozen weights block-scaled. On Blackwell GPUs (RTX 50-series, B200) the forward matmuls run on 8- and 4-bit tensor cores through PyTorch's own `scaled_mm`: 0.188 ms for a 512×5120×13824 FP4 matmul against 1.215 ms in bf16. Real Qwen2.5-14B LoRA (Windows, same session): 0.586 s/step with NVFP4 against 0.642 s with NF4 at the same memory. NVFP4 also quantizes activations, so it costs more quality (perplexity +5.2 % on 14B, +11 % on 1.5B, against +3.1 % / +5.9 % for NF4). It stays opt-in: `prefer="speed"` still picks NF4.
@@ -98,7 +117,7 @@ Offloading costs throughput when a model already fits, which is why `offload="au
 - The CUDA toolkit matching PyTorch's CUDA major version, and a C++ compiler (Visual Studio 2022+ Build Tools with "Desktop development with C++" on Windows, GCC 11+ on Linux)
 - Optional, for the Hugging Face integration: `transformers`, `accelerate`, and `peft` for LoRA (all three come with `trainstream[hf]`)
 
-Tested on an RTX 5090 Laptop GPU with Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14), where all 171 tests pass with no warnings, and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1, CUDA 13.3, GCC 13.3, Python 3.12), where 170 pass and 1 is skipped (the bitsandbytes comparison, without bitsandbytes installed), both from a wheel installed with pip and with uv. Installs were checked with pip and with uv 0.13 (`uv pip install`, `uv sync` in a project, and building from the sdist) on both. Native Linux and other GPUs are untested.
+Tested on an RTX 5090 Laptop GPU with Windows 11 (PyTorch 2.14.1, CUDA 13.4, MSVC, Python 3.14), where all 222 tests pass with no warnings, and Ubuntu 24.04 under WSL2 (PyTorch 2.14.1, CUDA 13.3, GCC 13.3, Python 3.12), where all 222 pass as well (with bitsandbytes 0.50.2 installed for the NF4 comparison), both from a wheel installed with pip and with uv. Installs were checked with pip and with uv 0.13 (`uv pip install`, `uv sync` in a project, and building from the sdist) on both. Native Linux and other GPUs are untested.
 
 ## Install
 
@@ -215,6 +234,34 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 model, optimizer = trainstream.wrap(MyModel().cuda(), torch.optim.AdamW(...))   # detected automatically
 ```
 
+### DPO with LoRA
+
+```python
+import trainstream
+from trainstream.integrations.huggingface import causal_lm_logprobs, load_model, reference_logprobs, wrap_hf
+
+model = peft.get_peft_model(load_model("Qwen/Qwen2.5-7B", quantize="nf4"), lora_config)
+model, optimizer = wrap_hf(model, torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=5e-6))
+pairs = [(chosen, rejected), ...]   # dicts with input_ids and labels (-100 on the prompt), batch_size rows each
+# adapters off: the same base is the reference; computed once, up front
+ref = reference_logprobs(model, [b for pair in pairs for b in pair]).split(batch_size)
+for k, (chosen, rejected) in enumerate(pairs):
+    pc = causal_lm_logprobs(model, chosen["input_ids"], chosen["labels"])
+    pr = causal_lm_logprobs(model, rejected["input_ids"], rejected["labels"])
+    loss, chosen_reward, rejected_reward = trainstream.dpo_loss(pc, pr, ref[2 * k], ref[2 * k + 1], beta=0.1)
+    loss.backward(); optimizer.step(); optimizer.zero_grad()
+```
+
+### Generating with a paged KV cache
+
+```python
+from trainstream.integrations.huggingface import TrainStreamCache
+
+cache = TrainStreamCache(model, max_tokens=prompt_len + 512)   # resident layers chosen from free VRAM
+out = model.generate(**inputs, max_new_tokens=512, do_sample=True, past_key_values=cache)
+cache.reset()                                                  # before the next batch of prompts
+```
+
 ### Inspecting what it decided
 
 ```python
@@ -251,6 +298,9 @@ model._trainstream_session.adapting   # True while it is still tuning itself
 | `prefer` | `"exact"`, `"speed"` | `"exact"` | `"speed"` lets `quantize="auto"` choose NF4 when it keeps every layer in VRAM |
 | `recompute` | `"auto"`, `True`, `False`, fraction 0.0–1.0, list of block indices | `"auto"` | recompute blocks in backward instead of keeping or paging their activations; `"auto"`: under memory pressure, as many as measured trials show is fastest |
 | `attention` | `"auto"`, `"cudnn"`, `"efficient"`, `"flash"`, `"math"`, `None` | `"auto"` | attention backend: the fastest measured on your model's shape, a named one first, or PyTorch's own order; deterministic mode leaves out the non-deterministic kernels |
+| `outliers` | `0`, `False`, `None`, `"auto"`, `True`, float 0.0–0.1 | `0` | with `quantize="nvfp4"` on tensor cores: the fraction of input channels (the largest of each call) multiplied in bf16 instead of 4-bit; `"auto"` / `True` mean `0.01`; ignored by other formats |
+| `host_arena` | `"auto"`, `False`, `None`, bytes | `"auto"` | page-locked host memory reserved up front, from which paged activations, staging and other pinned buffers are carved; `"auto"`: when the run streams anything, reserve one slab now and grow on demand within the page-lock budget; bytes: reserve that much now and cap growth there |
+| `peer` | `"auto"`, `False`, `None`, bytes | `"auto"` | data parallel on one machine: pool the frozen blocks every rank streams in the GPUs' VRAM and copy them GPU to GPU (needs peer access between the GPUs and CUDA IPC; set up collectively at step 10); `"auto"`: when peer copies reach 0.9× the host link, each GPU gives half the headroom under the memory plan's target; bytes: that much per GPU. While active, `unwrap()` is collective |
 | `moment_dtype` | `"auto"`, `"float32"`, `"bfloat16"`, `"bf16"`, `torch.bfloat16` | `"auto"` | fp32 unless that wouldn't fit in RAM; bf16 uses stochastic rounding |
 | `device` | `None`, `"cuda"`, `"cuda:N"`, `torch.device` | `None` | target GPU when the model is on the CPU |
 | `blocks` | `None`, list of layer modules | `None` | the repeated layer stack; auto-detected |
@@ -338,6 +388,9 @@ Methods and attributes: `step(closure=None)`, `zero_grad()`, `attach(model, guar
 | `wrap_hf(model, optimizer=None, **options)` | `options`: any `wrap()` option | `wrap()` with `blocks` preset to the decoder layers |
 | `load_model(name_or_path, ...)` | see the table above | streams a checkpoint, quantizing while it reads |
 | `TrainStreamCallback(optimizer)` | `optimizer`: an `OffloadAdamW` | for a stock `Trainer` that you gave an `OffloadAdamW`: prints the TrainStream metrics at each log step |
+| `causal_lm_logprobs(model, input_ids, labels=None, attention_mask=None, *, chunk_size=1024, average=False, **model_kwargs)` | `labels`: as for the model's loss (the input ids; `-100` marks tokens that don't count, e.g. the prompt); default `input_ids`. `chunk_size`: tokens per chunk. `average`: mean per counted token instead of the sum. `model_kwargs`: passed to the model | the log-probability of each sequence, shape `[batch]`, differentiable; computed from the final hidden states in chunks (models with soft-capped or scaled logits use their own logits) |
+| `reference_logprobs(model, batches, *, chunk_size=1024, average=False)` | `batches`: iterable of dicts with `"input_ids"` and optionally `"labels"` and `"attention_mask"` | DPO's reference log-probs without a second model: a PEFT model runs with its adapters off, in eval mode and without gradients; one float32 CPU tensor with every sequence's value, in order |
+| `TrainStreamCache(model, max_tokens, *, resident_layers="auto", page_tokens=256, vram_fraction=0.5)` | `model`: a decoder with full attention in every layer (sliding-window models are refused). Other arguments as `PagedKVCache` below | a `transformers` `Cache` for `model.generate(past_key_values=...)` whose keys and values are partly in host RAM; greedy or sampling (no beam search); `.reset()` before the next prompts; `.kv` is the `PagedKVCache`. Needs `transformers` ≥ 4.56 |
 
 How `TrainStreamTrainer` uses `TrainingArguments`:
 - `optim` must be an Adam/AdamW variant.
@@ -358,15 +411,38 @@ Its log lines add these metrics:
 |---|---|
 | `trainstream.chunked_cross_entropy(hidden, weight, targets, bias=None, *, chunk_size=1024, ignore_index=-100, reduction="mean", num_items=None)` | cross-entropy of `hidden @ weight.T (+ bias)` without building the logits. `hidden` `[..., D]` (after the last norm), `weight` `[V, D]`, `bias` `[V]` or `None`, `targets` class indices. `chunk_size`: tokens per chunk. `ignore_index`: positions that don't count. `reduction`: `"mean"` or `"sum"`. `num_items`: divide by this instead of the counted positions (as Hugging Face does with gradient accumulation) |
 | `trainstream.causal_lm_loss(hidden, weight, labels, bias=None, **kwargs)` | the next-token loss as Hugging Face computes it (labels shifted by one); `kwargs` as above |
+| `trainstream.sequence_logprobs(hidden, weight, labels, bias=None, *, chunk_size=1024, ignore_index=-100, shift=True, average=False)` | the log-probability of each sequence's labels, `[B]` float32, without building the logits; differentiable. `hidden` `[B, T, D]`, `labels` `[B, T]`. `shift=True`: labels are the input ids (position t predicts label t + 1), as Hugging Face passes them; `False`: position t predicts label t. `average`: mean per counted token instead of the sum |
+| `trainstream.dpo_loss(policy_chosen, policy_rejected, reference_chosen, reference_rejected, *, beta=0.1, label_smoothing=0.0)` | Direct Preference Optimization from per-sequence log-probs (`[B]` each). Returns `(loss, chosen_rewards, rejected_rewards)`: the mean loss and the implicit rewards `beta * (policy - reference)` (detached). `beta`: strength of the pull toward the reference. `label_smoothing` > 0: the conservative variant for noisy preference labels |
+
+### `trainstream.PagedKVCache(num_layers, max_tokens, *, resident_layers="auto", page_tokens=256, vram_fraction=0.5)`
+
+A KV cache for autoregressive generation whose offloaded layers keep their keys and values in pinned host pages. Inference only. The Hugging Face adapter is `TrainStreamCache` above.
+
+| Argument | Accepted values | Default | What it does |
+|---|---|---|---|
+| `num_layers` | integer ≥ 1 | — | attention layers of the model |
+| `max_tokens` | integer ≥ 1 | — | the longest sequence expected (prompt + new tokens); sizes the slots and the `"auto"` budget. Longer sequences still work, with a reallocation |
+| `resident_layers` | `"auto"`, integer ≥ 0, list of layer indices | `"auto"` | layers whose keys and values stay in VRAM; `"auto"`: as many as fit in `vram_fraction` of the free VRAM at the first update; the offloaded ones are spread through the stack |
+| `page_tokens` | integer ≥ 1 | `256` | tokens per host page (one D2H copy when a page fills) |
+| `vram_fraction` | float in (0, 1] | `0.5` | share of free (plus cached but unused) VRAM the `"auto"` plan may fill |
+
+Methods and attributes:
+- `update(layer, k, v) → (keys, values)`: append `[batch, kv_heads, new_tokens, head_dim]` and get the layer's full keys and values, as strided views.
+- `seq_length(layer=0)`: tokens cached in that layer.
+- `reset()`: forget every token.
+- `memory()`: `{"device_bytes", "host_bytes"}`.
+- `.resident` and `.offloaded`: layer lists.
+- `.stats`: `h2d_bytes`, `d2h_bytes`, `pages`, `prefetched` (slots filled ahead of time), `gathered` (filled on demand).
 
 ### Inspection and utilities
 
 | Function | Arguments | Returns |
 |---|---|---|
-| `trainstream.memory_report(model=None)` | a wrapped model, or `None` | for a wrapped model, a dict with these keys: `"events"` (the decision log), `"gpu"` (`allocated`, `reserved`, `peak_allocated`), `"pinned"`, `"pinned_by_tag"`, `"transfers"`, `"optimizer"`, `"resident"`, and when used, `"attention"` (`mode`, `backend`, `timings_ms`), `"activations"` (`policy`, `offloaded_blocks`, `recompute_blocks`, `decision`, ...), `"params"` (`paged_blocks`, `quantize`, `quantized_blocks`, ...) and `"plan"` (`target_vram`, `settled`, `history`, `budget`). Without a model: `"gpu"`, `"pinned"`, `"pinned_by_tag"` |
+| `trainstream.memory_report(model=None)` | a wrapped model, or `None` | for a wrapped model, a dict with these keys: `"events"` (the decision log), `"gpu"` (`allocated`, `reserved`, `peak_allocated`), `"pinned"`, `"pinned_by_tag"`, `"transfers"`, `"optimizer"`, `"resident"`, and when used, `"attention"` (`mode`, `backend`, `timings_ms`), `"activations"` (`policy`, `offloaded_blocks`, `recompute_blocks`, `decision`, ...), `"params"` (`paged_blocks`, `quantize`, `quantized_blocks`, `outliers`, `load_bytes` from host RAM, `bounce_bytes` staged from pageable RAM, `peer_bytes` copied from other GPUs, `peer_blocks`, `peer_owned_bytes`, ...) and `"plan"` (`target_vram`, `settled`, `history`, `budget`). Without a model: `"gpu"`, `"pinned"`, `"pinned_by_tag"` |
 | `trainstream.unwrap(model)` | a wrapped model | loads every weight back into VRAM, removes the hooks, returns the model |
 | `trainstream.profile_hardware(device=None, quick=True, force=False, threads=None)` | `device`: GPU to measure (default the current one). `quick`: shorter benchmarks. `force`: re-measure instead of using the cache. `threads`: host threads for the AdamW benchmark | a `HardwareProfile` (PCIe bandwidth, matmul and host AdamW throughput; `.summary()` prints it) |
-| `trainstream.pinned_stats()` | — | page-locked allocator counters, plus live bytes per tag in `"by_tag"` |
+| `trainstream.pinned_stats()` | — | page-locked allocator counters, plus live bytes per tag in `"by_tag"`. Arena keys: `arena_bytes` (reserved), `arena_used`, `arena_slabs`, `arena_cap`, `arena_fallbacks` (blocks that had to be page-locked on their own), `arena_largest_free`; `host_alloc_calls` counts every page-locking call |
+| `trainstream.reserve_pinned(bytes_now, cap=0, slab=0)` | `bytes_now`: page-lock this much for the arena now. `cap`: let it grow on demand up to this (at least `bytes_now`). `slab`: slab size in bytes (`0` keeps the current one) | the bytes reserved so far; `wrap(host_arena=...)` calls it for you |
 | `trainstream.transfer_stats(device=None)` | `device`: GPU (default the current one) | cumulative bytes and copies on TrainStream's D2H and H2D streams |
 | `trainstream.find_blocks(model)` | a model | the repeated layer stack `wrap()` would use (the largest `ModuleList` / `Sequential` of ≥ 2 same-type children), or `[]` |
 
@@ -375,6 +451,7 @@ The session behind a wrapped model is `model._trainstream_session` (`trainstream
 - `.events`: the decision log
 - `.config`: the options in effect
 - `.steps`: optimizer steps so far
+- `.peer`: the peer-GPU pools once set up (`.pooled_blocks`, `.bytes_owned`), else `None`
 
 ### `trainstream.ActivationOffloader(model, blocks, offload="auto", *, ...)`: activation paging on its own
 
@@ -396,7 +473,7 @@ The session behind a wrapped model is `model._trainstream_session` (`trainstream
 
 Attributes: `.policy` (per block: `"keep"`, `"offload"` or `"recompute"`), `.decision`, `.stats`, `.events`.
 
-`ParamPager`, `GradientOffloader`, `ParamReadyHooks` and `HardwareProfile` are also exported. `wrap()` and `OffloadAdamW` build and use them internally; they aren't meant to be constructed by hand.
+`ParamPager`, `GradientOffloader`, `ParamReadyHooks` and `HardwareProfile` are also exported, and `trainstream.peer` holds the peer-GPU setup. `wrap()` and `OffloadAdamW` build and use them internally; they aren't meant to be constructed by hand.
 
 ### Environment variables
 
@@ -407,7 +484,8 @@ Attributes: `.policy` (per block: `"keep"`, `"offload"` or `"recompute"`), `.dec
 | `TORCH_CUDA_ARCH_LIST` | GPU architectures to compile for (default: the GPUs present) |
 | `CUDA_HOME` / `CUDA_PATH` | CUDA toolkit to use, if it isn't found automatically |
 | `LOCAL_WORLD_SIZE` / `SLURM_NTASKS_PER_NODE` | processes sharing the machine; the planner splits RAM between them, and data parallel shares host memory when all ranks are local |
-| `TRAINSTREAM_SHM=0` | data parallel without shared host memory (per-rank copies, gloo reduction) |
+| `TRAINSTREAM_SHM=0` | data parallel without shared host memory (per-rank copies, gloo reduction); also turns off peer-GPU pooling, which uses the same local group |
+| `TRAINSTREAM_HOST_ARENA_SLAB` | size of one pinned-arena slab, in bytes or with a `K` / `M` / `G` suffix (default `1G`) |
 
 ## How it works
 
@@ -420,19 +498,21 @@ Attributes: `.policy` (per block: `"keep"`, `"offload"` or `"recompute"`), `.dec
 
 | Script | What it does | Main flags |
 |---|---|---|
-| `examples/lora_large_model.py` | LoRA on bases larger than the GPU, bf16 or quantized | `--size 1.5b\|7b\|14b\|32b`, `--model HUB_ID`, `--quantize auto\|none\|int8\|nf4\|fp8\|nvfp4`, `--prefer exact\|speed`, `--recompute auto\|on\|off`, `--attention auto\|cudnn\|efficient\|flash\|math\|default`, `--stock`, `--steps`, `--batch`, `--seq`, `--rank` |
+| `examples/lora_large_model.py` | LoRA on bases larger than the GPU, bf16 or quantized | `--size 1.5b\|7b\|14b\|32b`, `--model HUB_ID`, `--quantize auto\|none\|int8\|nf4\|fp8\|nvfp4`, `--prefer exact\|speed`, `--recompute auto\|on\|off`, `--attention auto\|cudnn\|efficient\|flash\|math\|default`, `--outliers FRACTION`, `--stock`, `--steps`, `--batch`, `--seq`, `--rank` |
+| `examples/dpo_lora.py` | DPO on a LoRA model: the base with adapters off is the reference, log-probs computed in chunks | `--model HUB_ID` (default: a random Qwen2.5-0.5B shape), `--quantize`, `--steps`, `--batch`, `--prompt`, `--answer`, `--beta`, `--rank` |
 | `examples/hf_finetune.py` | fine-tune a Hugging Face model, optionally beside the stock Trainer | `--model`, `--lora`, `--compare`, `--activation-offload` |
 | `examples/train_bigger_than_vram.py` | 1.8B model (7.3 GB of fp32 weights) inside a 4 GB VRAM cap | `--vram-gb`, `--moments fp32\|bf16`, `--layers`, `--d-model` |
 | `examples/verify_ram_offload.py` | proves where training memory lives, with a PASS/FAIL verdict | `--gpt`, `--hf`, `--vram-cap-gb`, `--engine both\|baseline\|trainstream` |
 | `benchmarks/compare.py` | head-to-head with stock PyTorch, bitsandbytes QLoRA, Unsloth, DeepSpeed | `--scenario full1.5b\|lora14b\|lora14b_2k`, `--engines ...`, `--steps` (2 warm-up + measured; default 10), `--timeout`, `--out` |
-| `benchmarks/quality.py` | perplexity of each quantization format, before and after a short LoRA fine-tune | `--model`, `--formats none int8 nf4 fp8 nvfp4`, `--windows`, `--train-steps` |
+| `benchmarks/quality.py` | perplexity of each quantization format, before and after a short LoRA fine-tune | `--model`, `--formats none int8 nf4 fp8 nvfp4 nvfp4-w nvfp4-o` (`nvfp4-w`: 4-bit weights only, expanded before each matmul; `nvfp4-o`: tensor cores with `outliers=0.01`), `--windows`, `--train-steps` |
 
 ## Limitations
 
 - Host RAM is the ceiling: 8–12 bytes per trained parameter and 2–4 per frozen one (1.06 with int8, 0.56 with NF4), plus activations. Measured on 64 GB: a 3.6B full fine-tune, and LoRA on a 32.8B NF4 base.
-- Quantization covers frozen block weights only (not embeddings, the output layer or trained weights) and isn't bit-exact. FP8 / NVFP4 tensor-core matmuls need a Blackwell GPU and quantize activations too. `load_model` reads `.safetensors` causal-LM checkpoints only.
+- Quantization covers frozen block weights only (not embeddings, the output layer or trained weights) and isn't bit-exact. FP8 / NVFP4 tensor-core matmuls need a Blackwell GPU and quantize activations too; `outliers=` recovers part of the activation error, never the weights' own 4-bit error. `load_model` reads `.safetensors` causal-LM checkpoints only.
+- `PagedKVCache` / `TrainStreamCache`: inference only, full-attention decoders, no beam search. With paged weights, every decoded token also streams the paged blocks over PCIe; a larger generation batch (which the paged cache makes room for) amortizes that.
 - Weight paging covers the repeated block stack and needs `optimizer_mode="cpu"`; each paged weight crosses PCIe twice per step.
-- Data parallel only (no tensor or pipeline parallelism). Ranks on one machine share host memory; tested with 2 processes on 1 GPU, not on a multi-GPU machine or across machines. VRAM pooling over NVLink / peer-to-peer isn't built.
+- Data parallel only (no tensor or pipeline parallelism). Ranks on one machine share host memory; tested with 2 processes on 1 GPU, not on a multi-GPU machine or across machines. Peer-GPU pooling covers frozen weights only and needs CUDA IPC and GPUs with peer access (GeForce pairs usually have none); tested with two processes on one GPU (Windows 11, WSL2), copies between two real GPUs are untested.
 - `TrainStreamTrainer` is single-process. fp16 with a GradScaler and AMSGrad aren't supported; `torch.compile` hasn't been tested.
 - Host AdamW speed is bounded by system RAM bandwidth.
 

@@ -19,6 +19,7 @@ from .attention import CHOICES as ATTENTION_CHOICES, AttentionSelector
 from .profiler import HardwareProfile, profile_hardware
 
 _ATTR = "_trainstream_session"
+PEER_SETUP_STEP = 10  # after the memory plan's refinement (at most 8 steps) has settled
 
 
 class TrainStreamSession:
@@ -45,6 +46,8 @@ class TrainStreamSession:
         self._orig_apply: Dict[int, object] = {}
         self.lowp_modules: List[nn.Module] = []
         self.attention: Optional[AttentionSelector] = None
+        self.peer = None  # trainstream.peer.PeerPool once set up
+        self._peer_step: Optional[int] = None
 
     # -- install / teardown ----------------------------------------------------------
     def install(self, frozen_init=None) -> None:
@@ -53,8 +56,8 @@ class TrainStreamSession:
         opt.attach(self.model, guard=cfg["guard_params"])
         if opt.resident:
             return
-        if self.config.get("quantize") in Q.BLOCKSCALED_KINDS:
-            self.lowp_modules = lowp.install(self.blocks, opt.device)  # before the pager reads the flags
+        if self.config.get("quantize") in Q.BLOCKSCALED_KINDS:  # before the pager reads the flags
+            self.lowp_modules = lowp.install(self.blocks, opt.device, cfg.get("outliers", 0.0))
         if cfg.get("attention") is not None and self.blocks:
             self.attention = AttentionSelector(self.model, self.blocks, cfg["attention"], opt.device)
             self.attention.events = self.events
@@ -83,8 +86,12 @@ class TrainStreamSession:
             self.activations.remove()
             self.activations = None
         if self.pager is not None:
-            self.pager.remove(materialize=materialize)
+            self.pager.remove(materialize=materialize)  # still reads pooled weights from the peers
             self.pager = None
+        if self.peer is not None:
+            self.peer.close()
+            self.peer = None
+            self.events.append("peer GPUs: pools released")
         lowp.uninstall(self.lowp_modules)
         self.lowp_modules = []
         if self.attention is not None:
@@ -114,6 +121,9 @@ class TrainStreamSession:
     # -- resident switch -------------------------------------------------------------
     def _after_step(self) -> None:
         self.steps += 1
+        if self._peer_step is not None and self.steps == self._peer_step:
+            self._peer_step = None
+            self._setup_peer()
         if self.activations is not None:
             packed = self.activations.stats["packed_bytes"]
             self._act_step_bytes, self._act_prev_bytes = packed - self._act_prev_bytes, packed
@@ -194,6 +204,31 @@ class TrainStreamSession:
         self._watch_level = peak
         self.events.append(f"memory watchdog: peak {peak / 2**30:.2f} GiB is inside the safety margin; block {pick} "
                            f"paged ({pager.n - len(pager.remote)} of {pager.n} resident)")
+
+    def _setup_peer(self) -> None:
+        """Collective, at the same step on every local rank: pool the frozen
+        blocks every rank streams in the GPUs' VRAM (trainstream.peer)."""
+        from . import peer
+        local = self.optimizer._dp["local"]
+        dev = self.optimizer.device
+        host = self.profile.h2d_gbps if self.profile is not None else \
+            _C.benchmark_pcie(dev.index or 0, 64 << 20, 4)["h2d_gbps"]
+        on, why, _ = peer.probe(local, dev, host)
+        if not on:
+            self.events.append(f"peer GPUs: off ({why})")
+            return
+        setting = self.config.get("peer", "auto")
+        if setting == "auto":  # half the headroom the memory plan leaves under its target
+            target = self.planner.target if self.planner is not None else self.config["_vram_target"]
+            budget = int(0.5 * max(0, target - torch.cuda.max_memory_allocated(dev)))
+        else:
+            budget = int(setting)
+        pool = peer.PeerPool.build(local, self.pager, dev, budget)
+        if self.pager is not None:
+            self.pager.peer = pool
+        self.peer = pool
+        self.events.append(f"peer GPUs: {why}; {len(pool.pooled_blocks)} streamed blocks pooled across "
+                           f"{local.world} GPUs ({pool.bytes_owned / 2**30:.2f} GiB held on this one)")
 
     def _fits_resident(self) -> bool:
         dev = self.optimizer.device
@@ -297,9 +332,12 @@ class TrainStreamSession:
                                  paged_bytes=self.pager.bytes_paged, total_blocks=self.pager.n,
                                  quantized_blocks=sorted(self.pager.quant_blocks),
                                  quantized_bytes=self.pager.quantized_bytes, quantize=self.config.get("quantize"),
+                                 outliers=self.config.get("outliers", 0.0),
                                  frozen_pinned_bytes=self.pager.frozen_pinned_bytes,
                                  frozen_shared_bytes=self.pager.frozen_shared_bytes,
-                                 frozen_pageable_bytes=self.pager.frozen_pageable_bytes)
+                                 frozen_pageable_bytes=self.pager.frozen_pageable_bytes,
+                                 peer_blocks=self.peer.pooled_blocks if self.peer is not None else [],
+                                 peer_owned_bytes=self.peer.bytes_owned if self.peer is not None else 0)
         if self.planner is not None:
             out["plan"] = dict(target_vram=self.planner.target, settled=self.planner.done,
                                history=list(self.planner.history), budget=self.planner.budget.describe())
@@ -369,6 +407,36 @@ def _paged_block_indices(param_offload, n_blocks: int, weight_bytes: int, on_cpu
     return spread(int(round(frac * n_blocks)), list(range(n_blocks)))  # spread for transfer/compute overlap
 
 
+def _outlier_fraction(value) -> float:
+    if value is True or value == "auto":
+        return 0.01
+    if value is None or value is False:
+        return 0.0
+    if isinstance(value, (int, float)) and 0.0 <= float(value) <= 0.1:
+        return float(value)
+    raise ValueError(f"outliers must be 'auto', True, False or a fraction between 0 and 0.1, got {value!r}")
+
+
+def _reserve_host_arena(host_arena, budget, session) -> dict:
+    """Page-lock the host memory the run allocates while it trains (paged
+    activations, gradient staging, bounce slots) now, instead of during steps."""
+    streams = session.pager is not None or session.activations is not None
+    if host_arena in (False, None, 0) or (host_arena == "auto" and (not streams or session.optimizer.resident)):
+        return dict(reserved=0, cap=0)
+    if host_arena == "auto":
+        cap = max(0, budget.pin_budget - _C.pinned_stats()["live_bytes"])
+        now = min(cap, 1 << 30)
+    else:
+        cap = now = int(host_arena)
+    if cap <= 0:
+        session.events.append("pinned host arena: none (the page-lock budget is already used)")
+        return dict(reserved=0, cap=0)
+    reserved = _C.pinned_reserve(now, 0, cap)
+    session.events.append(f"pinned host arena: {reserved / 2**30:.2f} GiB page-locked up front, grows on demand "
+                          f"to {cap / 2**30:.1f} GiB")
+    return dict(reserved=int(reserved), cap=int(cap))
+
+
 def _broadcast_from_rank0(model: nn.Module, group) -> None:
     import torch.distributed as dist
     with torch.no_grad():
@@ -407,6 +475,9 @@ def wrap(
     prefer: str = "exact",
     recompute: Union[str, float, bool, Sequence[int]] = "auto",
     attention: Optional[str] = "auto",
+    outliers: Union[str, float, bool, None] = 0.0,
+    host_arena: Union[str, int, bool] = "auto",
+    peer: Union[str, int, bool] = "auto",
     verbose: bool = False,
 ):
     """Enable TrainStream offloading for `model` and return ``(model, optimizer)``.
@@ -465,6 +536,24 @@ def wrap(
             times the backends once on the model's head shape and runs the
             fastest first (others stay as fallbacks); "cudnn", "efficient",
             "flash" or "math" put that one first; None leaves PyTorch's order.
+        outliers: with quantize="nvfp4" on tensor cores, the fraction of input
+            channels (the largest, picked per call) multiplied in bf16 instead
+            of being quantized to 4 bits with the rest of the activation.
+            0 (default) none; "auto" or True 0.01; a float up to 0.1.
+        host_arena: page-locked host memory reserved up front, from which
+            paged activations, gradient staging and other pinned buffers are
+            carved, so training steps never page-lock memory (a stall on
+            Windows). "auto" (default): when the run streams anything, reserve
+            one slab now and grow on demand within the page-lock budget; an int
+            reserves that many bytes now (and caps growth there); False: none.
+        peer: data parallel on one machine whose GPUs reach each other's
+            memory (NVLink / PCIe P2P, through CUDA IPC): the frozen blocks every
+            rank streams are split among the GPUs' VRAM and copied GPU to GPU
+            instead of from host RAM. Set up collectively at step 10. "auto"
+            (default): when the GPUs allow it and peer copies are at least 0.9x
+            the host link, each GPU contributes half the headroom under the
+            memory plan's target; an int: that many bytes per GPU; False: off.
+            With it active, unwrap() is collective too.
         vram_headroom: fraction of the usable VRAM the planner leaves free.
         check_memory: raise MemoryError at wrap() when the host state cannot
             fit in the available RAM, instead of failing later.
@@ -489,6 +578,12 @@ def wrap(
         recompute = False  # the model recomputes its own layers already
     if attention is not None and attention not in ATTENTION_CHOICES:
         raise ValueError(f"attention must be one of {ATTENTION_CHOICES} or None, got {attention!r}")
+    outliers = _outlier_fraction(outliers)
+    if not (host_arena in ("auto", False, None) or (isinstance(host_arena, int) and not isinstance(host_arena, bool)
+                                                    and host_arena >= 0)):
+        raise ValueError(f"host_arena must be 'auto', False or a number of bytes, got {host_arena!r}")
+    if not (peer in ("auto", False, None) or (isinstance(peer, int) and not isinstance(peer, bool) and peer >= 0)):
+        raise ValueError(f"peer must be 'auto', False or a number of bytes per GPU, got {peer!r}")
     params = list(_unique_params(model))
     if not params:
         raise ValueError("trainstream.wrap needs a model with parameters")
@@ -713,7 +808,7 @@ def wrap(
         print("[trainstream] no repeated block stack found; activation offload disabled")
 
     config = dict(quantize=qkind, quant_block_size=quant_block_size, prefer=prefer, recompute=recompute,
-                  attention=attention,
+                  attention=attention, outliers=outliers if qkind == "nvfp4" else 0.0,
                   optimizer_mode=optimizer_mode, offload=offload, activation_offload=activation_offload,
                   param_offload=param_offload, paged_blocks=len(paged_blocks), moment_dtype=opt.moment_dtype,
                   distributed=bool(distributed), accumulation_steps=opt.accumulation_steps,
@@ -736,8 +831,11 @@ def wrap(
         if qkind in Q.BLOCKSCALED_KINDS:
             cap = torch.cuda.get_device_capability(target)
             if session.lowp_modules:
+                kept = (f", except the largest {config['outliers']:.1%} of input channels, multiplied in bf16"
+                        if config["outliers"] else "")
                 session.events.append(f"{len(session.lowp_modules)} {qkind} matmuls run on tensor cores "
-                                      f"(sm_{cap[0]}{cap[1]}); activations are quantized to {qkind} on the fly")
+                                      f"(sm_{cap[0]}{cap[1]}); activations are quantized to {qkind} on the fly"
+                                      + kept)
             else:
                 session.events.append(f"this GPU (sm_{cap[0]}{cap[1]}) has no {qkind} tensor-core matmul: "
                                       f"weights are expanded before use, like nf4 / int8")
@@ -745,6 +843,10 @@ def wrap(
         session.events.append(f"memory plan: {budget.describe()}; starting with {len(stack) - len(paged_blocks)} "
                               f"of {len(stack)} blocks resident, {len(paged_blocks)} paged; "
                               f"moments {opt.moment_dtype}")
+    config["host_arena"] = _reserve_host_arena(host_arena, budget, session)
+    config["peer"] = peer if peer not in (None, 0) else False
+    if config["peer"] is not False and opt._dp is not None and opt._dp.get("local") is not None:
+        session._peer_step = PEER_SETUP_STEP  # the same step on every rank: the setup is collective
     frozen_init.clear()
     config["eager_updates"] = opt.eager_active
     opt._post_step_cb = session._after_step

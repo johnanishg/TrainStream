@@ -164,10 +164,13 @@ __device__ __forceinline__ uint8_t float_to_e4m3(float x) {
   return static_cast<uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
 }
 
+// `mask` (optional, one byte per column): columns quantized as 0. The outlier
+// channels of an activation are masked here and multiplied in bf16 instead,
+// so they no longer set the scale of their 16-value block.
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
     quant_nvfp4_kernel(const T* __restrict__ x, int64_t rows, int64_t cols, const float* __restrict__ gdec,
-                       uint8_t* __restrict__ q, uint8_t* __restrict__ scales) {
+                       const uint8_t* __restrict__ mask, uint8_t* __restrict__ q, uint8_t* __restrict__ scales) {
   const int64_t groups_per_row = cols / 16;
   const int64_t col_tiles = (groups_per_row + 3) / 4;
   const int64_t total = rows * groups_per_row;
@@ -178,11 +181,16 @@ __global__ void __launch_bounds__(kThreads)
     const T* src = x + r * cols + c * 16;
     float v[16];
     float amax = 0.0f;
+    if (mask != nullptr) {
+      const uint8_t* mk = mask + c * 16;
 #pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      v[j] = In<T>::cvt(src[j]);
-      amax = fmaxf(amax, fabsf(v[j]));
+      for (int j = 0; j < 16; ++j) v[j] = mk[j] ? 0.0f : In<T>::cvt(src[j]);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 16; ++j) v[j] = In<T>::cvt(src[j]);
     }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) amax = fmaxf(amax, fabsf(v[j]));
     const float bs = fminf(__fdiv_rn(__fdiv_rn(amax, 6.0f), g), 448.0f);
     const uint8_t bs8 = float_to_e4m3(bs);
     float dec = __fmul_rn(e4m3_to_float(bs8), g);
@@ -256,6 +264,41 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// out[r, j] = W[r, idx[j]] for a packed nvfp4 W: the weight columns that meet
+// an activation's outlier channels, gathered for the bf16 side matmul.
+template <typename T>
+__global__ void __launch_bounds__(kThreads)
+    dequant_nvfp4_cols_kernel(const uint8_t* __restrict__ q, const uint8_t* __restrict__ scales,
+                              const int64_t* __restrict__ idx, int64_t k, float g, T* __restrict__ out, int64_t rows,
+                              int64_t cols) {
+  const int64_t col_tiles = (cols / 16 + 3) / 4;
+  const int64_t total = rows * k;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * kThreads;
+  for (int64_t t = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; t < total; t += stride) {
+    const int64_t r = t / k, c = idx[t % k];
+    const uint8_t b = q[r * (cols / 2) + c / 2];
+    const uint8_t code = (c & 1) ? (b >> 4) : (b & 15);  // even columns in the low nibble
+    const float v = kE2M1[code & 7] * ((code & 8) ? -1.0f : 1.0f);
+    const float s = __fmul_rn(e4m3_to_float(scales[swizzled(r, c / 16, col_tiles)]), g);
+    out[t] = Out<T>::cvt(__fmul_rn(v, s));
+  }
+}
+
+// amax[c] = max(amax[c], max_r |x[r, c]|), as the bit pattern of a
+// non-negative float (whose integer order is its numeric order).
+template <typename T>
+__global__ void __launch_bounds__(kThreads)
+    col_absmax_kernel(const T* __restrict__ x, int64_t rows, int64_t cols, int64_t rows_per,
+                      unsigned int* __restrict__ amax) {
+  const int64_t c = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (c >= cols) return;
+  const int64_t r0 = static_cast<int64_t>(blockIdx.y) * rows_per;
+  const int64_t r1 = r0 + rows_per < rows ? r0 + rows_per : rows;
+  float m = 0.0f;
+  for (int64_t r = r0; r < r1; ++r) m = fmaxf(m, fabsf(In<T>::cvt(x[r * cols + c])));
+  atomicMax(amax + c, __float_as_uint(m));
+}
+
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
     dequant_mxfp8_kernel(const uint8_t* __restrict__ q, const uint8_t* __restrict__ scales, T* __restrict__ out,
@@ -278,13 +321,13 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 template <typename T>
-cudaError_t launch_quant_bs(QKind kind, const void* x, int64_t rows, int64_t cols, const float* gdec, uint8_t* q,
-                            uint8_t* scales, int sm_count, cudaStream_t stream) {
+cudaError_t launch_quant_bs(QKind kind, const void* x, int64_t rows, int64_t cols, const float* gdec,
+                            const uint8_t* mask, uint8_t* q, uint8_t* scales, int sm_count, cudaStream_t stream) {
   const int64_t groups = rows * (cols / blockscaled_group(kind));
   if (groups == 0) return cudaSuccess;
   if (kind == QKind::kNVFP4) {
     quant_nvfp4_kernel<T><<<grid_for(groups, sm_count), kThreads, 0, stream>>>(static_cast<const T*>(x), rows, cols,
-                                                                                 gdec, q, scales);
+                                                                                 gdec, mask, q, scales);
   } else {
     quant_mxfp8_kernel<T><<<grid_for(groups, sm_count), kThreads, 0, stream>>>(static_cast<const T*>(x), rows, cols,
                                                                                  q, scales);
@@ -311,17 +354,66 @@ cudaError_t launch_dequant_bs(QKind kind, const uint8_t* q, const uint8_t* scale
 
 cudaError_t quantize_blockscaled(QKind kind, DType in_dtype, const void* x, int64_t rows, int64_t cols,
                                  const float* global_decode, uint8_t* q, uint8_t* scales, int sm_count,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, const uint8_t* mask) {
   if ((kind != QKind::kNVFP4 && kind != QKind::kMXFP8) || cols % 32 != 0) return cudaErrorInvalidValue;
+  if (mask != nullptr && kind != QKind::kNVFP4) return cudaErrorInvalidValue;
   switch (in_dtype) {
     case DType::kFloat32:
-      return launch_quant_bs<float>(kind, x, rows, cols, global_decode, q, scales, sm_count, stream);
+      return launch_quant_bs<float>(kind, x, rows, cols, global_decode, mask, q, scales, sm_count, stream);
     case DType::kFloat16:
-      return launch_quant_bs<__half>(kind, x, rows, cols, global_decode, q, scales, sm_count, stream);
+      return launch_quant_bs<__half>(kind, x, rows, cols, global_decode, mask, q, scales, sm_count, stream);
     case DType::kBFloat16:
-      return launch_quant_bs<__nv_bfloat16>(kind, x, rows, cols, global_decode, q, scales, sm_count, stream);
+      return launch_quant_bs<__nv_bfloat16>(kind, x, rows, cols, global_decode, mask, q, scales, sm_count, stream);
   }
   return cudaErrorInvalidValue;
+}
+
+cudaError_t col_absmax(DType in_dtype, const void* x, int64_t rows, int64_t cols, float* amax,
+                       cudaStream_t stream) {
+  if (rows == 0 || cols == 0) return cudaSuccess;
+  const int64_t ychunks = rows < 64 ? rows : 64;
+  const int64_t rows_per = (rows + ychunks - 1) / ychunks;
+  const dim3 grid(static_cast<unsigned>((cols + kThreads - 1) / kThreads),
+                  static_cast<unsigned>((rows + rows_per - 1) / rows_per));
+  auto* out = reinterpret_cast<unsigned int*>(amax);
+  switch (in_dtype) {
+    case DType::kFloat32:
+      col_absmax_kernel<float><<<grid, kThreads, 0, stream>>>(static_cast<const float*>(x), rows, cols, rows_per, out);
+      break;
+    case DType::kFloat16:
+      col_absmax_kernel<__half><<<grid, kThreads, 0, stream>>>(static_cast<const __half*>(x), rows, cols, rows_per,
+                                                               out);
+      break;
+    case DType::kBFloat16:
+      col_absmax_kernel<__nv_bfloat16><<<grid, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x), rows, cols,
+                                                                      rows_per, out);
+      break;
+  }
+  return cudaGetLastError();
+}
+
+cudaError_t dequantize_nvfp4_cols(DType out_dtype, const uint8_t* q, const uint8_t* scales, const int64_t* idx,
+                                  int64_t k, float global_decode, void* out, int64_t rows, int64_t cols, int sm_count,
+                                  cudaStream_t stream) {
+  if (cols % 32 != 0) return cudaErrorInvalidValue;
+  const int64_t total = rows * k;
+  if (total == 0) return cudaSuccess;
+  const int grid = grid_for(total, sm_count);
+  switch (out_dtype) {
+    case DType::kFloat32:
+      dequant_nvfp4_cols_kernel<float><<<grid, kThreads, 0, stream>>>(q, scales, idx, k, global_decode,
+                                                                      static_cast<float*>(out), rows, cols);
+      break;
+    case DType::kFloat16:
+      dequant_nvfp4_cols_kernel<__half><<<grid, kThreads, 0, stream>>>(q, scales, idx, k, global_decode,
+                                                                       static_cast<__half*>(out), rows, cols);
+      break;
+    case DType::kBFloat16:
+      dequant_nvfp4_cols_kernel<__nv_bfloat16><<<grid, kThreads, 0, stream>>>(
+          q, scales, idx, k, global_decode, static_cast<__nv_bfloat16*>(out), rows, cols);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 cudaError_t dequantize_blockscaled(QKind kind, DType out_dtype, const uint8_t* q, const uint8_t* scales,

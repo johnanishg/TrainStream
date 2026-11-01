@@ -125,7 +125,8 @@ class ParamPager:
         self.allocated = {i: True for i in range(self.n)}
         self.fresh = {i: False for i in range(self.n)}
         self.events: Dict[int, object] = {}
-        self.stats = dict(loads=0, load_bytes=0, releases=0, pages=0, unpages=0)
+        self.stats = dict(loads=0, load_bytes=0, bounce_bytes=0, peer_bytes=0, releases=0, pages=0, unpages=0)
+        self.peer = None  # trainstream.peer.PeerPool: frozen weights other GPUs hold for this one
         frozen_init = frozen_init if frozen_init is not None else {}
         self._shared_frozen: Dict[int, torch.Tensor] = {}
         self.frozen_shared_bytes = 0
@@ -355,6 +356,7 @@ class ParamPager:
         last = self.events.get(i) if only_native else None
         keep = list(self._keep.get(i, [])) if only_native else []
         dev = self.device.index or 0
+        bounce_dst, bounce_src = [], []
         for p, slot, nbytes in entries:
             qw = self._quant.get(id(p))
             native = qw is not None and getattr(qw, "native", False)
@@ -362,26 +364,48 @@ class ParamPager:
                 continue
             if qw is not None:
                 near = qw.dev_q is not None
+                via_peer = not near and self.peer is not None and self.peer.source(id(p), "q") is not None
                 if native and not expand_native:
-                    if not near:  # stage the packed bytes; the matmul reads them as they are
+                    if via_peer:  # the packed bytes from the GPU that holds them
+                        tq, ts, last = self._peer_packed(p, qw, after)
+                        qw._staged = (tq, ts)
+                    elif not near:  # stage the packed bytes; the matmul reads them as they are
                         tq, _ = _C.h2d_alloc_async(qw.host_q, after, dev)
                         ts, last = _C.h2d_alloc_async(qw.host_absmax, after, dev)
                         qw._staged = (tq, ts)
                         self.stats["load_bytes"] += qw.nbytes
                     continue
-                q = qw.dev_q if near else qw.host_q
-                s = qw.dev_absmax if near else qw.host_absmax
+                if via_peer:  # on this GPU (H2D stream, in order) before the expansion reads it
+                    q, s, last = self._peer_packed(p, qw, after)
+                    keep.extend((q, s))
+                else:
+                    q = qw.dev_q if near else qw.host_q
+                    s = qw.dev_absmax if near else qw.host_absmax
                 if qw.blockscaled:
                     last, held = _C.dequantize_blockscaled_async(p.detach().view(qw.shape[0], -1), q, s, qw.kind,
                                                                  qw.global_decode, after)
                 else:
                     last, held = _C.dequantize_async(p.detach().view(-1), q, s, qw.kind, qw.block_size, after)
                 keep.extend(held)
-                if not near:
+                if not near and not via_peer:
                     self.stats["load_bytes"] += qw.nbytes
                 continue
-            last = _C.h2d_async(p.detach().view(-1), self._source(p, slot), after)
+            peer_src = self.peer.source(id(p), "w") if self.peer is not None and slot is None else None
+            if peer_src is not None:
+                base, off, src_dev = peer_src
+                last = _C.peer_copy_async(p.detach().view(-1), base, off, src_dev, after)
+                self.stats["peer_bytes"] += nbytes
+                continue
+            src = self._source(p, slot)
+            if getattr(src, "_ts_pinned", True):
+                last = _C.h2d_async(p.detach().view(-1), src, after)
+            else:  # over the page-lock budget: stage through pinned slots instead of the driver's
+                bounce_dst.append(p.detach().view(-1))
+                bounce_src.append(src)
             self.stats["load_bytes"] += nbytes
+        if bounce_dst:
+            last = _C.h2d_bounce_async(bounce_dst, bounce_src, after, self.depth + 2)
+            self.stats["bounce_bytes"] += sum(t.numel() * t.element_size() for t in bounce_src)
         self._keep[i] = keep  # staging copies of far packed bytes, alive until the event
         for s in slots:
             self.opt.engine.set_ready(s, last)  # the next update waits until this read is done
@@ -390,6 +414,17 @@ class ParamPager:
         if expand_native:
             self._native_expanded[i] = True
         self.stats["loads"] += 1
+
+    def _peer_packed(self, p, qw, after):
+        """Copy a pooled weight's packed bytes and scales from the GPU that owns them."""
+        out, last = [], None
+        for part, host in (("q", qw.host_q), ("s", qw.host_absmax)):
+            base, off, src_dev = self.peer.source(id(p), part)
+            t = torch.empty(host.shape, dtype=host.dtype, device=self.device)
+            last = _C.peer_copy_async(t, base, off, src_dev, after)
+            out.append(t)
+        self.stats["peer_bytes"] += qw.nbytes
+        return out[0], out[1], last
 
     def wait(self, i: int) -> None:
         ev = self.events.get(i)

@@ -241,6 +241,10 @@ def test_activation_offload_reduces_vram():
         base = torch.cuda.memory_allocated()
         loss = lm_loss(model, t)
         torch.cuda.synchronize()
+        # Every D2H copy has landed; release their sources as the next block
+        # boundary would. Otherwise the number depends on how far the forward
+        # ran ahead of the copy engine when it last checked.
+        off._reap()
         after_fwd = torch.cuda.memory_allocated() - base
         loss.backward()
         off.remove()

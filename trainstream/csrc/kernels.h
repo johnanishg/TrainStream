@@ -64,10 +64,17 @@ inline int64_t blockscaled_scale_bytes(QKind kind, int64_t rows, int64_t cols) {
   return ((rows + 127) / 128) * 128 * ((sc + 3) / 4) * 4;
 }
 // `global_decode` (nvfp4 only) is read from device memory, so it can be
-// computed on the GPU without a host round trip.
+// computed on the GPU without a host round trip. `mask` (nvfp4 only, one byte
+// per column, may be null): columns whose byte is non-zero are quantized as 0.
 cudaError_t quantize_blockscaled(QKind kind, DType in_dtype, const void* x, int64_t rows, int64_t cols,
                                  const float* global_decode, uint8_t* q, uint8_t* scales, int sm_count,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream, const uint8_t* mask = nullptr);
+// amax[c] = max(amax[c], max over rows of |x[r, c]|); amax must start at 0.
+cudaError_t col_absmax(DType in_dtype, const void* x, int64_t rows, int64_t cols, float* amax, cudaStream_t stream);
+// out[r, j] = W[r, idx[j]] (row-major [rows, k]) for an nvfp4-packed W [rows, cols].
+cudaError_t dequantize_nvfp4_cols(DType out_dtype, const uint8_t* q, const uint8_t* scales, const int64_t* idx,
+                                  int64_t k, float global_decode, void* out, int64_t rows, int64_t cols, int sm_count,
+                                  cudaStream_t stream);
 cudaError_t dequantize_blockscaled(QKind kind, DType out_dtype, const uint8_t* q, const uint8_t* scales,
                                    float global_decode, void* out, int64_t rows, int64_t cols, int sm_count,
                                    cudaStream_t stream);

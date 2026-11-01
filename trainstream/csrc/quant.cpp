@@ -50,7 +50,8 @@ void check_packed(kernels::QKind k, int64_t rows, int64_t cols, const at::Tensor
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor> quantize_blockscaled(const at::Tensor& x, const std::string& kind,
-                                                        const c10::optional<at::Tensor>& global_decode) {
+                                                        const c10::optional<at::Tensor>& global_decode,
+                                                        const c10::optional<at::Tensor>& mask) {
   const auto k = blockscaled_kind(kind);
   TORCH_CHECK(x.is_cuda(), "quantize_blockscaled: x must be a CUDA tensor");
   const at::Tensor x2 = x.contiguous();
@@ -62,6 +63,14 @@ std::tuple<at::Tensor, at::Tensor> quantize_blockscaled(const at::Tensor& x, con
                 "quantize_blockscaled: nvfp4 needs a 1-element float32 CUDA global_decode tensor");
     g = global_decode->data_ptr<float>();
   }
+  const uint8_t* mk = nullptr;
+  if (mask.has_value()) {
+    TORCH_CHECK(k == kernels::QKind::kNVFP4, "quantize_blockscaled: a column mask is only supported for nvfp4");
+    TORCH_CHECK(mask->is_cuda() && mask->get_device() == x.get_device() && mask->scalar_type() == at::kByte &&
+                    mask->is_contiguous() && mask->numel() == cols,
+                "quantize_blockscaled: mask must be a contiguous uint8 CUDA tensor with one byte per column");
+    mk = mask->data_ptr<uint8_t>();
+  }
   c10::cuda::CUDAGuard guard(x.device());
   const auto opts = x.options().dtype(at::kByte);
   at::Tensor q = at::empty({rows, k == kernels::QKind::kNVFP4 ? cols / 2 : cols}, opts);
@@ -69,8 +78,36 @@ std::tuple<at::Tensor, at::Tensor> quantize_blockscaled(const at::Tensor& x, con
   Runtime& rt = runtime(x.get_device());
   TS_CUDA_CHECK(kernels::quantize_blockscaled(k, out_dtype(x2.scalar_type()), x2.data_ptr(), rows, cols, g,
                                               q.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), rt.sm_count,
-                                              compute_stream(x.get_device())));
+                                              compute_stream(x.get_device()), mk));
   return {q, scales};
+}
+
+at::Tensor col_absmax(const at::Tensor& x) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2, "col_absmax: x must be a 2-D CUDA tensor");
+  const at::Tensor x2 = x.contiguous();
+  c10::cuda::CUDAGuard guard(x.device());
+  at::Tensor amax = at::zeros({x2.size(1)}, x2.options().dtype(at::kFloat));
+  TS_CUDA_CHECK(kernels::col_absmax(out_dtype(x2.scalar_type()), x2.data_ptr(), x2.size(0), x2.size(1),
+                                    amax.data_ptr<float>(), compute_stream(x.get_device())));
+  return amax;
+}
+
+at::Tensor dequantize_blockscaled_cols(const at::Tensor& q, const at::Tensor& scales, const at::Tensor& idx,
+                                       int64_t rows, int64_t cols, double global_decode, at::ScalarType dtype) {
+  TORCH_CHECK(q.is_cuda() && scales.device() == q.device() && idx.device() == q.device(),
+              "dequantize_blockscaled_cols: q, scales and idx must be on the same GPU");
+  TORCH_CHECK(cols % 32 == 0, "dequantize_blockscaled_cols: cols must be a multiple of 32");
+  TORCH_CHECK(idx.scalar_type() == at::kLong && idx.dim() == 1, "dequantize_blockscaled_cols: idx must be 1-D int64");
+  check_packed(kernels::QKind::kNVFP4, rows, cols, q, scales);
+  const at::Tensor ix = idx.contiguous();
+  c10::cuda::CUDAGuard guard(q.device());
+  at::Tensor out = at::empty({rows, ix.numel()}, q.options().dtype(dtype));
+  Runtime& rt = runtime(q.get_device());
+  TS_CUDA_CHECK(kernels::dequantize_nvfp4_cols(out_dtype(dtype), q.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+                                               ix.data_ptr<int64_t>(), ix.numel(), static_cast<float>(global_decode),
+                                               out.data_ptr(), rows, cols, rt.sm_count,
+                                               compute_stream(q.get_device())));
+  return out;
 }
 
 void dequantize_blockscaled(const at::Tensor& dst, const at::Tensor& q, const at::Tensor& scales,

@@ -29,14 +29,15 @@ except ImportError:
     sys.modules[__name__ + "._C"] = _C
 
 from .hooks import ActivationOffloader, GradientOffloader, ParamReadyHooks, find_blocks
-from .losses import causal_lm_loss, chunked_cross_entropy
+from .kvcache import PagedKVCache
+from .losses import causal_lm_loss, chunked_cross_entropy, dpo_loss, sequence_logprobs
 from .optimizer import OffloadAdamW
 from .paging import ParamPager
 from .profiler import HardwareProfile, profile_hardware
 from .quant import quantize_model
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "wrap",
@@ -44,8 +45,11 @@ __all__ = [
     "memory_report",
     "OffloadAdamW",
     "ParamPager",
+    "PagedKVCache",
     "chunked_cross_entropy",
     "causal_lm_loss",
+    "sequence_logprobs",
+    "dpo_loss",
     "ActivationOffloader",
     "GradientOffloader",
     "ParamReadyHooks",
@@ -56,6 +60,7 @@ __all__ = [
     "find_blocks",
     "pinned_stats",
     "transfer_stats",
+    "reserve_pinned",
 ]
 
 
@@ -64,6 +69,15 @@ def pinned_stats():
     stats = dict(_C.pinned_stats())
     stats["by_tag"] = dict(_C.pinned_tag_bytes())
     return stats
+
+
+def reserve_pinned(bytes_now: int, cap: int = 0, slab: int = 0) -> int:
+    """Page-lock `bytes_now` of host RAM for TrainStream's pinned arena now and
+    let it grow on demand up to `cap` (at least `bytes_now`), in slabs of
+    `slab` bytes (0: keep the current size, 1 GiB unless
+    TRAINSTREAM_HOST_ARENA_SLAB says otherwise). wrap(host_arena=...) does
+    this for you; returns the bytes reserved so far."""
+    return int(_C.pinned_reserve(int(bytes_now), int(slab), int(cap)))
 
 
 def transfer_stats(device=None):

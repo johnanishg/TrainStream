@@ -2,6 +2,7 @@
 
     python benchmarks/quality.py --model Qwen/Qwen2.5-1.5B
     python benchmarks/quality.py --model Qwen/Qwen2.5-14B --formats none nf4 nvfp4 --windows 16
+    python benchmarks/quality.py --formats none nf4 nvfp4-w nvfp4 nvfp4-o   # where NVFP4's loss comes from
 
 For every format the base is loaded with trainstream's load_model (quantized
 while read), given zero-initialised LoRA adapters (so the model is exactly the
@@ -25,7 +26,11 @@ import sys
 import sysconfig
 import time
 
-FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4"]
+FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4", "nvfp4-w", "nvfp4-o"]
+# variants of a stored format: nvfp4-w multiplies expanded weights (no activation
+# quantization: what 4-bit weights alone cost), nvfp4-o keeps 1% of the input
+# channels in bf16 on the tensor-core path (wrap(outliers=0.01))
+VARIANTS = {"nvfp4-w": ("nvfp4", {"weights_only": True}), "nvfp4-o": ("nvfp4", {"outliers": 0.01})}
 
 
 def corpus_files():
@@ -68,14 +73,18 @@ def worker(args):
     eval_w = torch.tensor(token_windows(tok, eval_files, args.windows, args.seq))
     train_w = torch.tensor(token_windows(tok, train_files, args.train_steps * args.batch, args.seq))
 
+    kind, extra = VARIANTS.get(args.format, (args.format, {}))
+    if extra.get("weights_only"):  # expanded before every matmul: only the weights are 4-bit
+        from trainstream import lowp
+        lowp.native_supported = lambda kind, device: False
     t0 = time.time()
-    model = load_model(args.model, quantize=args.format)
+    model = load_model(args.model, quantize=kind)
     model = peft.get_peft_model(model, peft.LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.0, task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))
     params = [p for p in model.parameters() if p.requires_grad]
     model, opt = trainstream.wrap(model, torch.optim.AdamW(params, lr=args.lr), device="cuda",
-                                  quantize=args.format if args.format != "none" else "none")
+                                  quantize=kind if kind != "none" else "none", outliers=extra.get("outliers", 0.0))
 
     def eval_loss():
         model.eval()

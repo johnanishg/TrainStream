@@ -38,6 +38,8 @@ class TrainStreamSession:
         self.candidates = None
         self._act_prev_bytes = 0
         self._act_step_bytes = 0
+        self._act_room_step: Optional[int] = None
+        self._act_room_done = False
         self._resident_check_step: Optional[int] = None
         self._watch_level = 0
         self.steps = 0
@@ -77,6 +79,8 @@ class TrainStreamSession:
                 max_inflight_bytes=cfg["max_inflight_bytes"], recompute=rc,
                 memory_pressure=bool(cfg.get("_act_forced")), vram_target=cfg.get("_vram_target"))
             self.activations.events = self.events
+            self.activations.weights_paged = lambda: self.pager is not None and bool(self.pager.remote)
+            self._act_room_step, self._act_room_done = None, False
 
     def teardown(self, materialize: bool = True) -> None:
         if self.pager is not None:
@@ -110,7 +114,7 @@ class TrainStreamSession:
         blocks' activations are paged or recomputed, the switch to resident mode):
         until it turns False, step times are not yet steady."""
         act = self.activations
-        if act is not None and act.phase != "fixed":
+        if act is not None and (act.phase != "fixed" or (act.adjustable and not self._act_room_done)):
             return True
         if self.planner is not None and self.pager is not None and not self.planner.done:
             return True
@@ -132,6 +136,8 @@ class TrainStreamSession:
                 self._refine_plan()
                 return
             self._watch_plan()
+        if self.activations is not None and not self._act_room_done and self.activations.phase == "fixed":
+            self._fill_activation_room()
         if self._resident_check_step is not None:
             if self.steps < self._resident_check_step:
                 return
@@ -184,6 +190,31 @@ class TrainStreamSession:
                     self.events.append(f"activations ({self._act_step_bytes / 2**30:.2f} GiB per step) fit in "
                                        "VRAM: activation paging switched off")
             self._resident_check_step = self.steps + 2  # measure a clean step, then consider resident mode
+
+    def _fill_activation_room(self) -> None:
+        """Once the activation policy is final (and the memory plan settled):
+        measure one clean step of it, then keep as many of the blocks "auto"
+        pages or recomputes in VRAM as the room left under the target holds."""
+        act, dev = self.activations, self.optimizer.device
+        if not act.adjustable or not (act.recompute or act.offload) or act.block_bytes <= 0:
+            self._act_room_done = True
+            return
+        if self._act_room_step is None:
+            torch.cuda.reset_peak_memory_stats(dev)  # the next step runs the final policy from start to end
+            self._act_room_step = self.steps + 1
+            return
+        if self.steps < self._act_room_step:
+            return
+        self._act_room_step, self._act_room_done = None, True
+        peak = torch.cuda.max_memory_allocated(dev)
+        target = self.planner.target if self.planner is not None else self.config.get("_vram_target") or 0
+        kept = act.keep_resident(int((target - peak) // (1.25 * act.block_bytes)))
+        if kept:
+            self.events.append(f"activations: step peak {peak / 2**30:.2f} GiB of {target / 2**30:.2f} GiB target "
+                               f"leaves room for {len(kept)} more blocks' activations: kept in VRAM "
+                               f"({len(act.recompute)} recomputed, {len(act.offload)} paged now)")
+            if not (act.recompute or act.offload):
+                self._resident_check_step = self.steps + 2  # nothing paged or recomputed: consider resident mode
 
     def _watch_plan(self) -> None:
         """After the plan settled: if a later step (longer sequences, a bigger
@@ -489,8 +520,10 @@ def wrap(
         offload: "auto" measures the first two steps and, if a stock optimizer
             would fit in VRAM, switches to torch.optim.AdamW(fused=True) — so
             small models are never slowed down. True always offloads.
-        activation_offload: "auto" (calibrate, then size from bandwidth), a
-            fraction in [0, 1], True (all but the last block) or False.
+        activation_offload: "auto" (default) measures them in the first step:
+            kept in VRAM if they fit under the VRAM target, otherwise paged to
+            host RAM as far as it holds them (see recompute for the rest). A
+            fraction in [0, 1], True (all but the last block) or False fix it.
         param_offload: page transformer-block weights to host RAM, streaming
             each block in just before it runs. "auto" (default) plans from the
             VRAM this process may use: as many blocks as fit stay resident, the
@@ -514,8 +547,11 @@ def wrap(
             (torch.nn.utils.clip_grad_norm_ cannot see streamed gradients).
         accumulation_steps: backward passes per optimizer.step(). In cpu mode
             without clipping, updates run eagerly during the last backward.
-        max_activation_slowdown: "auto" activation paging backs off until the
-            measured step time is within this fraction of the un-paged baseline.
+        max_activation_slowdown: without a VRAM target to measure against (an
+            ActivationOffloader used on its own), "auto" activation paging backs
+            off until the measured step time is within this fraction of the
+            un-paged baseline. wrap() always has a target: activations that fit
+            under it stay in VRAM instead.
         quantize: frozen weights only (a LoRA base; trained weights are never
             quantized). "auto" (default) quantizes only when the run cannot fit
             otherwise, trying "int8" before "nf4"; "none" never; "int8" / "nf4"
@@ -526,12 +562,13 @@ def wrap(
             picks NF4 when the bf16 weights would have to stream from RAM but the
             4-bit ones fit in VRAM — usually faster, no longer bit-exact.
         recompute: run a block's forward again in backward instead of keeping
-            or paging its activations. "auto" (default) does it only under
-            memory pressure (weights paged, all activations over PCIe), for as
-            many blocks as balances the link against the GPU, measured in the
-            first steps. True: every block but the last; False: never; a
-            fraction or block indices fix it. Off when the model already uses
-            gradient checkpointing (Hugging Face).
+            or paging its activations. "auto" (default) does it only when the
+            activations cannot all stay in VRAM (weights paged, or too large),
+            for as many blocks as the measured trials in the first steps show
+            is fastest; blocks go back to VRAM afterwards as far as the room
+            left under the target allows. True: every block but the last;
+            False: never; a fraction or block indices fix it. Off when the
+            model already uses gradient checkpointing (Hugging Face).
         attention: scaled_dot_product_attention backend. "auto" (default)
             times the backends once on the model's head shape and runs the
             fastest first (others stay as fallbacks); "cudnn", "efficient",

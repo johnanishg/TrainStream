@@ -17,7 +17,7 @@ import statistics
 import time
 import types
 import weakref
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -276,9 +276,12 @@ class ActivationOffloader:
     so streaming activations can cost more than computing them again.
 
     With ``vram_target`` set, ``"auto"`` first runs one probe step with every
-    block's activations paged (always safe), to measure them: only if they then
-    fit next to everything else is the calibration below run with them
-    resident; otherwise paging stays on (and the recompute balance runs).
+    block's activations paged (always safe), to measure them: if they then fit
+    next to everything else they stay in VRAM, with nothing paged or
+    recomputed; otherwise paging stays on (and the recompute balance runs).
+    The calibration below runs only without a target. Once the policy is
+    final, ``keep_resident`` moves blocks back to VRAM if the session finds
+    room under its target.
 
     ``offload`` may be a float fraction, an explicit set of block indices, or
     ``"auto"``, which runs a closed loop:
@@ -374,6 +377,11 @@ class ActivationOffloader:
         self._forced_recompute: Set[int] = set()
         self._probe_block: Optional[int] = None
         self._probe_forced = False
+        self.block_bytes = 0  # measured saved activations of one block
+        self.weights_paged: Optional[Callable[[], bool]] = None  # set by the session: are weights streamed now?
+        # Blocks that "auto" chose to page or recompute may later be kept in
+        # VRAM instead (keep_resident); explicit choices are left alone.
+        self.adjustable = (offload == "auto" or memory_pressure) and recompute in ("auto", False, None, 0)
         if recompute == "auto":
             # A probe step that is safe for VRAM *and* host RAM: one block's
             # activations are paged (to measure them), every other block is
@@ -462,6 +470,8 @@ class ActivationOffloader:
                     self.events.append(f"activations: settled on {k} of {self.n} blocks paged "
                                        f"({t:.0f} ms/step against {base:.0f} ms with none)")
                 self.decision["offloaded_blocks"] = float(len(self.offload))
+                if self.phase == "fixed":
+                    self._release_trial_memory()
 
     # -- module hooks --------------------------------------------------------
     def _root_pre(self, module, args):
@@ -651,7 +661,8 @@ class ActivationOffloader:
             frac = self.profile.activation_offload_fraction(blk_bytes, base_ms, self.n, reserved)
         else:
             frac = 1.0 if blk_bytes > 0 else 0.0
-        self.offload = set(range(self._blocks_for_fraction(frac)))
+        self.block_bytes = int(blk_bytes)
+        self.offload = set(range(min(self._blocks_for_fraction(frac), self._host_ram_blocks(blk_bytes))))
         p = self.profile
         self.decision = dict(
             block_fwd_ms=fwd_ms,
@@ -675,10 +686,9 @@ class ActivationOffloader:
                               if self.phase == "tune" else "kept in VRAM"))
 
     def _finish_probe(self) -> None:
-        """After the probe step: resident calibration only if the measured
-        activations fit next to what stays allocated between steps; otherwise
-        page what host RAM can hold and recompute the rest."""
-        from .planner import available_ram_bytes, local_processes
+        """After the probe step: keep the activations in VRAM if they fit next
+        to what stays allocated between steps; otherwise page what host RAM can
+        hold and recompute the rest."""
         n_eligible = max(self.n - 1, 0)  # the last block is never paged
         if self._probe_block is not None:
             blk = self._measure_bytes.get(self._probe_block, 0)
@@ -691,10 +701,15 @@ class ActivationOffloader:
                              probe_vram_target=float(self.vram_target or 0))
         fits = self.vram_target and steady + 1.25 * total <= self.vram_target
         if fits and not self._probe_forced:
-            self.set_recompute(set())
+            # Paging or recomputing activations that fit would only cost time:
+            # the VRAM it frees has no taker.
+            if self._recompute_pending:
+                self.set_recompute(set())
             self.offload = set()
-            self.phase = "calibrate"
-            self._calib_target = self._calibrate_steps
+            self.phase = "fixed"
+            self.decision["probe"] = "activations fit in VRAM: kept there"
+            self.events.append(f"activations: {total / 2**30:.1f} GiB per step fit next to {steady / 2**30:.1f} GiB "
+                               f"in the {self.vram_target / 2**30:.1f} GiB VRAM target: kept in VRAM")
             return
         self.phase = "fixed"
         if self._probe_block is None:  # recompute disabled: keep paging all of them
@@ -704,14 +719,18 @@ class ActivationOffloader:
                                f"target: all paged")
             return
         # page as many as host RAM can hold (pinned, plus room for everything else), recompute the rest
-        ram = available_ram_bytes() // max(local_processes(), 1)
-        k = n_eligible if blk <= 0 else min(n_eligible, int(0.6 * ram // blk))
+        self.block_bytes = int(blk)
+        k = min(n_eligible, self._host_ram_blocks(blk))
         order = list(range(n_eligible))
         self.offload = set(order[:k])  # the earliest blocks: backward reaches them last, prefetch has time
         self._forced_recompute = set(order[k:])
         self.set_recompute(self._forced_recompute)
-        why = "the weights already page over PCIe" if self._probe_forced else \
-            f"{total / 2**30:.1f} GiB do not fit next to {steady / 2**30:.1f} GiB in VRAM"
+        if not self._probe_forced:
+            why = f"{total / 2**30:.1f} GiB do not fit next to {steady / 2**30:.1f} GiB in VRAM"
+        elif self.weights_paged is None or self.weights_paged():
+            why = "the weights page over PCIe"
+        else:  # the memory plan has since made every block resident; what is left over is filled later
+            why = "measured while the memory plan settles"
         self.events.append(f"activations: {blk / 2**20:.0f} MiB per block ({why}); host RAM holds {k} of "
                            f"{n_eligible} blocks' activations, the other {n_eligible - k} are recomputed")
         if self.offload:
@@ -737,6 +756,7 @@ class ActivationOffloader:
         self.phase = "fixed"
         if fwd_ms <= 0 or blk_bytes <= 0:
             return
+        self.block_bytes = int(blk_bytes)
         p = self.profile
         link_ms = p.link_ms(blk_bytes, blk_bytes) if p else 2 * blk_bytes / 25e9 * 1e3
         reserved = p.link_ms(*self.reserved_link_bytes) if p else 0.0
@@ -749,7 +769,8 @@ class ActivationOffloader:
         # Baseline (nothing recomputed) was just measured; try the model's
         # answer and recomputing every streamed block, keep the fastest.
         base = self._trial_ms[1:] or self._trial_ms
-        self._trial_results = {0: statistics.median(base)} if base else {}
+        # Results are keyed by every recomputed block, those host RAM cannot hold included.
+        self._trial_results = {len(self.recompute): statistics.median(base)} if base else {}
         self._offload_all = set(self.offload)
         self._trials = [k for k in dict.fromkeys([r, m]) if k > 0]
         self._next_trial(first=True)
@@ -770,8 +791,9 @@ class ActivationOffloader:
             self._apply_recompute_count(self._trials.pop(0))
             self.phase = "trial"
             return
-        best = min(self._trial_results, key=self._trial_results.get) if self._trial_results else 0
-        self._apply_recompute_count(best)
+        forced = len(self._forced_recompute)
+        best = min(self._trial_results, key=self._trial_results.get) if self._trial_results else forced
+        self._apply_recompute_count(max(0, best - forced))  # the key counts the forced blocks too
         self.phase = "fixed"
         self.decision = dict(self.decision, recompute_blocks=sorted(self.recompute),
                              recompute_trials_ms={str(k): v for k, v in sorted(self._trial_results.items())},
@@ -779,6 +801,39 @@ class ActivationOffloader:
         tried = ", ".join(f"{k} recomputed {v:.0f} ms" for k, v in sorted(self._trial_results.items()))
         self.events.append(f"activations: {len(self.recompute)} of {self.n} blocks recomputed in backward, "
                            f"{len(self.offload)} paged (measured step times: {tried})")
+        self._release_trial_memory()
+
+    @staticmethod
+    def _release_trial_memory() -> None:
+        """Tuning is over. The page-locked host memory that its larger trials
+        cached (activations of blocks no longer paged) goes back to the OS;
+        blocks still in use are untouched."""
+        _C.pinned_empty_cache()
+        _C.pinned_arena_trim()
+
+    @staticmethod
+    def _host_ram_blocks(blk: float) -> int:
+        """How many blocks' activations host RAM can hold, page-locked, with
+        room left for everything else."""
+        from .planner import available_ram_bytes, local_processes
+        if blk <= 0:
+            return 1 << 30
+        return int(0.6 * (available_ram_bytes() // max(local_processes(), 1)) // blk)
+
+    def keep_resident(self, k: int) -> List[int]:
+        """Keep the activations of up to k blocks that "auto" pages or
+        recomputes in VRAM instead: the latest ones, which backward reaches
+        first (and which are the recomputed ones). Returns the blocks moved."""
+        if k <= 0 or not self.adjustable or self.phase != "fixed":
+            return []
+        kept = sorted(self.recompute | self.offload)[-k:]
+        self.set_recompute(self.recompute - set(kept))
+        self.offload -= set(kept)
+        self._forced_recompute -= set(kept)
+        self._offload_all -= set(kept)
+        # recompute_blocks stays what the trials chose; kept_blocks left it (or the paged set) later
+        self.decision = dict(self.decision, kept_blocks=sorted(set(self.decision.get("kept_blocks", ())) | set(kept)))
+        return kept
 
     @property
     def policy(self) -> List[str]:

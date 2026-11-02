@@ -15,12 +15,18 @@ quantized base) and wrapped. Then:
 Text: the Python standard library's own source files (offline, identical on
 every machine), split into a training half and a held-out half by file.
 Writes JSON to --out and prints a table. Each format runs in a fresh process.
+
+    python benchmarks/quality.py --format nf4 --live    one format, as the test UI runs it
+
+--live (worker only) prints progress as `LIVE {json}` lines (phase, eval batch,
+training step) and the result as one `RESULT {json}` line, also on failure.
 """
 
 import argparse
 import json
 import math
 import os
+import platform
 import subprocess
 import sys
 import sysconfig
@@ -58,7 +64,23 @@ def token_windows(tok, files, n, seq):
     return out
 
 
+def live(args, kind, **fields):
+    if args.live:
+        print("LIVE " + json.dumps(dict(kind=kind, t=time.time(), **fields)), flush=True)
+
+
 def worker(args):
+    try:
+        return _worker(args)
+    except BaseException as exc:
+        if args.live:  # the reason, before the traceback that follows on stderr
+            print("RESULT " + json.dumps(dict(format=args.format, error=f"{type(exc).__name__}: {exc}"[:600])),
+                  flush=True)
+        raise
+
+
+def _worker(args):
+    live(args, "phase", phase="starting")
     import peft
     import torch
     from transformers import AutoTokenizer
@@ -77,6 +99,9 @@ def worker(args):
     if extra.get("weights_only"):  # expanded before every matmul: only the weights are 4-bit
         from trainstream import lowp
         lowp.native_supported = lambda kind, device: False
+    env = dict(python=platform.python_version(), torch=torch.__version__, cuda=torch.version.cuda,
+               gpu=torch.cuda.get_device_name(), trainstream=trainstream.__version__)
+    live(args, "phase", phase="loading", env=env)
     t0 = time.time()
     model = load_model(args.model, quantize=kind)
     model = peft.get_peft_model(model, peft.LoraConfig(
@@ -85,8 +110,9 @@ def worker(args):
     params = [p for p in model.parameters() if p.requires_grad]
     model, opt = trainstream.wrap(model, torch.optim.AdamW(params, lr=args.lr), device="cuda",
                                   quantize=kind if kind != "none" else "none", outliers=extra.get("outliers", 0.0))
+    load_s = time.time() - t0
 
-    def eval_loss():
+    def eval_loss(which):
         model.eval()
         tot, n = 0.0, 0
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -94,12 +120,16 @@ def worker(args):
                 ids = eval_w[i:i + 2].cuda()
                 tot += model(input_ids=ids, labels=ids).loss.float().item() * len(ids)
                 n += len(ids)
+                live(args, "eval", which=which, done=n, of=len(eval_w))
         model.train()
         return tot / n
 
-    base = eval_loss()
+    live(args, "phase", phase="eval_base", load_s=load_s)
+    base = eval_loss("base")
+    live(args, "phase", phase="training", base_ppl=math.exp(base))
     losses = []
     for s in range(args.train_steps):
+        t1 = time.time()
         ids = train_w[s * args.batch:(s + 1) * args.batch].cuda()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = model(input_ids=ids, labels=ids).loss
@@ -107,12 +137,15 @@ def worker(args):
         opt.step()
         opt.zero_grad()
         losses.append(loss.item())
+        live(args, "step", i=s + 1, of=args.train_steps, loss=losses[-1], step_s=time.time() - t1)
     opt.synchronize()
-    tuned = eval_loss()
+    live(args, "phase", phase="eval_tuned")
+    tuned = eval_loss("tuned")
     rep = trainstream.memory_report(model)
-    print(json.dumps(dict(format=args.format, base_loss=base, base_ppl=math.exp(base), tuned_loss=tuned,
-                          tuned_ppl=math.exp(tuned), train_losses=losses, seconds=time.time() - t0,
-                          events=[e for e in rep["events"] if "quantized" in e or "tensor cores" in e])))
+    out = dict(format=args.format, base_loss=base, base_ppl=math.exp(base), tuned_loss=tuned,
+               tuned_ppl=math.exp(tuned), train_losses=losses, seconds=time.time() - t0, load_s=load_s,
+               events=[e for e in rep["events"] if "quantized" in e or "tensor cores" in e], env=env)
+    print(("RESULT " if args.live else "") + json.dumps(out), flush=True)
 
 
 def main():
@@ -125,7 +158,8 @@ def main():
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--format", default=None, help=argparse.SUPPRESS)  # worker mode
+    ap.add_argument("--format", default=None, choices=FORMATS, help="run only this format, in this process")
+    ap.add_argument("--live", action="store_true", help="with --format: progress as LIVE {json} lines")
     args = ap.parse_args()
     if args.format is not None:
         return worker(args)

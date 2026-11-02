@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 import trainstream
-from trainstream.hooks import recompute_count
+from trainstream.hooks import ActivationOffloader, recompute_count
 
 from test_quant import HP, make, tokens, train, trainable
 
@@ -93,12 +93,36 @@ def test_auto_recompute_engages_only_under_memory_pressure():
         assert s.activations.phase == "fixed"
         d = s.activations.decision
         assert "recompute_block_fwd_ms" in d and d["recompute_block_bytes"] > 0
-        assert set(d["recompute_blocks"]) == s.activations.recompute
+        kept = set(d.get("kept_blocks", ()))  # VRAM left over afterwards keeps these blocks' activations
+        assert set(d["recompute_blocks"]) - kept == s.activations.recompute
+        assert not kept & (s.activations.recompute | s.activations.offload)
         trials = {int(k): v for k, v in d["recompute_trials_ms"].items()}
         assert 0 in trials and len(trials) >= 2  # the baseline and at least one tried setting
-        assert len(s.activations.recompute) == min(trials, key=trials.get)  # the fastest measured one is kept
+        assert len(d["recompute_blocks"]) == min(trials, key=trials.get)  # the fastest measured one is applied
     finally:
         trainstream.unwrap(m)
+
+
+def test_trials_apply_the_measured_setting_when_host_ram_forces_recompute():
+    # Trial keys count every recomputed block, those host RAM cannot hold
+    # included: the setting applied must be the one measured, not one shifted
+    # by the forced blocks.
+    m = make().cuda()
+    off = ActivationOffloader(m, list(m.blocks), offload=False, recompute=False)
+    try:
+        off._forced_recompute = {4}  # host RAM could not hold block 4's activations
+        off._offload_all = {0, 1, 2, 3}
+        off._trial_results = {1: 30.0, 2: 10.0, 5: 20.0}  # forced only; one more recomputed; all of them
+        off._next_trial(first=True)
+        assert off.recompute == {3, 4} and off.offload == {0, 1, 2}
+        assert off.decision["recompute_blocks"] == [3, 4]
+        # VRAM found later: the latest (recomputed) blocks are kept first
+        off.adjustable = True
+        assert off.keep_resident(1) == [4]
+        assert off.recompute == {3} and off.offload == {0, 1, 2} and off.policy[4] == "keep"
+        assert off.keep_resident(10) == [0, 1, 2, 3] and not off.recompute and not off.offload
+    finally:
+        off.remove()
 
 
 def test_recompute_keeps_the_model_from_going_resident():

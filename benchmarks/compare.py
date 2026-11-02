@@ -114,12 +114,34 @@ def live(kind, **fields):
         print("LIVE " + json.dumps(dict(kind=kind, t=time.time(), **fields), default=str), flush=True)
 
 
+def source_version(name):
+    """__version__ as written in the package `import name` would load, without importing it.
+    A source tree on the path can sit next to a stale *.egg-info, which metadata.version
+    would answer with instead."""
+    import importlib.util
+    import re
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not (spec.origin or "").endswith("__init__.py"):
+        return None
+    try:
+        with open(spec.origin, encoding="utf-8") as fh:
+            m = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", fh.read(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
 def versions():
     from importlib import metadata
     out = {}
     for name in LIBRARIES:
         mod = sys.modules.get(name)
         v = getattr(mod, "__version__", None) if mod is not None else None
+        if v is None:
+            v = source_version(name)
         if v is None:
             try:
                 v = metadata.version(name)

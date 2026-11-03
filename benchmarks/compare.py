@@ -3,6 +3,7 @@ and DeepSpeed ZeRO-Offload, on the same GPU, model, data and settings.
 
     python benchmarks/compare.py --scenario lora14b --engines stock bnb_qlora unsloth trainstream_nf4 trainstream_nvfp4
     python benchmarks/compare.py --scenario full1.5b --engines stock deepspeed trainstream
+    python benchmarks/compare.py --scenario lora14b_2k --engines bnb_qlora trainstream_nf4 --profile 2
 
 Every (engine, scenario) runs in a fresh process; a run that does not fit is
 recorded as "out of memory", one whose library is not installed as "not
@@ -10,6 +11,25 @@ installed". Same data for all: fixed random tokens. Results: JSON lines to
 --out and a Markdown table on stdout. The rival libraries are only needed in
 the benchmark environment (benchmarks/requirements-bench.txt), never by
 TrainStream itself.
+
+While an engine trains, the GPU's SM clock, temperature, power draw and clock
+limits are sampled four times a second through NVML (the driver's library;
+nvidia-smi every 2 s where it can't be loaded); the result carries them for
+the measured steps ("gpu"), so a report can tell a slower GPU from a slower
+engine (a laptop GPU's clocks follow its temperature and power limits, and
+its power limit moves when the CPU draws more).
+
+--profile N runs N more steps after the measured ones under torch.profiler
+(GPU activity only) and reports where a step's time goes: GPU time per kernel
+category (GEMM, attention, quantize / dequantize, elementwise & norm, loss,
+optimizer, other), host <-> GPU copies, and how much of the step the GPU spends
+computing, only copying (transfers not hidden behind compute) or idle (waiting
+on the host). Tracing slows a step a little, so the profiled step time is a bit
+above the measured one; the measured numbers never include profiled steps.
+Engines slower than PROFILE_MAX_S per step are not profiled. --profile-ops adds
+another N steps traced on the CPU side too, with input shapes, and lists the
+operations whose kernels took the most GPU time (e.g. aten::mm [[512, 13824],
+[13824, 5120]]): slower to trace and heavier on host RAM, so it is opt-in.
 
 Scenarios
   full1.5b      Qwen2.5-1.5B, every parameter trained, batch 4 x 512
@@ -29,6 +49,7 @@ Engines
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -67,6 +88,20 @@ SETTLE = 1
 MAX_ADAPT = 40  # at most this many extra warm-up steps; past it the run is measured anyway (and says so)
 SEED = 0  # the random-token data
 SAMPLE_S = 0.5  # --live memory sampling interval
+PROFILE = 0  # --profile N: steps traced after the measured ones (0: off)
+PROFILE_OPS = False  # --profile-ops: N more steps traced with the operations (and shapes) that launch the kernels
+OPS_TOP = 25
+PROFILE_MAX_S = 60.0  # engines slower than this per step are not profiled (a long trace for little news)
+# GPU kernel categories, matched against the kernel's full (demangled) name; the first match wins
+KERNEL_CATEGORIES = [
+    ("attention", r"flash|fmha|attention|sdpa|attn"),
+    ("GEMM", r"gemm|xmma|nvjet|cutlass|cublas|wgmma|tensorop|matmul|splitkreduce"),
+    ("quantize / dequantize", r"quant|absmax|nf4|fp4|e2m1|blockwise"),
+    ("loss", r"cross_?entropy|nll_?loss|log_?soft_?max"),
+    ("optimizer", r"adam|multi_tensor_apply|foreach|optim|sq_norm|clip"),
+    ("elementwise & norm", r"elementwise|reduce|norm|moments|silu|gelu|swiglu|fg_kernel|rotary|rope|embed|cat_|"
+                           r"catarray|copy|index|gather|scatter|fill|where|softmax|triton|unrolled|vectorized"),
+]
 
 
 LIVE = False  # --live: also print "LIVE {json}" lines while running (for the test UI)
@@ -171,6 +206,147 @@ class Sampler(threading.Thread):
                          vram_reserved_gb=torch.cuda.memory_reserved() / 1e9,
                          gpu_used_gb=(total - free) / 1e9, gpu_total_gb=total / 1e9)
             live("sample", **s)
+
+
+GPU_SAMPLE_S = 0.25  # NVML samples of the GPU's clock while an engine trains
+SMI_SAMPLE_S = 2.0  # nvidia-smi samples (a process each) where NVML can't be loaded
+# why the driver held the SM clock down (NVML's clocks event reasons, nvidia-smi's clocks_event_reasons)
+CLOCK_LIMITS = {0x4: "power cap", 0x8: "hardware slowdown", 0x20: "thermal limit", 0x40: "hardware thermal limit",
+                0x80: "power brake"}
+
+
+def gpu_target():
+    """CUDA device 0 for NVML / nvidia-smi -i: its PCI bus id (they number GPUs differently)."""
+    import torch
+    p = torch.cuda.get_device_properties(0)
+    if getattr(p, "pci_bus_id", None) is None:
+        return "0"
+    return f"{getattr(p, 'pci_domain_id', 0):08X}:{p.pci_bus_id:02X}:{getattr(p, 'pci_device_id', 0):02X}.0"
+
+
+def nvidia_smi():
+    """nvidia-smi's path: on PATH, else where WSL keeps it (a benchmark env's PATH may leave it out)."""
+    return shutil.which("nvidia-smi") or ("/usr/lib/wsl/lib/nvidia-smi" if os.path.exists("/usr/lib/wsl/lib/nvidia-smi")
+                                          else None)
+
+
+class Nvml:
+    """The few NVML calls GpuWatch needs, through ctypes: the library comes with the driver,
+    and a call costs microseconds where nvidia-smi starts a process. OSError without it."""
+
+    LIBS = (("nvml.dll", r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll") if os.name == "nt"
+            else ("libnvidia-ml.so.1", "/usr/lib/wsl/lib/libnvidia-ml.so.1"))
+
+    def __init__(self, target="0"):
+        import ctypes
+        self.c, lib = ctypes, None
+        for name in self.LIBS:
+            try:
+                lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if lib is None or lib.nvmlInit_v2() != 0:
+            raise OSError("NVML can't be loaded")
+        self.lib, self.h = lib, ctypes.c_void_p()
+        found = target != "0" and lib.nvmlDeviceGetHandleByPciBusId_v2(target.encode(), ctypes.byref(self.h)) == 0
+        if not found and lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(self.h)) != 0:
+            lib.nvmlShutdown()
+            raise OSError("NVML sees no GPU")
+        self.reasons = (getattr(lib, "nvmlDeviceGetCurrentClocksEventReasons", None)
+                        or getattr(lib, "nvmlDeviceGetCurrentClocksThrottleReasons", None))  # older drivers
+
+    def sample(self):
+        """(SM MHz, °C, W, limits bitmask), None for what the driver doesn't report; None without a clock."""
+        c, lib, h = self.c, self.lib, self.h
+        sm, temp, mw, why = c.c_uint(), c.c_uint(), c.c_uint(), c.c_ulonglong()
+        if lib.nvmlDeviceGetClockInfo(h, 1, c.byref(sm)) != 0:  # NVML_CLOCK_SM
+            return None
+        return (float(sm.value),
+                float(temp.value) if lib.nvmlDeviceGetTemperature(h, 0, c.byref(temp)) == 0 else None,
+                mw.value / 1000.0 if lib.nvmlDeviceGetPowerUsage(h, c.byref(mw)) == 0 else None,
+                why.value if self.reasons is not None and self.reasons(h, c.byref(why)) == 0 else None)
+
+    def close(self):
+        self.lib.nvmlShutdown()
+
+
+class GpuWatch(threading.Thread):
+    """The GPU's SM clock, temperature, power draw and clock limits every GPU_SAMPLE_S seconds
+    through NVML, else every SMI_SAMPLE_S from nvidia-smi (no Python dependency either way): a
+    laptop GPU's clocks follow its temperature and power, so a report can tell a slower GPU from
+    a slower engine. Silent without either."""
+
+    FIELDS = ("clocks.sm,temperature.gpu,power.draw,clocks_event_reasons.active",
+              "clocks.sm,temperature.gpu,power.draw,clocks_throttle_reasons.active",  # older drivers
+              "clocks.sm,temperature.gpu,power.draw")
+
+    def __init__(self, target="0"):
+        super().__init__(daemon=True)
+        self.target = target
+        self.targets = [target] if target == "0" else [target, "0"]
+        self.fields = None
+        self.samples = []  # (time, SM MHz, °C, W or None, limits bitmask or None)
+        self.done = threading.Event()
+
+    def _smi(self, exe):
+        """One nvidia-smi sample as Nvml.sample() gives it, or None when it can't answer."""
+        def num(x):
+            try:
+                return float(x)
+            except ValueError:
+                return None  # "[N/A]"
+        for target in self.targets:
+            for fields in [self.fields] if self.fields else self.FIELDS:
+                try:
+                    res = subprocess.run([exe, f"--query-gpu={fields}", "--format=csv,noheader,nounits", "-i", target],
+                                         capture_output=True, text=True, timeout=15)
+                except (OSError, subprocess.TimeoutExpired):
+                    return None
+                if res.returncode == 0 and res.stdout.strip():
+                    self.targets, self.fields = [target], fields
+                    v = [x.strip() for x in res.stdout.strip().splitlines()[0].split(",")]
+                    return (num(v[0]), num(v[1]), num(v[2]),
+                            int(v[3], 16) if len(v) > 3 and v[3].startswith("0x") else None)
+        return None
+
+    def run(self):
+        try:
+            nvml = Nvml(self.target)
+        except OSError:
+            nvml = None
+        exe = None if nvml else nvidia_smi()
+        if nvml is None and exe is None:
+            return
+        try:
+            while not self.done.is_set():
+                t = time.time()
+                vals = nvml.sample() if nvml else self._smi(exe)
+                if vals is None and nvml is None:
+                    return
+                if vals is not None and vals[0] is not None:
+                    self.samples.append((t,) + tuple(vals))
+                self.done.wait(GPU_SAMPLE_S if nvml else SMI_SAMPLE_S)
+        finally:
+            if nvml is not None:
+                nvml.close()
+
+    def summary(self, t0, t1):
+        """The samples taken between t0 and t1 (else every sample): median SM clock, its lowest,
+        the hottest temperature, median power and the clock limits seen."""
+        xs = [s for s in self.samples if t0 <= s[0] <= t1] or list(self.samples)
+        if not xs:
+            return None
+
+        def median(v):
+            v = sorted(x for x in v if x is not None)
+            return v[len(v) // 2] if v else None
+        seen = 0
+        for s in xs:
+            seen |= s[4] or 0
+        return dict(samples=len(xs), sm_mhz=median(s[1] for s in xs), sm_mhz_min=min(s[1] for s in xs),
+                    temp_c_max=max((s[2] for s in xs if s[2] is not None), default=None),
+                    power_w=median(s[3] for s in xs), limits=[n for bit, n in CLOCK_LIMITS.items() if seen & bit])
 
 
 def batches(vocab, batch, seq):
@@ -322,12 +498,189 @@ def build(engine, sc):
         used = (session.config.get("quantize") if session is not None else None) or "none"
         step = plain_step(model, opt)
         step.session = session  # the worker reports the decisions TrainStream logs while training
+        step.drain = getattr(opt, "synchronize", None)  # its host optimizer runs behind the step: wait for it
         if session is not None:
             step.adapting = lambda: session.adapting  # still tuning itself: those steps are warm-up
         return model, step, dict(base=f"quantize={kind}" + (f" → {used}" if used != kind else "") + " (TrainStream)",
                                  quantize_used=used, **optimizer_info(opt))
 
     raise ValueError(engine)
+
+
+def kernel_category(name):
+    import re
+    for cat, pattern in KERNEL_CATEGORIES:
+        if re.search(pattern, name, re.I):
+            return cat
+    return "other"
+
+
+def mangled_identifiers(name):
+    """The <length><identifier> runs of an Itanium-mangled name, in order (a scan,
+    not a demangler: enough to name a kernel)."""
+    out, i, n, after_token = [], 0, len(name), False
+    while i < n:
+        # a length starts right after a token (which may end in a digit) or after a non-digit
+        if name[i].isdigit() and (after_token or not name[i - 1].isdigit()):
+            j = i
+            while j < n and name[j].isdigit():
+                j += 1
+            tok = name[j:j + int(name[i:j])]
+            if len(tok) >= 3 and len(tok) == int(name[i:j]) and (tok[0].isalpha() or tok[0] == "_") \
+                    and all(c.isalnum() or c == "_" for c in tok):
+                out.append(tok)
+                i, after_token = j + len(tok), True
+                continue
+            i = j
+        else:
+            i += 1
+        after_token = False
+    return out
+
+
+def short_kernel(name):
+    """A kernel's name without return type, namespaces, template and call arguments.
+    Traces on Windows carry mangled names: the first identifier that is not a
+    namespace or a generic wrapper (cutlass's Kernel2: then its template argument)."""
+    import re
+    if name.startswith("_Z"):
+        for tok in mangled_identifiers(name):
+            if not (tok.startswith("_GLOBAL__N") or (tok.isalpha() and tok.islower())
+                    or re.fullmatch(r"(device_)?kernel\d*", tok, re.I)):
+                return tok[:90]
+        return name[:90]
+    s = name[5:] if name.startswith("void ") else name
+    s = s.replace("(anonymous namespace)::", "")
+    base = s
+    for stop in ("<", "("):
+        base = base.split(stop, 1)[0]
+    base = base.rsplit("::", 1)[-1] or name
+    if re.fullmatch(r"(device_)?kernel\d*", base, re.I) and "<" in s:  # cutlass::Kernel2<the GEMM's own name>
+        arg = s.split("<", 1)[1]
+        for stop in ("<", "(", ",", ">"):
+            arg = arg.split(stop, 1)[0]
+        base = arg.strip().rsplit("::", 1)[-1] or base
+    return base[:90]
+
+
+def busy_us(spans):
+    """Length of the union of (start, end) intervals (overlap across streams counted once)."""
+    total, cur = 0.0, None
+    for a, b in sorted(spans):
+        if cur is None or a > cur[1]:
+            if cur is not None:
+                total += cur[1] - cur[0]
+            cur = [a, b]
+        else:
+            cur[1] = max(cur[1], b)
+    return total + (cur[1] - cur[0] if cur is not None else 0.0)
+
+
+def summarize_trace(events, wall_s, n):
+    """Per step, from a chrome trace's GPU events: see the module docstring (--profile)."""
+    kernels, k_spans, all_spans, named = {}, [], [], {}
+    copies = dict(h2d_ms=0.0, d2h_ms=0.0, d2d_ms=0.0, h2d_gb=0.0, d2h_gb=0.0, d2d_gb=0.0)
+    count = 0
+    for e in events:
+        cat = e.get("cat")
+        if cat not in ("kernel", "gpu_memcpy", "gpu_memset") or "dur" not in e or "ts" not in e:
+            continue
+        a = float(e["ts"])
+        b = a + float(e["dur"])
+        all_spans.append((a, b))
+        name = e.get("name") or "?"
+        if cat == "kernel":
+            count += 1
+            k_spans.append((a, b))
+            if name not in named:  # (short name, category), per full name: instances of one template differ
+                named[name] = (short_kernel(name), kernel_category(name))
+            k = kernels.setdefault(named[name], dict(us=0.0, calls=0))
+            k["us"] += b - a
+            k["calls"] += 1
+        elif cat == "gpu_memcpy":
+            way = "h2d" if "HtoD" in name else "d2h" if "DtoH" in name else "d2d"
+            copies[f"{way}_ms"] += (b - a) / 1000.0
+            copies[f"{way}_gb"] += float((e.get("args") or {}).get("bytes") or 0) / 1e9
+    if not count:
+        return dict(error="the profiler saw no GPU kernels here (GPU tracing through CUPTI unavailable?)")
+
+    def per(us):  # microseconds in total -> ms per step
+        return round(us / 1000.0 / n, 2)
+    compute, anything = busy_us(k_spans), busy_us(all_spans)
+    categories = {}
+    for (_, c), k in kernels.items():
+        categories[c] = categories.get(c, 0.0) + k["us"]
+    top = sorted(kernels.items(), key=lambda kv: -kv[1]["us"])[:10]
+    step_ms = wall_s * 1000.0 / n
+    return dict(steps=n, step_ms=round(step_ms, 1), compute_ms=per(compute),
+                copy_only_ms=per(anything - compute), idle_ms=round(max(step_ms - anything / 1000.0 / n, 0.0), 2),
+                kernel_ms=per(sum(k["us"] for k in kernels.values())), kernels_per_step=round(count / n),
+                categories={c: per(us) for c, us in sorted(categories.items(), key=lambda kv: -kv[1])},
+                copies={k: round(v / n, 3) for k, v in copies.items()},
+                top=[dict(name=name, category=c, ms=per(k["us"]), calls=round(k["calls"] / n, 1))
+                     for (name, c), k in top])
+
+
+def profile_steps(step, data, n):
+    """Run n more steps under torch.profiler (GPU activity) and summarize the trace."""
+    import tempfile
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+    fd, path = tempfile.mkstemp(prefix="ts-profile-", suffix=".json")
+    os.close(fd)
+    # An engine whose optimizer runs on host threads behind the step (TrainStream) keeps issuing
+    # copies after step() returns; the tracer starts and stops only once that work has landed
+    # (stopping it under them is the likely cause of a crash seen once on Windows).
+    drain = getattr(step, "drain", None) or (lambda: None)
+    try:
+        batches_ = [next(data) for _ in range(n)]
+        drain()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            t = time.perf_counter()
+            for ids in batches_:
+                step(ids.cuda())
+            drain()
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - t
+        prof.export_chrome_trace(path)
+        with open(path, encoding="utf-8") as fh:
+            events = json.load(fh).get("traceEvents") or []
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return summarize_trace(events, wall, n)
+
+
+def profile_ops(step, data, n, top=OPS_TOP):
+    """Run n more steps traced with the CPU-side operations and their input shapes; the top
+    operations by the GPU time of the kernels they launched themselves, per step."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+    drain = getattr(step, "drain", None) or (lambda: None)
+    batches_ = [next(data) for _ in range(n)]
+    drain()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        for ids in batches_:
+            step(ids.cuda())
+        drain()
+        torch.cuda.synchronize()
+    rows = []
+    cpu = torch.autograd.DeviceType.CPU
+    for e in prof.key_averages(group_by_input_shape=True):
+        if getattr(e, "device_type", cpu) != cpu:
+            continue  # the kernels themselves: counted under the operation that launched them
+        us = getattr(e, "self_device_time_total", None)
+        if us is None:
+            us = getattr(e, "self_cuda_time_total", 0)
+        if us > 0:
+            shapes = [list(x) for x in (e.input_shapes or []) if x]
+            rows.append(dict(op=e.key, shapes=str(shapes)[:200], calls=round(e.count / n, 1), ms=round(us / 1000.0 / n, 2)))
+    rows.sort(key=lambda r: -r["ms"])
+    return rows[:top]
 
 
 def describe(model, cfg, setup):
@@ -400,10 +753,14 @@ def worker(engine, scenario, steps):
         sampler.phase = "training"
         live("phase", phase="training")
     take_events(0)  # decided while wrapping
+    watch = GpuWatch(gpu_target())
+    watch.start()
+    starts = []  # wall time each step began: the GPU samples of the measured steps
     try:
         while len(times) < method["steps"]:
             ids = next(data)
             torch.cuda.synchronize()
+            starts.append(time.time())
             t = time.perf_counter()
             losses.append(step(ids.cuda()))
             torch.cuda.synchronize()
@@ -424,9 +781,34 @@ def worker(engine, scenario, steps):
         return out
     finally:
         sampler.done.set()
+        watch.done.set()
     tail = sorted(times[method["warmup"]:] or times)
     out.update(status="ok", step_s=tail[len(tail) // 2], tokens_per_s=sc["batch"] * sc["seq"] / tail[len(tail) // 2],
-               vram_peak_gb=peak.gb(), rss_peak_gb=rss_gb(), losses=losses[:5], step_times=times)
+               vram_peak_gb=peak.gb(), rss_peak_gb=rss_gb(), losses=losses[:5], step_times=times,
+               gpu=watch.summary(starts[min(method["warmup"], len(starts) - 1)], time.time()))
+    if PROFILE:  # after the measurements: the peaks and the step time above never include traced steps
+        if out["step_s"] > PROFILE_MAX_S:
+            out["profile"] = dict(skipped=f"{out['step_s']:.0f} s per step, over the {PROFILE_MAX_S:.0f} s "
+                                          f"profiling limit")
+        else:
+            # the measured result first: readers keep the last RESULT line, so it stands even if
+            # tracing takes the process down (GPU tracing support varies, e.g. under WSL2)
+            print("RESULT " + json.dumps(out), flush=True)
+            live("phase", phase="profiling", steps=PROFILE)
+            try:
+                out["profile"] = profile_steps(step, data, PROFILE)
+            except torch.OutOfMemoryError:
+                out["profile"] = dict(error="out of memory while profiling (the measured results stand)")
+            except Exception as exc:  # noqa: BLE001 - a profile is extra; the run itself succeeded
+                out["profile"] = dict(error=f"{type(exc).__name__}: {exc}"[:300])
+            if PROFILE_OPS and out["profile"].get("categories"):
+                print("RESULT " + json.dumps(out), flush=True)  # the kernel profile stands whatever happens next
+                live("phase", phase="profiling", steps=PROFILE, what="operations")
+                try:
+                    out["profile"]["ops"] = profile_ops(step, data, PROFILE)
+                except Exception as exc:  # noqa: BLE001 - extra again
+                    out["profile"]["ops_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            live("profile", **out["profile"])
     return out
 
 
@@ -436,13 +818,17 @@ def main():
     ap.add_argument("--engines", nargs="+", default=ENGINES, choices=ENGINES)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--timeout", type=int, default=3600)
+    ap.add_argument("--profile-ops", action="store_true",
+                    help="with --profile: N more steps traced with the operations and shapes behind the kernels")
+    ap.add_argument("--profile", type=int, default=0, metavar="N",
+                    help="trace N more steps after the measured ones: where the time goes")
     ap.add_argument("--out", default=None)
     ap.add_argument("--worker", nargs=2, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--live", action="store_true", help=argparse.SUPPRESS)  # with --worker: stream LIVE lines
     args = ap.parse_args()
     if args.worker:
-        global LIVE
-        LIVE = args.live
+        global LIVE, PROFILE, PROFILE_OPS
+        LIVE, PROFILE, PROFILE_OPS = args.live, max(args.profile, 0), args.profile_ops
         print("RESULT " + json.dumps(worker(args.worker[0], args.worker[1], args.steps)), flush=True)
         return
     rows = []
@@ -450,7 +836,8 @@ def main():
         if not_applicable(engine, args.scenario):
             print(f"{engine}: skipped, {not_applicable(engine, args.scenario)}", flush=True)
             continue
-        cmd = [sys.executable, __file__, "--worker", engine, args.scenario, "--steps", str(args.steps)]
+        cmd = [sys.executable, __file__, "--worker", engine, args.scenario, "--steps", str(args.steps),
+               "--profile", str(args.profile)] + (["--profile-ops"] if args.profile_ops else [])
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
             line = [l for l in res.stdout.splitlines() if l.startswith("RESULT ")]
@@ -478,6 +865,19 @@ def main():
                   f"{r['vram_peak_gb']:.1f} GB | {ram} |")
         else:
             print(f"| {r['engine']} | {r['status']} | — | — | — | — |")
+    profiled = [r for r in rows if (r.get("profile") or {}).get("categories")]
+    if profiled:
+        cats = []
+        for r in profiled:
+            cats += [c for c in r["profile"]["categories"] if c not in cats]
+        print("\nWhere a step's time goes (ms per step, over the profiled steps)\n")
+        print("| engine | step | " + " | ".join(cats) + " | copies only | GPU idle |")
+        print("|---|---|" + "---|" * (len(cats) + 2))
+        for r in profiled:
+            p = r["profile"]
+            print(f"| {r['engine']} | {p['step_ms']:.0f} | "
+                  + " | ".join(f"{p['categories'].get(c, 0):.0f}" for c in cats)
+                  + f" | {p['copy_only_ms']:.0f} | {p['idle_ms']:.0f} |")
 
 
 if __name__ == "__main__":

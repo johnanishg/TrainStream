@@ -10,7 +10,9 @@ quantized base) and wrapped. Then:
 
   1. perplexity of the base on held-out text, and
   2. eval loss after a short LoRA fine-tune (same data, seed and steps for
-     every format).
+     every format), with the steady training step time (the median of the
+     steps after TrainStream has finished tuning itself; synchronized) and
+     the GPU's clock meanwhile (NVML or nvidia-smi, as in compare.py).
 
 Text: the Python standard library's own source files (offline, identical on
 every machine), split into a training half and a held-out half by file.
@@ -37,6 +39,7 @@ FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4", "nvfp4-w", "nvfp4-o"]
 # quantization: what 4-bit weights alone cost), nvfp4-o keeps 1% of the input
 # channels in bf16 on the tensor-core path (wrap(outliers=0.01))
 VARIANTS = {"nvfp4-w": ("nvfp4", {"weights_only": True}), "nvfp4-o": ("nvfp4", {"outliers": 0.01})}
+SETTLE = 1  # steps after TrainStream's last change left out of the step time, as in compare.py
 
 
 def corpus_files():
@@ -87,6 +90,7 @@ def _worker(args):
 
     import trainstream
     from trainstream.integrations.huggingface import load_model
+    from trainstream.wrapper import unwrap_session
 
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -111,6 +115,7 @@ def _worker(args):
     model, opt = trainstream.wrap(model, torch.optim.AdamW(params, lr=args.lr), device="cuda",
                                   quantize=kind if kind != "none" else "none", outliers=extra.get("outliers", 0.0))
     load_s = time.time() - t0
+    session = unwrap_session(model)
 
     def eval_loss(which):
         model.eval()
@@ -127,24 +132,41 @@ def _worker(args):
     live(args, "phase", phase="eval_base", load_s=load_s)
     base = eval_loss("base")
     live(args, "phase", phase="training", base_ppl=math.exp(base))
-    losses = []
+    from compare import GpuWatch, gpu_target  # GPU samples: how fast the GPU ran meanwhile
+    watch = GpuWatch(gpu_target())
+    watch.start()
+    losses, times, starts, settled = [], [], [], 0
     for s in range(args.train_steps):
-        t1 = time.time()
         ids = train_w[s * args.batch:(s + 1) * args.batch].cuda()
+        torch.cuda.synchronize()
+        starts.append(time.time())
+        t1 = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = model(input_ids=ids, labels=ids).loss
         loss.backward()
         opt.step()
         opt.zero_grad()
         losses.append(loss.item())
-        live(args, "step", i=s + 1, of=args.train_steps, loss=losses[-1], step_s=time.time() - t1)
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - t1)
+        if session is not None and session.adapting:  # the next step may still try a setting
+            settled = s + 2 + SETTLE
+        live(args, "step", i=s + 1, of=args.train_steps, loss=losses[-1], step_s=times[-1])
     opt.synchronize()
+    watch.done.set()
+    first = settled if len(times) - settled >= 5 else len(times) // 2  # else: the last half
+    steady = times[first:]
+    step_s = sorted(steady)[len(steady) // 2]
+    gpu = watch.summary(starts[first], time.time())
     live(args, "phase", phase="eval_tuned")
     tuned = eval_loss("tuned")
     rep = trainstream.memory_report(model)
     out = dict(format=args.format, base_loss=base, base_ppl=math.exp(base), tuned_loss=tuned,
                tuned_ppl=math.exp(tuned), train_losses=losses, seconds=time.time() - t0, load_s=load_s,
-               events=[e for e in rep["events"] if "quantized" in e or "tensor cores" in e], env=env)
+               step_s=step_s, step_times=times, tuning_steps=min(settled, len(times)), gpu=gpu,
+               tokens_per_s=args.batch * args.seq / step_s,
+               events=[e for e in rep["events"] if "quantized" in e or "tensor cores" in e
+                       or "expanded before use" in e], env=env)
     print(("RESULT " if args.live else "") + json.dumps(out), flush=True)
 
 
@@ -180,11 +202,12 @@ def main():
     ok = [r for r in rows if "error" not in r]
     ref = next((r for r in ok if r["format"] == "none"), None)
     print(f"\n{args.model}: perplexity on held-out stdlib source ({args.windows} x {args.seq} tokens)")
-    print(f"{'format':8s} {'base ppl':>9s} {'vs bf16':>8s} {'after LoRA':>11s} {'vs bf16':>8s}")
+    print(f"{'format':8s} {'base ppl':>9s} {'vs bf16':>8s} {'after LoRA':>11s} {'vs bf16':>8s} {'step':>8s}")
     for r in ok:
         d1 = f"{(r['base_ppl'] / ref['base_ppl'] - 1) * 100:+.2f}%" if ref else ""
         d2 = f"{(r['tuned_ppl'] / ref['tuned_ppl'] - 1) * 100:+.2f}%" if ref else ""
-        print(f"{r['format']:8s} {r['base_ppl']:9.3f} {d1:>8s} {r['tuned_ppl']:11.3f} {d2:>8s}")
+        step = f"{r['step_s']:.2f} s" if r.get("step_s") else ""
+        print(f"{r['format']:8s} {r['base_ppl']:9.3f} {d1:>8s} {r['tuned_ppl']:11.3f} {d2:>8s} {step:>8s}")
     for r in rows:
         if "error" in r:
             print(f"{r['format']:8s} failed: {r['error']}")

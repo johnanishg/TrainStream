@@ -115,6 +115,7 @@ class ParamPager:
         self.qnear: Set[int] = set()
         self._keep: Dict[int, list] = {}
         self._native_expanded: Dict[int, bool] = {}
+        self._loading: Dict[int, Set[int]] = {}  # per block, the weights a load_state_dict in progress provides
         self._host_frozen: Dict[int, torch.Tensor] = {}
         ram = physical_ram_bytes()
         self.pin_budget = 0.40 * ram if ram else float("inf")
@@ -549,6 +550,10 @@ class ParamPager:
     def _make_load_pre(self, i: int):
         def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
             if i in self.paged:
+                # a partial load (strict=False, e.g. adapters only) must leave the rest as it is:
+                # a quantized weight's expansion is not exactly its value (and is empty for one
+                # that runs on tensor cores), so it must not be re-quantized from it
+                self._loading[i] = {id(p) for name, p in self._named(i) if prefix + name in state_dict}
                 self.load(i)  # real storage for the copy_ that follows
                 self.wait(i)
                 for p, _, nbytes in self._entries[i]:
@@ -560,8 +565,11 @@ class ParamPager:
         def hook(module, incompatible_keys):
             if i not in self.paged:
                 return
+            loaded = self._loading.pop(i, None)
             torch.cuda.current_stream(self.device).synchronize()
             for p, slot, _ in self._entries[i]:
+                if loaded is not None and id(p) not in loaded:
+                    continue  # not in this state dict: unchanged (release() drops the expansion)
                 qw = self._quant.get(id(p))
                 if qw is not None:  # re-quantize the loaded values
                     new = make_quantized(p.detach(), qw.kind, qw.block_size, pin=qw.pinned)

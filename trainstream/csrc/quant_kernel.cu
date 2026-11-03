@@ -84,6 +84,78 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// The kernels below expand eight values per thread and write them with one
+// 16-byte store (two for fp32), so a warp writes one contiguous span; code books
+// are read from shared memory, where lanes asking for different entries don't
+// serialize as they do in constant memory. The arithmetic is the same as in the
+// one-value kernels above, so the results are bit for bit the same.
+template <typename T>
+__device__ __forceinline__ void store8(T* dst, const float (&v)[8]);
+template <>
+__device__ __forceinline__ void store8<__nv_bfloat16>(__nv_bfloat16* dst, const float (&v)[8]) {
+  __nv_bfloat162 p[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) p[j] = __floats2bfloat162_rn(v[2 * j], v[2 * j + 1]);
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(p);
+}
+template <>
+__device__ __forceinline__ void store8<__half>(__half* dst, const float (&v)[8]) {
+  __half2 p[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) p[j] = __floats2half2_rn(v[2 * j], v[2 * j + 1]);
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(p);
+}
+template <>
+__device__ __forceinline__ void store8<float>(float* dst, const float (&v)[8]) {
+  reinterpret_cast<float4*>(dst)[0] = make_float4(v[0], v[1], v[2], v[3]);
+  reinterpret_cast<float4*>(dst)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
+
+// Which absmax a chunk of 8 values uses: chunk / per_block, as a shift when per_block is a power of two.
+__device__ __forceinline__ uint32_t scale_of(uint32_t chunk, uint32_t per_block, int shift) {
+  return shift >= 0 ? chunk >> shift : chunk / per_block;
+}
+
+template <typename T>
+__global__ void __launch_bounds__(kThreads)
+    dequant_nf4_x8_kernel(const uint32_t* __restrict__ q, const float* __restrict__ absmax, T* __restrict__ out,
+                          uint32_t chunks, uint32_t per_block, int shift) {
+  __shared__ float lut[16];
+  if (threadIdx.x < 16) lut[threadIdx.x] = kNF4[threadIdx.x];
+  __syncthreads();
+  const uint32_t stride = gridDim.x * kThreads;
+  for (uint32_t k = blockIdx.x * kThreads + threadIdx.x; k < chunks; k += stride) {
+    const uint32_t b = q[k];  // 4 bytes, 8 codes: in each byte the first value is the high nibble
+    const float s = absmax[scale_of(k, per_block, shift)];
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t byte = (b >> (8 * j)) & 0xFFu;
+      v[2 * j] = lut[byte >> 4] * s;
+      v[2 * j + 1] = lut[byte & 15u] * s;
+    }
+    store8<T>(out + static_cast<int64_t>(k) * 8, v);
+  }
+}
+
+template <typename T>
+__global__ void __launch_bounds__(kThreads)
+    dequant_int8_x8_kernel(const uint2* __restrict__ q, const float* __restrict__ absmax, T* __restrict__ out,
+                           uint32_t chunks, uint32_t per_block, int shift) {
+  const uint32_t stride = gridDim.x * kThreads;
+  for (uint32_t k = blockIdx.x * kThreads + threadIdx.x; k < chunks; k += stride) {
+    const uint2 b = q[k];  // 8 codes
+    const float s = absmax[scale_of(k, per_block, shift)] * (1.0f / 127.0f);
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      v[j] = static_cast<float>(static_cast<int8_t>((b.x >> (8 * j)) & 0xFFu)) * s;
+      v[4 + j] = static_cast<float>(static_cast<int8_t>((b.y >> (8 * j)) & 0xFFu)) * s;
+    }
+    store8<T>(out + static_cast<int64_t>(k) * 8, v);
+  }
+}
+
 inline int grid_for(int64_t work, int sm_count) {
   int64_t blocks = (work + kThreads - 1) / kThreads;
   const int64_t cap = static_cast<int64_t>(sm_count > 0 ? sm_count : 80) * 32;
@@ -92,11 +164,30 @@ inline int grid_for(int64_t work, int sm_count) {
   return static_cast<int>(blocks);
 }
 
+inline bool aligned(const void* p, uintptr_t bytes) { return reinterpret_cast<uintptr_t>(p) % bytes == 0; }
+
 template <typename T>
 cudaError_t launch(QKind kind, const void* q, const float* absmax, void* out, int64_t n, int block, int sm_count,
                    cudaStream_t stream) {
   if (n == 0) return cudaSuccess;
-  if (kind == QKind::kNF4) {
+  const bool nf4 = kind == QKind::kNF4;
+  if (n % 8 == 0 && block % 8 == 0 && n / 8 <= 0xFFFFFFFFLL && aligned(q, nf4 ? 4 : 8) && aligned(out, 16)) {
+    const uint32_t chunks = static_cast<uint32_t>(n / 8), per_block = static_cast<uint32_t>(block / 8);
+    int shift = -1;
+    if ((per_block & (per_block - 1)) == 0) {
+      shift = 0;
+      while ((1u << shift) < per_block) ++shift;
+    }
+    if (nf4) {
+      dequant_nf4_x8_kernel<T><<<grid_for(chunks, sm_count), kThreads, 0, stream>>>(
+          static_cast<const uint32_t*>(q), absmax, static_cast<T*>(out), chunks, per_block, shift);
+    } else {
+      dequant_int8_x8_kernel<T><<<grid_for(chunks, sm_count), kThreads, 0, stream>>>(
+          static_cast<const uint2*>(q), absmax, static_cast<T*>(out), chunks, per_block, shift);
+    }
+    return cudaGetLastError();
+  }
+  if (nf4) {
     dequant_nf4_kernel<T><<<grid_for((n + 1) / 2, sm_count), kThreads, 0, stream>>>(
         static_cast<const uint8_t*>(q), absmax, static_cast<T*>(out), n, block);
   } else {

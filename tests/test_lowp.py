@@ -196,6 +196,27 @@ def test_state_dict_unwrap_and_shapes(kind):
     assert not Q.eligible(odd.weight, kind) and Q.eligible(odd.weight, "nf4")
 
 
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_partial_load_keeps_tensor_core_weights(kind):
+    # load_state_dict(strict=False) with adapters only (how PEFT loads them): tensor-core
+    # weights have no expansion, so the ones the dict leaves out must not be re-quantized
+    needs_native(kind)
+    m = make()
+    m, opt = trainstream.wrap(m, torch.optim.AdamW(trainable(m), **HP), offload=True, quantize=kind,
+                              activation_offload=False)
+    try:
+        want = {n: Q.quantized_of(p).dequantize(DEV) for n, p in m.named_parameters() if Q.quantized_of(p) is not None}
+        adapters = {k: v.clone() for k, v in m.state_dict().items() if ".down." in k or ".up." in k}
+        m.load_state_dict(adapters, strict=False)
+        for n, p in m.named_parameters():
+            if n in want:
+                assert torch.equal(Q.quantized_of(p).dequantize(DEV), want[n]), n
+                assert p.untyped_storage().nbytes() == 0  # still never expanded
+        train(m, opt, tokens(1))
+    finally:
+        trainstream.unwrap(m)
+
+
 def test_invalid_kind_names_the_choices():
     m = make()
     with pytest.raises(ValueError, match="nvfp4"):

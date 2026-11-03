@@ -38,6 +38,22 @@ def test_kernel_matches_reference(kind, dtype, where):
     assert err < (0.12 if kind == "nf4" else 0.01)
 
 
+@pytest.mark.parametrize("kind", Q.EXPAND_KINDS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("n,block,offset", [(64 * 513, 64, 0), (6 * 1000, 6, 0), (64 * 513, 64, 1)],
+                         ids=["8-per-thread", "odd-block", "unaligned"])
+def test_kernel_paths_match_reference(kind, dtype, n, block, offset):
+    # eight values per thread when sizes and alignment allow, one at a time otherwise: the same values
+    torch.manual_seed(0)
+    w = torch.randn(n, device=DEV) * 0.02
+    q, a = Q.quantize_tensor(w, kind, block)
+    out = torch.empty(n + offset, device=DEV, dtype=dtype)[offset:]
+    ev, keep = _C.dequantize_async(out, q, a, kind, block, _C.record_event(0))
+    ev.wait()
+    torch.cuda.synchronize()
+    assert torch.equal(out, Q.dequantize_reference(q, a, kind, block, n, dtype))
+
+
 def test_nf4_is_bit_identical_to_bitsandbytes():
     bf = pytest.importorskip("bitsandbytes.functional")
     torch.manual_seed(0)
@@ -191,6 +207,26 @@ def test_state_dict_serves_the_dequantized_values():
         assert torch.equal(sd["blocks.2.fc1.weight"].to(DEV), ref.blocks[2].fc1.weight)
     finally:
         trainstream.unwrap(mine)
+
+
+@pytest.mark.parametrize("kind", Q.EXPAND_KINDS)
+def test_a_partial_load_keeps_the_quantized_weights(kind):
+    # load_state_dict(strict=False) with adapters only (how PEFT loads them): the block hooks
+    # expand every weight first, and in bf16 that expansion isn't exactly the stored values,
+    # so the weights the dict leaves out must not be re-quantized from it
+    m = make().to(torch.bfloat16)
+    m, opt = trainstream.wrap(m, torch.optim.AdamW(trainable(m), **HP), offload=True, quantize=kind,
+                              activation_offload=False, profile=False)
+    try:
+        want = {n: Q.quantized_of(p).dequantize(DEV) for n, p in m.named_parameters() if Q.quantized_of(p) is not None}
+        adapters = {k: v.clone() for k, v in m.state_dict().items() if ".down." in k or ".up." in k}
+        m.load_state_dict(adapters, strict=False)
+        for n, p in m.named_parameters():
+            if n in want:
+                assert torch.equal(Q.quantized_of(p).dequantize(DEV), want[n]), n
+        train(m, opt, tokens(1))
+    finally:
+        trainstream.unwrap(m)
 
 
 # --------------------------------------------------------------------------- decisions and errors

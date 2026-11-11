@@ -220,3 +220,38 @@ def test_undeclared_accumulation_raises():
     with pytest.raises(RuntimeError, match="accumulation_steps"):
         nn.functional.cross_entropy(model(x2), y2).backward()
     opt.synchronize()
+
+
+# --------------------------------------------------------------------------- 8-bit moments
+def test_int8_moments_track_fp32_adamw():
+    # one byte per moment value (stochastic rounding): close to fp32 AdamW, a quarter of the memory
+    ref, mine, b16 = make_mlp(), make_mlp(), make_mlp()
+    data = batches(30)
+    run(ref, torch.optim.AdamW(ref.parameters(), foreach=False, **HP), data)
+    opt = OffloadAdamW(mine.parameters(), mode="cpu", moment_dtype="int8", **HP)
+    run(mine, opt, data)
+    run(b16, OffloadAdamW(b16.parameters(), mode="cpu", moment_dtype="bfloat16", **HP), data)
+    init = list(make_mlp().parameters())
+    drift = max(((p - q).norm() / (p - q0).norm()).item() for p, q, q0 in zip(ref.parameters(), mine.parameters(), init))
+    assert drift < 0.08  # measured 0.05 (bitsandbytes' AdamW8bit: 0.04): a few % of how far training moved them
+    assert max_diff(ref, b16) < max_diff(ref, mine)  # bf16 moments stay closer
+    assert opt.moment_dtype == "int8"
+
+
+def test_int8_moments_state_dict_round_trip():
+    m = make_mlp()
+    data = batches(4)
+    opt = OffloadAdamW(m.parameters(), mode="cpu", moment_dtype="int8", **HP)
+    run(m, opt, data)
+    sd = opt.state_dict()
+    st = next(iter(sd["state"].values()))
+    assert st["exp_avg"].dtype == torch.float32 and st["exp_avg_sq"].min() >= 0  # handed out as fp32
+    m2 = make_mlp()
+    m2.load_state_dict(m.state_dict())
+    opt2 = OffloadAdamW(m2.parameters(), mode="cpu", moment_dtype="int8", **HP)
+    opt2.load_state_dict(sd)
+    st2 = next(iter(opt2.state_dict()["state"].values()))
+    scale = st["exp_avg"].abs().max()
+    assert (st2["exp_avg"] - st["exp_avg"]).abs().max() <= 0.13 * scale  # re-encoded: one 8-bit step
+    with pytest.raises(ValueError):
+        OffloadAdamW(make_mlp().parameters(), mode="gpu", moment_dtype="int8", **HP)

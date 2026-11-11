@@ -93,6 +93,10 @@ class OffloadAdamW(torch.optim.Optimizer):
                 the weights in place, reading/writing moments through mapped
                 pinned memory (zero-copy over PCIe).
 
+    moment_dtype="int8" (cpu mode) stores each moment in one byte per value, a
+    small float relative to an fp32 absmax per 256 values, written with
+    stochastic rounding: a quarter of fp32's host memory, for full fine-tunes
+    whose moments would not fit otherwise; state_dict() still hands out fp32.
     moment_dtype="bfloat16" stores exp_avg/exp_avg_sq in bf16 with stochastic
     rounding: half the host memory and RAM traffic for the moments, at a small
     numerical cost (master weights stay fp32).
@@ -141,8 +145,12 @@ class OffloadAdamW(torch.optim.Optimizer):
             moment_dtype = "bfloat16"
         if moment_dtype in (torch.float32, "fp32"):
             moment_dtype = "float32"
-        if moment_dtype not in ("float32", "bfloat16"):
-            raise ValueError(f"moment_dtype must be 'float32' or 'bfloat16', got {moment_dtype!r}")
+        if moment_dtype in (torch.int8, torch.uint8, "8bit"):
+            moment_dtype = "int8"
+        if moment_dtype not in ("float32", "bfloat16", "int8"):
+            raise ValueError(f"moment_dtype must be 'float32', 'bfloat16' or 'int8', got {moment_dtype!r}")
+        if moment_dtype == "int8" and mode != "cpu":
+            raise ValueError("8-bit moments (moment_dtype='int8') need mode='cpu' (host AdamW)")
         if not 0.0 <= lr:
             raise ValueError(f"invalid learning rate {lr}")
         if not (0.0 <= betas[0] < 1.0 and 0.0 <= betas[1] < 1.0):
@@ -235,7 +243,7 @@ class OffloadAdamW(torch.optim.Optimizer):
         numel = sum(p.numel() for p in params)
         pbytes = params[0].element_size()
         always_pinned = numel * (4 + (pbytes if pbytes < 4 else 0))  # master + rounded staging copy
-        moments = numel * (4 if moment_dtype == "bfloat16" else 8)
+        moments = numel * {"bfloat16": 4, "int8": 2}.get(moment_dtype, 8)
         total_ram = physical_ram_bytes()
         budget = 0.40 * total_ram if total_ram else float("inf")
         live = _C.pinned_stats()["live_bytes"]

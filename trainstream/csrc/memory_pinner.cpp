@@ -14,6 +14,8 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace trainstream {
@@ -62,7 +64,10 @@ Event::Event(int device, bool timing) : device_(device), timing_(timing) {
     }
   }
   c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_));
-  TS_CUDA_CHECK(cudaEventCreateWithFlags(&ev_, timing_ ? cudaEventDefault : cudaEventDisableTiming));
+  // How a host thread waits on it: see event_wait_mode(). Only "block" asks for an event the GPU
+  // signals by interrupt; thousands of those per step held this laptop's GPU near half its power.
+  TS_CUDA_CHECK(cudaEventCreateWithFlags(&ev_, (timing_ ? cudaEventDefault : cudaEventDisableTiming) |
+                                                    (event_wait_mode() == 1 ? cudaEventBlockingSync : 0u)));
 }
 
 Event::~Event() {
@@ -93,9 +98,48 @@ bool Event::query() const {
   return true;
 }
 
+// How host threads wait for an event (TRAINSTREAM_EVENT_WAIT):
+//   "poll" (default): check the event for up to TRAINSTREAM_EVENT_SPIN_US (50), then check it again
+//       after sleeping TRAINSTREAM_EVENT_SLEEP_US (100) at a time. The CPU optimizer's worker threads
+//       wait for gradient copies thousands of times a step; spinning, they kept ~6 cores at 100 %.
+//   "spin": CUDA's default, a core at 100 % until the event completes; the lowest latency.
+//   "block": an interrupt-signalled event the thread sleeps on. No CPU, but on an RTX 5090 Laptop
+//       (Windows) the GPU then ran at ~70 W instead of ~148 W and the 14B LoRA step took 1.8x longer.
+int event_wait_mode() {
+  static const int mode = [] {
+    const char* v = std::getenv("TRAINSTREAM_EVENT_WAIT");
+    const std::string s(v != nullptr ? v : "");
+    return s == "spin" ? 0 : s == "block" ? 1 : 2;
+  }();
+  return mode;
+}
+
+static int64_t env_us(const char* name, int64_t fallback) {
+  const char* v = std::getenv(name);
+  return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : fallback;
+}
+
+static void wait_event(cudaEvent_t ev) {
+  if (event_wait_mode() != 2) {
+    TS_CUDA_CHECK(cudaEventSynchronize(ev));
+    return;
+  }
+  static const int64_t spin_us = env_us("TRAINSTREAM_EVENT_SPIN_US", 50);
+  static const int64_t sleep_us = env_us("TRAINSTREAM_EVENT_SLEEP_US", 100);
+  const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+  for (;;) {
+    const cudaError_t err = cudaEventQuery(ev);
+    if (err == cudaSuccess) return;
+    if (err != cudaErrorNotReady) TS_CUDA_CHECK(err);
+    (void)cudaGetLastError();  // clear the sticky "not ready" status
+    if (std::chrono::steady_clock::now() >= spin_until)
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+  }
+}
+
 void Event::synchronize() const {
   if (!recorded_) return;
-  TS_CUDA_CHECK(cudaEventSynchronize(ev_));
+  wait_event(ev_);
 }
 
 void Event::block(cudaStream_t stream) const {

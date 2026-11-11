@@ -13,7 +13,7 @@ from .hooks import ActivationOffloader, find_blocks
 from .optimizer import OffloadAdamW
 from .paging import ParamPager, pageable_params
 from .planner import MemoryPlanner, explain_ram_shortfall, host_bytes_needed, measure_budget
-from . import lowp
+from . import experts, fused, lora, lowp
 from . import quant as Q
 from .attention import CHOICES as ATTENTION_CHOICES, AttentionSelector
 from .profiler import HardwareProfile, profile_hardware
@@ -47,6 +47,9 @@ class TrainStreamSession:
         self._applying = False
         self._orig_apply: Dict[int, object] = {}
         self.lowp_modules: List[nn.Module] = []
+        self.fused = None  # trainstream.fused.Fused: the fused norm / RoPE / MLP kernels installed
+        self.lora_layers: List[nn.Module] = []  # PEFT LoRA Linears routed through trainstream.lora
+        self.expert_pagers: list = []  # trainstream.experts.ExpertPager per paged stack of MoE experts
         self.attention: Optional[AttentionSelector] = None
         self.peer = None  # trainstream.peer.PeerPool once set up
         self._peer_step: Optional[int] = None
@@ -56,10 +59,15 @@ class TrainStreamSession:
         cfg = self.config
         opt = self.optimizer
         opt.attach(self.model, guard=cfg["guard_params"])
+        if cfg.get("kernels") and self.fused is None:
+            self.fused = fused.install(self.model, opt.device)
+        if cfg.get("fused_lora") and not self.lora_layers:
+            self.lora_layers = lora.install(self.model)
         if opt.resident:
             return
         if self.config.get("quantize") in Q.BLOCKSCALED_KINDS:  # before the pager reads the flags
-            self.lowp_modules = lowp.install(self.blocks, opt.device, cfg.get("outliers", 0.0))
+            self.lowp_modules = lowp.install(self.blocks, opt.device, cfg.get("outliers", 0.0),
+                                             cfg.get("nvfp4_backward", False))
         if cfg.get("attention") is not None and self.blocks:
             self.attention = AttentionSelector(self.model, self.blocks, cfg["attention"], opt.device)
             self.attention.events = self.events
@@ -67,7 +75,8 @@ class TrainStreamSession:
             if self.candidates is None:
                 self.candidates = pageable_params(self.model, self.blocks, range(len(self.blocks)))
             self.pager = ParamPager(self.model, self.blocks, opt, self.paged_blocks, candidates=self.candidates,
-                                    frozen_init=frozen_init, prefetch_depth=cfg["prefetch_depth"])
+                                    frozen_init=frozen_init, prefetch_depth=cfg["prefetch_depth"],
+                                    disk=cfg.get("_disk"))
         rc = cfg.get("recompute", "auto")
         explicit_rc = rc not in ("auto", False, None, 0, 0.0)
         if (cfg["activation_offload"] not in (False, 0, 0.0, None) or explicit_rc) and self.blocks:
@@ -98,12 +107,20 @@ class TrainStreamSession:
             self.events.append("peer GPUs: pools released")
         lowp.uninstall(self.lowp_modules)
         self.lowp_modules = []
+        if self.fused is not None:
+            self.fused.remove()
+            self.fused = None
+        lora.uninstall(self.lora_layers)
+        self.lora_layers = []
         if self.attention is not None:
             self.attention.remove()
             self.attention = None
 
     def remove(self) -> None:
         self.teardown(materialize=True)
+        for ep in self.expert_pagers:
+            ep.remove()
+        self.expert_pagers = []
         for m in self.model.modules():
             if "_apply" in m.__dict__:
                 del m.__dict__["_apply"]
@@ -347,6 +364,12 @@ class TrainStreamSession:
             "resident": self.optimizer.resident,
             "events": list(self.events),
         }
+        if self.expert_pagers:
+            out["experts"] = dict(stacks=len(self.expert_pagers),
+                                  host_bytes=sum(e.nbytes for e in self.expert_pagers),
+                                  calls=sum(e.calls for e in self.expert_pagers),
+                                  experts_copied=sum(e.experts_used for e in self.expert_pagers),
+                                  bytes_copied=sum(e.bytes_in for e in self.expert_pagers))
         if self.attention is not None:
             out["attention"] = dict(mode=self.attention.mode, backend=self.attention.choice,
                                     timings_ms=dict(self.attention.timings))
@@ -367,6 +390,7 @@ class TrainStreamSession:
                                  frozen_pinned_bytes=self.pager.frozen_pinned_bytes,
                                  frozen_shared_bytes=self.pager.frozen_shared_bytes,
                                  frozen_pageable_bytes=self.pager.frozen_pageable_bytes,
+                                 frozen_disk_bytes=self.pager.frozen_disk_bytes,
                                  peer_blocks=self.peer.pooled_blocks if self.peer is not None else [],
                                  peer_owned_bytes=self.peer.bytes_owned if self.peer is not None else 0)
         if self.planner is not None:
@@ -503,11 +527,20 @@ def wrap(
     check_memory: bool = True,
     quantize: Optional[str] = "auto",
     quant_block_size: int = 64,
+    keep_precise: Union[str, float, bool, None] = 0,
+    error_rank: int = 0,
+    error_iters: int = 1,
+    double_quant: bool = False,
     prefer: str = "exact",
     recompute: Union[str, float, bool, Sequence[int]] = "auto",
     attention: Optional[str] = "auto",
     outliers: Union[str, float, bool, None] = 0.0,
+    nvfp4_backward: bool = False,
+    kernels: Union[str, bool, None] = "auto",
+    fused_lora: Union[str, bool, None] = "auto",
     host_arena: Union[str, int, bool] = "auto",
+    disk_offload: Optional[str] = None,
+    moe_paging: bool = False,
     peer: Union[str, int, bool] = "auto",
     verbose: bool = False,
 ):
@@ -535,9 +568,12 @@ def wrap(
         device: target GPU when `model` is still on the CPU. With parameter
             paging, block weights then go straight to host RAM and never
             occupy VRAM all at once — models larger than the GPU can train.
-        moment_dtype: "auto" (fp32 unless fp32 moments would not fit in the
-            available RAM), "float32" or "bfloat16" (stochastic rounding; half
-            the host memory and traffic for the moments).
+        moment_dtype: "auto" (fp32; bf16 when fp32 moments would not fit in the
+            available RAM; 8-bit when bf16 would not either and the optimizer
+            runs on the host), "float32", "bfloat16" (stochastic rounding; half
+            the host memory and traffic for the moments) or "int8" (one byte
+            per value with an fp32 scale per 256, stochastic rounding; a
+            quarter; cpu optimizer_mode only).
         distributed: data parallel over torch.distributed (default: on when a
             process group with more than one rank is initialized). Parameters
             are broadcast from rank 0; gradients are averaged on the host.
@@ -558,6 +594,22 @@ def wrap(
             always. Weights quantized beforehand (quantize_model, load_model)
             are used as they are.
         quant_block_size: values per fp32 scale (even; default 64).
+        keep_precise: with quantize="nf4" / "nvfp4", the weights that lose the
+            most in that format (relative error, measured weight by weight) stay
+            one step more precise, int8 / fp8, as long as the extra bytes stay
+            within this fraction of the quantized weights' size. 0 (default)
+            none; "auto" or True 0.05; a fraction up to 0.5.
+        error_rank: LoftQ. When > 0, quantizing a weight also fits a rank-
+            error_rank approximation B A of what quantization lost (randomized
+            SVD; error_iters rounds alternate it with quantizing W - B A), and
+            the model's PEFT LoRA adapters on those weights start at it instead
+            of at zero, so base + adapter starts close to the original weights.
+            Weights quantized beforehand with error_rank (load_model,
+            quantize_model) start their adapters the same way. Default 0: off.
+        double_quant: nf4 / int8 block scales stored as one-byte log codes with
+            an fp32 scale per 256 blocks (bitsandbytes' double quantization),
+            about 0.37 bit per weight less at block size 64 (0.65 GB on a 14B
+            model); the values are quantized against the decoded scales.
         prefer: "exact" (default) or "speed". With "speed", quantize="auto" also
             picks NF4 when the bf16 weights would have to stream from RAM but the
             4-bit ones fit in VRAM — usually faster, no longer bit-exact.
@@ -577,12 +629,43 @@ def wrap(
             channels (the largest, picked per call) multiplied in bf16 instead
             of being quantized to 4 bits with the rest of the activation.
             0 (default) none; "auto" or True 0.01; a float up to 0.1.
+        nvfp4_backward: with quantize="nvfp4" on tensor cores, the input
+            gradient of each frozen matmul is computed in nvfp4 too (the
+            gradient and the transposed weight quantized along the reduced
+            dimension, round to nearest), instead of in bf16 against the
+            expanded weight. Faster matmuls in backward, more rounding: try it
+            with benchmarks/quality.py (format nvfp4-b). Default False.
+        kernels: fused CUDA kernels for each block's RMSNorm, rotary embedding
+            and gated MLP activation (Hugging Face models; each is checked
+            against the model's own code once and used only where they agree).
+            They compute in fp32 and round once, so results differ from
+            PyTorch's in the last bits. "auto" (default): on when the frozen
+            weights are quantized (already not bit-exact), off otherwise; True:
+            always; False: never.
+        fused_lora: PEFT LoRA adapters (plain ones: no dropout, DoRA or bias)
+            computed by one autograd function: two matmuls, the second
+            accumulating into the base layer's output, and three in backward,
+            keeping the input the base layer read instead of a copy. Matches
+            PEFT up to the rounding of its intermediate products. "auto"
+            (default): on when the frozen weights are quantized; True / False.
         host_arena: page-locked host memory reserved up front, from which
             paged activations, gradient staging and other pinned buffers are
             carved, so training steps never page-lock memory (a stall on
             Windows). "auto" (default): when the run streams anything, reserve
             one slab now and grow on demand within the page-lock budget; an int
             reserves that many bytes now (and caps growth there); False: none.
+        disk_offload: a directory (on a fast SSD). Frozen paged weights the
+            page-lock budget can't hold go to memory-mapped files there instead
+            of ordinary RAM: the OS keeps them in its page cache while RAM has
+            room and reads them from the disk when it doesn't, and the RAM
+            check no longer counts them. Weights load_model(disk_offload=...)
+            already put on disk stay there. Default None: RAM only.
+        moe_paging: the frozen experts of mixture-of-experts layers (Hugging
+            Face's stacked experts: Qwen3-MoE, Qwen2-MoE, Mixtral...) stay in
+            pinned host RAM, and each layer copies in only the experts its
+            tokens were routed to, again in backward instead of keeping them.
+            Pays when a step routes to few experts (short sequences, small
+            batches); with thousands of tokens nearly all are hit. Default False.
         peer: data parallel on one machine whose GPUs reach each other's
             memory (NVLink / PCIe P2P, through CUDA IPC): the frozen blocks every
             rank streams are split among the GPUs' VRAM and copied GPU to GPU
@@ -616,6 +699,11 @@ def wrap(
     if attention is not None and attention not in ATTENTION_CHOICES:
         raise ValueError(f"attention must be one of {ATTENTION_CHOICES} or None, got {attention!r}")
     outliers = _outlier_fraction(outliers)
+    keep_frac = Q.keep_fraction(keep_precise)
+    if kernels not in ("auto", True, False, None):
+        raise ValueError(f"kernels must be 'auto', True or False, got {kernels!r}")
+    if fused_lora not in ("auto", True, False, None):
+        raise ValueError(f"fused_lora must be 'auto', True or False, got {fused_lora!r}")
     if not (host_arena in ("auto", False, None) or (isinstance(host_arena, int) and not isinstance(host_arena, bool)
                                                     and host_arena >= 0)):
         raise ValueError(f"host_arena must be 'auto', False or a number of bytes, got {host_arena!r}")
@@ -640,6 +728,9 @@ def wrap(
             want = torch.device("cuda", torch.cuda.current_device())
         if want != target:
             raise ValueError(f"model is on {target} but device={device!r}; move it first or leave device unset")
+    expert_pagers = experts.install(model, target) if moe_paging else []  # before anything places or pages them
+    if expert_pagers:
+        params = list(_unique_params(model))
 
     if distributed is None:
         import torch.distributed as dist
@@ -711,16 +802,31 @@ def wrap(
                     qwhy = "prefer='speed': 4-bit weights fit in VRAM, bf16 would stream from RAM"
     else:
         qkind = None
+    kept_note = None
     if qkind is not None:
         from .optimizer import physical_ram_bytes
         pin_budget = int(0.40 * (physical_ram_bytes() or 1 << 40))
         # block-scaled formats take only tensor-core shapes; other weights stay as they are
         qparams = [p for p in qparams if Q.quantized_of(p) is not None or Q.eligible(p, qkind)]
-        for p in qparams:  # one tensor at a time: the model never exists twice
-            if Q.quantized_of(p) is None:
-                nb = Q.packed_bytes(p.numel(), qkind, quant_block_size, p.shape)
-                Q.attach(p, Q.make_quantized(p, qkind, quant_block_size,
-                                             pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget))
+        todo = [p for p in qparams if Q.quantized_of(p) is None]
+        keep = set()
+        if keep_frac and qkind in Q.KEEP_KIND and todo:  # measure every weight's loss first, then choose
+            keep = Q.choose_precise([(id(p), Q.quant_error(p, qkind, quant_block_size), p.numel(), tuple(p.shape))
+                                     for p in todo], qkind, keep_frac, quant_block_size)
+        for p in todo:  # one tensor at a time: the model never exists twice
+            kind = Q.KEEP_KIND[qkind] if id(p) in keep else qkind
+            nb = Q.packed_bytes(p.numel(), kind, quant_block_size, p.shape)
+            Q.attach(p, Q.make_quantized(p, kind, quant_block_size,
+                                         pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget,
+                                         error_rank=max(0, int(error_rank)), error_iters=max(1, int(error_iters)),
+                                         double_quant=bool(double_quant)))
+        if any(Q.quantized_of(p).lora_init is not None for p in qparams):
+            n = Q.init_lora_from_error(model)  # before the optimizer copies the adapters to the host
+            kept_note = ((kept_note + "; ") if kept_note else "") + (
+                f"LoftQ: {n} LoRA adapters start at their base weights' quantization error")
+        if keep:
+            kept_note = (f"kept the {len(keep)} of {len(todo)} weights that lose the most in {qkind} as "
+                         f"{Q.KEEP_KIND[qkind]} (keep_precise={keep_frac:g})")
     qset = {id(p) for p in qparams} if qkind is not None else set()
     near_bytes = [sum(Q.quantized_of(p).nbytes if id(p) in qset else p.numel() * p.element_size()
                       for p in candidates.get(i, [])) for i in range(len(stack))]
@@ -749,6 +855,12 @@ def wrap(
     frozen_paged = sum(p.numel() * p.element_size() for i in paged_set for p in candidates.get(i, [])
                        if not p.requires_grad and id(p) not in qset)
     frozen_paged += sum(Q.quantized_of(p).nbytes for p in qparams if id(p) in qset)  # packed host copies
+    disk = None
+    if disk_offload:
+        from .disk import DiskStore
+        from .optimizer import physical_ram_bytes
+        disk = DiskStore(str(disk_offload))
+        frozen_paged = min(frozen_paged, int(0.40 * (physical_ram_bytes() or 1 << 40)))  # the rest is on disk
     if distributed:
         from . import shared
         if shared.enabled():
@@ -759,15 +871,22 @@ def wrap(
                 frozen_paged //= _dist.get_world_size()
     need32 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=4, grad_acc=grad_acc)
     need16 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=2, grad_acc=grad_acc)
-    if moment_dtype == "auto":
-        moment_dtype = "float32" if need32 <= have else "bfloat16"
-    need = need16 if moment_dtype in ("bfloat16", "bf16", torch.bfloat16) else need32
+    need8 = host_bytes_needed(trainable_params, frozen_paged, moment_bytes=1, grad_acc=grad_acc)
+    if moment_dtype == "auto":  # the most precise moments that fit; 8-bit only for the host optimizer
+        moment_dtype = ("float32" if need32 <= have else "bfloat16" if need16 <= have or optimizer_mode == "gpu"
+                        else "int8")
+    need = (need16 if moment_dtype in ("bfloat16", "bf16", torch.bfloat16)
+            else need8 if moment_dtype in ("int8", "8bit") else need32)
     if check_memory and budget.ram_available and need > have:
         raise MemoryError(explain_ram_shortfall(need, have, budget, trainable=sum(p.numel() for p in trainable_params),
                                                 frozen=frozen_paged // 2))
     if paged_blocks:
         if optimizer_mode == "gpu":
             raise ValueError("param_offload needs optimizer_mode='cpu' (paged weights are updated on the host)")
+        optimizer_mode = "cpu"
+    if moment_dtype in ("int8", "8bit"):
+        if optimizer_mode == "gpu":
+            raise ValueError("moment_dtype='int8' needs optimizer_mode='cpu' (8-bit moments are updated on the host)")
         optimizer_mode = "cpu"
 
     host_init: Dict[int, torch.Tensor] = {}
@@ -846,17 +965,25 @@ def wrap(
 
     config = dict(quantize=qkind, quant_block_size=quant_block_size, prefer=prefer, recompute=recompute,
                   attention=attention, outliers=outliers if qkind == "nvfp4" else 0.0,
+                  nvfp4_backward=bool(nvfp4_backward) and qkind == "nvfp4",
+                  kernels=kernels is True or (kernels == "auto" and qkind is not None),
+                  fused_lora=fused_lora is True or (fused_lora == "auto" and qkind is not None),
                   optimizer_mode=optimizer_mode, offload=offload, activation_offload=activation_offload,
                   param_offload=param_offload, paged_blocks=len(paged_blocks), moment_dtype=opt.moment_dtype,
                   distributed=bool(distributed), accumulation_steps=opt.accumulation_steps,
                   eager_updates=opt.eager_active, max_grad_norm=max_grad_norm, prefetch_depth=prefetch_depth,
                   min_offload_bytes=min_offload_bytes, guard_params=guard_params,
                   max_activation_slowdown=max_activation_slowdown, max_inflight_bytes=max_inflight_bytes,
-                  verbose=verbose, _reserved=reserved, _act_forced=act_forced,
+                  verbose=verbose, _reserved=reserved, _act_forced=act_forced, _disk=disk,
                   _vram_target=planner.target if planner is not None else int(budget.vram_usable * (1 - vram_headroom)),
                   plan=dict(budget=budget.describe(), host_bytes=need, blocks=len(stack),
                             initial_paged=len(paged_blocks), auto=planner is not None))
     session = TrainStreamSession(model, opt, hw, config, stack, paged_blocks)
+    session.expert_pagers = expert_pagers
+    if expert_pagers:
+        session.events.append(f"MoE: {len(expert_pagers)} stacks of experts "
+                              f"({sum(e.nbytes for e in expert_pagers) / 2**30:.2f} GiB) stay in host RAM; each layer "
+                              f"copies in only the experts its tokens are routed to")
     session.planner = planner
     session.candidates = candidates
     session.install(frozen_init=frozen_init)
@@ -865,6 +992,8 @@ def wrap(
         session.events.append(f"quantized {len(qparams)} frozen weights to {qkind} ({qbytes / 2**30:.2f} GiB; "
                               f"{qwhy}); training uses their dequantized values and is no longer bit-exact "
                               f"with the bf16 model")
+        if kept_note:
+            session.events.append(kept_note)
         if qkind in Q.BLOCKSCALED_KINDS:
             cap = torch.cuda.get_device_capability(target)
             if session.lowp_modules:
@@ -876,11 +1005,20 @@ def wrap(
             else:
                 session.events.append(f"this GPU (sm_{cap[0]}{cap[1]}) has no {qkind} tensor-core matmul: "
                                       f"weights are expanded before use, like nf4 / int8")
+    if session.fused is not None:
+        session.events.append(f"fused kernels: {session.fused.describe()}")
+    if session.lora_layers:
+        session.events.append(f"fused LoRA: {len(session.lora_layers)} adapted Linears computed in one function "
+                              f"each (two matmuls forward, three backward)")
     if planner is not None:
         session.events.append(f"memory plan: {budget.describe()}; starting with {len(stack) - len(paged_blocks)} "
                               f"of {len(stack)} blocks resident, {len(paged_blocks)} paged; "
                               f"moments {opt.moment_dtype}")
     config["host_arena"] = _reserve_host_arena(host_arena, budget, session)
+    config["disk_offload"] = disk.dir if disk is not None else None
+    if session.pager is not None and session.pager.frozen_disk_bytes:
+        session.events.append(f"disk tier: {session.pager.frozen_disk_bytes / 2**30:.2f} GiB of frozen weights in "
+                              f"memory-mapped files under {disk_offload}")
     config["peer"] = peer if peer not in (None, 0) else False
     if config["peer"] is not False and opt._dp is not None and opt._dp.get("local") is not None:
         session._peer_step = PEER_SETUP_STEP  # the same step on every rank: the setup is collective

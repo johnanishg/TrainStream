@@ -99,6 +99,42 @@ def test_quant_linear_matches_emulation(kind, dtype):
     assert lin.bias.grad is not None
 
 
+@pytest.mark.parametrize("kind, outliers", [("fp8", 0.0), ("nvfp4", 0.0), ("nvfp4", 0.02)],
+                         ids=["fp8", "nvfp4", "nvfp4-outliers"])  # outlier channels are an nvfp4 option
+def test_a_shared_input_is_quantized_once(kind, outliers, monkeypatch):
+    # q / k / v read the same activation: one quantization serves all three, with the
+    # same results as quantizing it for each; an in-place write invalidates it
+    needs_native(kind)
+    torch.manual_seed(0)
+    lins = [nn.Linear(512, n, bias=False).to(DEV, torch.bfloat16) for n in (512, 128, 128)]
+    qws = []
+    for lin in lins:
+        qw = Q.make_quantized(lin.weight, kind, 64, pin=False)
+        qw.to_device(DEV)
+        qw.outliers = outliers
+        qws.append(qw)
+    calls = []
+    for name in ("_quantize", "_quantize_split"):
+        real = getattr(lowp, name)
+        monkeypatch.setattr(lowp, name, lambda *a, _real=real: calls.append(1) or _real(*a))
+    x = torch.randn(2, 9, 512, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    lowp._CACHE.clear()
+    ys = [lowp.QuantLinearFn.apply(x, qw, None) for qw in qws]
+    assert len(calls) == 1
+    want = []
+    for qw in qws:
+        lowp._CACHE.clear()
+        want.append(lowp.QuantLinearFn.apply(x, qw, None))
+    assert all(torch.equal(a, b) for a, b in zip(ys, want))
+    with torch.no_grad():
+        x.mul_(2)  # bumps the version counter: quantized again
+    calls.clear()
+    lowp.QuantLinearFn.apply(x, qws[0], None)
+    assert len(calls) == 1
+    sum(y.float().sum() for y in ys).backward()  # the first backward empties the cache
+    assert lowp._CACHE.x is None
+
+
 # --------------------------------------------------------------------------- training
 class Emulated(nn.Module):
     def __init__(self, lin, kind):
@@ -221,3 +257,63 @@ def test_invalid_kind_names_the_choices():
     m = make()
     with pytest.raises(ValueError, match="nvfp4"):
         trainstream.wrap(m, torch.optim.AdamW(trainable(m), **HP), quantize="fp4")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fp4_backward_trades_precision_for_tensor_cores(dtype):
+    needs_native("nvfp4")
+    torch.manual_seed(0)
+    lin = nn.Linear(512, 384, bias=False).to(DEV, dtype)
+    lin.weight.requires_grad_(False)
+    qw = Q.make_quantized(lin.weight, "nvfp4", 64, pin=False)
+    qw.to_device(DEV)
+    x = torch.randn(64, 512, device=DEV, dtype=dtype, requires_grad=True)
+    g = torch.randn(64, 384, device=DEV, dtype=dtype)
+    exact = g.float() @ qw.dequantize(DEV).float()
+    err = {}
+    for fp4 in (False, True):
+        qw.fp4_backward = fp4
+        x.grad = None
+        lowp.QuantLinearFn.apply(x, qw, None).backward(g)
+        err[fp4] = ((x.grad.float() - exact).norm() / exact.norm()).item()
+    assert err[False] < 0.01 < err[True] < 0.2  # measured: 0.002 and 0.12
+
+
+def test_modelopt_nvfp4_checkpoint_is_read_as_stored(tmp_path):
+    needs_native("nvfp4")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("accelerate")
+    import json
+    from safetensors.torch import save_file
+    from trainstream.integrations.huggingface import load_model
+    torch.manual_seed(0)
+    cfg = transformers.LlamaConfig(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2)
+    model = transformers.LlamaForCausalLM(cfg).to(torch.bfloat16)
+    tensors, want = {}, {}
+    for name, p in model.state_dict().items():
+        if ".layers." in name and name.endswith("_proj.weight"):  # what ModelOpt exports in NVFP4
+            w = p.float().to(DEV)
+            g = Q.global_decode_scale(w)
+            q, _, deq = Q.quantize_blockscaled_reference(w, "nvfp4", g)
+            n, k = w.shape
+            scale = (w.view(n, k // 16, 16).abs().amax(-1) / 6.0 / g).clamp(max=448.0).to(torch.float8_e4m3fn)
+            base = name[: -len(".weight")]
+            tensors.update({name: q.cpu(), base + ".weight_scale": scale.cpu(), base + ".weight_scale_2": g.cpu(),
+                            base + ".input_scale": torch.ones(1)})
+            want[name] = deq.to(torch.bfloat16).cpu()
+        else:
+            tensors[name] = p.contiguous()
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    cfg.save_pretrained(str(tmp_path))
+    meta = json.loads((tmp_path / "config.json").read_text())
+    meta["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16}
+    (tmp_path / "config.json").write_text(json.dumps(meta))
+    loaded = load_model(str(tmp_path), dtype=torch.bfloat16)
+    assert loaded._ts_load_info["quantize"] == "nvfp4"
+    assert loaded._ts_load_info["quantized_tensors"] == len(want)
+    for name, p in loaded.named_parameters():
+        if name in want:
+            qw = Q.quantized_of(p)
+            assert qw is not None and qw.kind == "nvfp4"
+            assert torch.equal(qw.dequantize(DEV).cpu(), want[name]), name

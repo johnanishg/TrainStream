@@ -74,8 +74,13 @@ def _owner(model: nn.Module, name: str) -> nn.Module:
     return mod
 
 
+PACKED_SUFFIXES = (".weight", ".weight_scale", ".weight_scale_2", ".input_scale")  # ModelOpt NVFP4 export
+
+
 def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch.bfloat16,
-               quant_block_size: int = 64, random_weights: bool = False, ram_fraction: float = 0.85,
+               quant_block_size: int = 64, keep_precise=0, error_rank: int = 0, error_iters: int = 1,
+               double_quant: bool = False, disk_offload: Optional[str] = None,
+               random_weights: bool = False, ram_fraction: float = 0.85,
                trust_remote_code: bool = False, **config_overrides) -> nn.Module:
     """Load a causal LM for TrainStream training, streaming its checkpoint.
 
@@ -94,6 +99,23 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     weights instead of reading a checkpoint (memory / speed tests at full size
     without a download). ``config_overrides`` set config fields, e.g.
     ``num_hidden_layers=4``.
+
+    An NVFP4 checkpoint exported by NVIDIA ModelOpt (``quant_method: modelopt``,
+    ``quant_algo: NVFP4`` in its config) is read as it is stored: its packed
+    matrices become TrainStream NVFP4 weights without being expanded or
+    quantized again (``quantize`` is ignored for it).
+
+    ``keep_precise`` (with ``quantize="nf4"`` / ``"nvfp4"``): the matrices that
+    lose the most in that format, measured as they are read, are read again
+    afterwards and kept one step more precise (int8 / fp8), within that
+    fraction of extra bytes ("auto": 0.05; default 0: none). ``error_rank`` /
+    ``error_iters`` (LoftQ): each quantized matrix also keeps a rank-``error_rank``
+    approximation of what quantization lost; ``wrap()`` starts the PEFT LoRA
+    adapters added on top at it (see trainstream.wrap). ``double_quant``: nf4 / int8
+    block scales stored in one byte each (see trainstream.wrap). ``disk_offload``: a
+    directory; decoder-layer matrices that aren't quantized are written to
+    memory-mapped files there as they're read (trainstream.disk), so a base
+    larger than RAM loads, and wrap() streams them from there.
     """
     import os
 
@@ -109,7 +131,15 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     if quantize not in ("auto", "none") + Q.KINDS:
         raise ValueError(f"quantize must be 'auto', 'none', 'int8', 'nf4', 'fp8' or 'nvfp4', got {quantize!r}")
     Q._check("nf4", quant_block_size)
+    keep_frac = Q.keep_fraction(keep_precise)
     cfg = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    qc = getattr(cfg, "quantization_config", None) or {}
+    qc = qc if isinstance(qc, dict) else (qc.to_dict() if hasattr(qc, "to_dict") else vars(qc))
+    # an NVFP4 checkpoint exported by NVIDIA ModelOpt: its matrices are read as they are stored
+    prequant = qc.get("quant_method") == "modelopt" and str(qc.get("quant_algo", "")).upper() == "NVFP4"
+    if prequant:
+        cfg.quantization_config = None  # built as a plain model; the packed weights are attached below
+        quantize = "none"  # the matrices the export kept in 16 bits stay so
     for k, v in config_overrides.items():
         setattr(cfg, k, v)
     with init_empty_weights(include_buffers=False):
@@ -134,19 +164,34 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     ram = physical_ram_bytes()
     pin_budget = int(0.40 * ram) if ram else 1 << 62
     qcount = 0
+    errors, where = [], {}  # keep_precise: each matrix's loss in `quantize`, and where to read it again
+    packed = {}  # ModelOpt NVFP4: per matrix, its packed codes and scales (possibly in different shards)
+    store = None
+    if disk_offload:
+        from trainstream.disk import DiskStore
+        store = DiskStore(str(disk_offload))
 
-    def put(name: str, value: torch.Tensor) -> None:
+    def put(name: str, value: torch.Tensor, kind=None) -> None:
         nonlocal qcount
         module, attr = _owner(model, name), name.rsplit(".", 1)[-1]
         old = module._parameters[attr]
         if quantize in Q.KINDS and name in elig:
-            nb = Q.packed_bytes(value.numel(), quantize, quant_block_size, value.shape)
-            qw = Q.make_quantized(value.to(dtype), quantize, quant_block_size,
-                                  pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget)
+            kind = kind or quantize
+            nb = Q.packed_bytes(value.numel(), kind, quant_block_size, value.shape)
+            if keep_frac and kind == quantize and quantize in Q.KEEP_KIND:
+                errors.append((name, Q.quant_error(value.to(dtype), quantize, quant_block_size), value.numel(),
+                               tuple(value.shape)))
+            qw = Q.make_quantized(value.to(dtype), kind, quant_block_size,
+                                  pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget,
+                                  error_rank=max(0, int(error_rank)), error_iters=max(1, int(error_iters)),
+                                  double_quant=bool(double_quant))
             holder = nn.Parameter(torch.empty(tuple(value.shape), dtype=dtype), requires_grad=False)
             Q.attach(holder, qw)
             module._parameters[attr] = holder
-            qcount += 1
+            qcount += kind == quantize
+        elif store is not None and value.is_floating_point() and value.dim() >= 2 and id(_owner(model, name)) in inside:
+            v = store.store(value.to(dtype)).view(tuple(value.shape))  # a block matrix: in a file, not in RAM
+            module._parameters[attr] = nn.Parameter(v, requires_grad=old.requires_grad)
         else:
             # an owned copy: a view would keep the whole memory-mapped shard alive
             v = value.to(dtype, copy=True) if value.is_floating_point() else value.clone()
@@ -176,15 +221,45 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
         for f in files:
             with safe_open(os.path.join(folder, f), framework="pt", device="cpu") as fh:
                 for key in fh.keys():
+                    if prequant and key.endswith(PACKED_SUFFIXES):
+                        base, _, suf = key.rpartition(".")
+                        t = fh.get_tensor(key)
+                        if suf != "weight" or t.dtype == torch.uint8:  # (a 16-bit matrix is read as usual)
+                            packed.setdefault(base, {})[suf] = t
+                            continue
                     name = key if key in params else (prefix + key if prefix + key in params else None)
                     if name is not None and params[name].device.type == "meta":
+                        where[name] = (os.path.join(folder, f), key)
                         put(name, fh.get_tensor(key))
+    if prequant:
+        for base, parts in packed.items():
+            name = base + ".weight"
+            name = name if name in params else prefix + name
+            if name not in params or not {"weight", "weight_scale", "weight_scale_2"} <= parts.keys():
+                continue
+            qw = Q.from_modelopt_nvfp4(parts["weight"], parts["weight_scale"], parts["weight_scale_2"], dtype,
+                                       pin=_C.pinned_stats()["live_bytes"] + parts["weight"].numel() <= pin_budget)
+            module, attr = _owner(model, name), name.rsplit(".", 1)[-1]
+            holder = nn.Parameter(torch.empty(qw.shape, dtype=dtype), requires_grad=False)
+            Q.attach(holder, qw)
+            module._parameters[attr] = holder
+            qcount += 1
+        quantize = "nvfp4" if qcount else "none"
+        packed.clear()
+    # random weights have no checkpoint to read again: they stay as they are
+    keep = Q.choose_precise([e for e in errors if e[0] in where], quantize, keep_frac, quant_block_size)
+    for name in sorted(keep):  # read again and stored one step more precise
+        from safetensors import safe_open
+        path, key = where[name]
+        with safe_open(path, framework="pt", device="cpu") as fh:
+            put(name, fh.get_tensor(key), kind=Q.KEEP_KIND[quantize])
     model.tie_weights()
     missing = [n for n, p in model.named_parameters() if p.device.type == "meta"]
     if missing:
         raise RuntimeError(f"the checkpoint has no values for {len(missing)} parameters, e.g. {missing[:3]}")
     model._ts_load_info = {"quantize": None if quantize == "none" else quantize,
-                           "quant_block_size": quant_block_size, "quantized_tensors": qcount}
+                           "quant_block_size": quant_block_size, "quantized_tensors": qcount,
+                           "kept_precise": sorted(keep)}
     return model
 
 
@@ -417,6 +492,11 @@ class TrainStreamTrainer(Trainer):
     The next-token loss of causal LMs is computed in chunks of tokens from the
     final hidden states (``trainstream.losses``), so the full [batch, seq,
     vocab] logits never exist; disable with ``trainstream={"chunked_loss": False}``.
+
+    ``trainstream={"packing": N}`` packs each batch's examples into rows of N
+    tokens with no padding (``trainstream.packing``; True: rows as long as the
+    batch's longest example). position_ids restart at every example, which
+    keeps attention inside it, and no example is trained to follow another.
     Models with soft-capped or scaled logits, label smoothing, or a custom
     ``compute_loss_func`` use the stock loss.
 
@@ -441,6 +521,7 @@ class TrainStreamTrainer(Trainer):
         self.trainstream_config = dict(trainstream or {})
         self.chunked_loss = bool(self.trainstream_config.pop("chunked_loss", True))
         self.loss_chunk_size = int(self.trainstream_config.pop("loss_chunk_size", 1024))
+        packing = self.trainstream_config.pop("packing", False)
         self.chunked_loss_used = 0
         self.ts_optimizer: Optional[OffloadAdamW] = None
         super().__init__(*args, **kwargs)
@@ -451,6 +532,10 @@ class TrainStreamTrainer(Trainer):
             raise ValueError("TrainStreamTrainer currently supports a single GPU per process.")
         if not torch.cuda.is_available():
             raise ValueError("TrainStreamTrainer needs a CUDA GPU.")
+        if packing:
+            from trainstream.packing import PackedCollator
+            pad = getattr(getattr(self, "processing_class", None), "pad_token_id", None)
+            self.data_collator = PackedCollator(None if packing is True else int(packing), pad if pad is not None else 0)
         self._ts_metrics: Optional[TrainStreamMetrics] = None
 
     # -- placement ---------------------------------------------------------

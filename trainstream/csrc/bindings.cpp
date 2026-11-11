@@ -125,6 +125,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quantize_blockscaled", &quantize_blockscaled, py::arg("x"), py::arg("kind"),
         py::arg("global_decode") = c10::optional<at::Tensor>(), py::arg("mask") = c10::optional<at::Tensor>());
   m.def("col_absmax", &col_absmax, py::arg("x"));
+  m.def("rms_norm_forward", &rms_norm_forward, py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("gemma"));
+  m.def("rms_norm_backward", &rms_norm_backward, py::arg("dy"), py::arg("x"), py::arg("w"), py::arg("rstd"),
+        py::arg("gemma"), py::arg("need_dw"));
+  m.def("rope", &rope, py::arg("x"), py::arg("cos"), py::arg("sin"), py::arg("backward"));
+  m.def("gated_act_forward", &gated_act_forward, py::arg("g"), py::arg("u"), py::arg("act"));
+  m.def("gated_act_backward", &gated_act_backward, py::arg("dh"), py::arg("g"), py::arg("u"), py::arg("act"));
   m.def("dequantize_blockscaled_cols", &dequantize_blockscaled_cols, py::arg("q"), py::arg("scales"), py::arg("idx"),
         py::arg("rows"), py::arg("cols"), py::arg("global_decode"), py::arg("dtype") = at::kBFloat16);
   m.def("dequantize_blockscaled", &dequantize_blockscaled, py::arg("dst"), py::arg("q"), py::arg("scales"),

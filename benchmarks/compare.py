@@ -12,6 +12,10 @@ installed". Same data for all: fixed random tokens. Results: JSON lines to
 the benchmark environment (benchmarks/requirements-bench.txt), never by
 TrainStream itself.
 
+The result also says how many CPU cores the engine kept busy over its measured
+steps ("cpu_cores": process CPU time / wall time, every thread): a laptop shares
+one power budget between CPU and GPU.
+
 While an engine trains, the GPU's SM clock, temperature, power draw and clock
 limits are sampled four times a second through NVML (the driver's library;
 nvidia-smi every 2 s where it can't be loaded); the result carries them for
@@ -35,13 +39,24 @@ Scenarios
   full1.5b      Qwen2.5-1.5B, every parameter trained, batch 4 x 512
   lora14b       Qwen2.5-14B, LoRA r=16 on all projections, batch 1 x 512
   lora14b_2k    the same at batch 1 x 2048
+  lora14b_12gb  lora14b with every engine held to 12 GB of VRAM (set_per_process_memory_fraction)
+  lora8b_llama  Llama-3.1-8B, LoRA r=16, batch 1 x 1024 (a second architecture; needs the model downloaded)
+  lora14b_var   Qwen2.5-14B, LoRA, documents of 64-2,048 tokens packed into 2 rows of 2,048 per step:
+                position_ids restart per document (transformers keeps attention inside each),
+                no document trained to follow another; the same rows for every engine
+--repeat N runs each engine N times in fresh processes and reports the run with the
+median step time, every run's step time and their spread (engines slower than
+REPEAT_MAX_S per step run once).
 Engines
   stock             plain PyTorch (+ PEFT for LoRA), weights in VRAM, fused AdamW
   bnb_qlora         bitsandbytes NF4 base (BitsAndBytesConfig) + PEFT
   bnb_qlora_ckpt    the same with Hugging Face gradient checkpointing (the usual QLoRA recipe)
-  unsloth           Unsloth FastLanguageModel, 4-bit base, its defaults
+  bnb_liger         bnb_qlora_ckpt plus Liger's fused Triton kernels (AutoLigerKernelForCausalLM)
+  unsloth           Unsloth FastLanguageModel, 4-bit base, use_gradient_checkpointing="unsloth"
   deepspeed         DeepSpeed ZeRO-2 with the optimizer offloaded to the CPU
-  trainstream       TrainStream defaults (bf16 base)
+  trainstream       TrainStream defaults (bf16 base). The TrainStream engines compute the loss as
+                    TrainStreamTrainer does, in chunks from the hidden states (no full logits);
+                    Liger and Unsloth use their own fused losses, the others the model's own
   trainstream_nf4   TrainStream, NF4 base         (load_model(quantize="nf4"))
   trainstream_nvfp4 TrainStream, NVFP4 base, tensor-core matmuls
 """
@@ -59,13 +74,21 @@ SCENARIOS = {
     "full1.5b": dict(model="Qwen/Qwen2.5-1.5B", lora=False, batch=4, seq=512),
     "lora14b": dict(model="Qwen/Qwen2.5-14B", lora=True, batch=1, seq=512),
     "lora14b_2k": dict(model="Qwen/Qwen2.5-14B", lora=True, batch=1, seq=2048),
+    # every engine held to 12 GB of VRAM (torch.cuda.set_per_process_memory_fraction)
+    "lora14b_12gb": dict(model="Qwen/Qwen2.5-14B", lora=True, batch=1, seq=512, vram_gb=12, like="lora14b"),
+    # a second architecture; runs where the model is downloaded
+    "lora8b_llama": dict(model="meta-llama/Llama-3.1-8B", lora=True, batch=1, seq=1024),
+    # documents of 64 to 2,048 tokens packed into 2 rows of 2,048 per step (the same ones for every engine)
+    "lora14b_var": dict(model="Qwen/Qwen2.5-14B", lora=True, batch=2, seq=2048, docs=True, like="lora14b_2k"),
 }
-ENGINES = ["stock", "bnb_qlora", "bnb_qlora_ckpt", "unsloth", "deepspeed", "trainstream", "trainstream_nf4", "trainstream_nvfp4"]
+ENGINES = ["stock", "bnb_qlora", "bnb_qlora_ckpt", "bnb_liger", "unsloth", "deepspeed", "trainstream", "trainstream_nf4",
+           "trainstream_nvfp4"]
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 LORA = dict(r=16, alpha=32, dropout=0.0, targets=TARGETS)
 ENGINE_LABELS = {
     "stock": "Stock PyTorch (+ PEFT)", "bnb_qlora": "bitsandbytes QLoRA (NF4)",
-    "bnb_qlora_ckpt": "bitsandbytes QLoRA + checkpointing", "unsloth": "Unsloth (4-bit)",
+    "bnb_qlora_ckpt": "bitsandbytes QLoRA + checkpointing", "bnb_liger": "bitsandbytes QLoRA + Liger kernels",
+    "unsloth": "Unsloth (4-bit)",
     "deepspeed": "DeepSpeed ZeRO-2, CPU offload", "trainstream": "TrainStream (auto)",
     "trainstream_nf4": "TrainStream, NF4 base", "trainstream_nvfp4": "TrainStream, NVFP4 base",
 }
@@ -74,12 +97,14 @@ LR = dict(lora=2e-4, full=2e-5)  # one learning rate per kind of scenario, for e
 NOT_FOR_FULL = {
     "bnb_qlora": "trains LoRA adapters on a 4-bit base; this scenario trains every parameter",
     "bnb_qlora_ckpt": "trains LoRA adapters on a 4-bit base; this scenario trains every parameter",
+    "bnb_liger": "trains LoRA adapters on a 4-bit base; this scenario trains every parameter",
     "unsloth": "set up here for LoRA on a 4-bit base; this scenario trains every parameter",
     "trainstream_nf4": "quantizes frozen base weights; this scenario trains every weight, so it would run exactly "
                        "as TrainStream (auto)",
     "trainstream_nvfp4": "quantizes frozen base weights; this scenario trains every weight, so it would run exactly "
                          "as TrainStream (auto)",
 }
+REPEAT_MAX_S = 10.0  # --repeat: engines slower than this per step (spilling past VRAM) run once
 WARMUP = 2  # steps left out of the step-time median (allocator warm-up, autotuning, first-use setup)
 # An engine that tunes itself while training (TrainStream) gets its tuning steps, plus
 # SETTLE more after its last change, added to the warm-up: the median is taken over the
@@ -105,7 +130,7 @@ KERNEL_CATEGORIES = [
 
 
 LIVE = False  # --live: also print "LIVE {json}" lines while running (for the test UI)
-LIBRARIES = ("torch", "transformers", "peft", "bitsandbytes", "unsloth", "deepspeed", "trainstream")
+LIBRARIES = ("torch", "transformers", "peft", "bitsandbytes", "liger_kernel", "unsloth", "deepspeed", "trainstream")
 
 
 def proc_mem_gb():
@@ -257,15 +282,17 @@ class Nvml:
                         or getattr(lib, "nvmlDeviceGetCurrentClocksThrottleReasons", None))  # older drivers
 
     def sample(self):
-        """(SM MHz, °C, W, limits bitmask), None for what the driver doesn't report; None without a clock."""
+        """(SM MHz, °C, W, limits bitmask, enforced power limit W), None for what the driver doesn't
+        report; None without a clock."""
         c, lib, h = self.c, self.lib, self.h
-        sm, temp, mw, why = c.c_uint(), c.c_uint(), c.c_uint(), c.c_ulonglong()
+        sm, temp, mw, why, cap = c.c_uint(), c.c_uint(), c.c_uint(), c.c_ulonglong(), c.c_uint()
         if lib.nvmlDeviceGetClockInfo(h, 1, c.byref(sm)) != 0:  # NVML_CLOCK_SM
             return None
         return (float(sm.value),
                 float(temp.value) if lib.nvmlDeviceGetTemperature(h, 0, c.byref(temp)) == 0 else None,
                 mw.value / 1000.0 if lib.nvmlDeviceGetPowerUsage(h, c.byref(mw)) == 0 else None,
-                why.value if self.reasons is not None and self.reasons(h, c.byref(why)) == 0 else None)
+                why.value if self.reasons is not None and self.reasons(h, c.byref(why)) == 0 else None,
+                cap.value / 1000.0 if lib.nvmlDeviceGetEnforcedPowerLimit(h, c.byref(cap)) == 0 else None)
 
     def close(self):
         self.lib.nvmlShutdown()
@@ -277,7 +304,9 @@ class GpuWatch(threading.Thread):
     laptop GPU's clocks follow its temperature and power, so a report can tell a slower GPU from
     a slower engine. Silent without either."""
 
-    FIELDS = ("clocks.sm,temperature.gpu,power.draw,clocks_event_reasons.active",
+    FIELDS = ("clocks.sm,temperature.gpu,power.draw,clocks_event_reasons.active,enforced.power.limit",
+              "clocks.sm,temperature.gpu,power.draw,clocks_throttle_reasons.active,enforced.power.limit",
+              "clocks.sm,temperature.gpu,power.draw,clocks_event_reasons.active",
               "clocks.sm,temperature.gpu,power.draw,clocks_throttle_reasons.active",  # older drivers
               "clocks.sm,temperature.gpu,power.draw")
 
@@ -286,7 +315,7 @@ class GpuWatch(threading.Thread):
         self.target = target
         self.targets = [target] if target == "0" else [target, "0"]
         self.fields = None
-        self.samples = []  # (time, SM MHz, °C, W or None, limits bitmask or None)
+        self.samples = []  # (time, SM MHz, °C, W, limits bitmask, enforced power limit W); None if unknown
         self.done = threading.Event()
 
     def _smi(self, exe):
@@ -307,7 +336,8 @@ class GpuWatch(threading.Thread):
                     self.targets, self.fields = [target], fields
                     v = [x.strip() for x in res.stdout.strip().splitlines()[0].split(",")]
                     return (num(v[0]), num(v[1]), num(v[2]),
-                            int(v[3], 16) if len(v) > 3 and v[3].startswith("0x") else None)
+                            int(v[3], 16) if len(v) > 3 and v[3].startswith("0x") else None,
+                            num(v[4]) if len(v) > 4 else None)
         return None
 
     def run(self):
@@ -333,7 +363,7 @@ class GpuWatch(threading.Thread):
 
     def summary(self, t0, t1):
         """The samples taken between t0 and t1 (else every sample): median SM clock, its lowest,
-        the hottest temperature, median power and the clock limits seen."""
+        the hottest temperature, median power, the enforced power limit's range and the clock limits seen."""
         xs = [s for s in self.samples if t0 <= s[0] <= t1] or list(self.samples)
         if not xs:
             return None
@@ -346,7 +376,55 @@ class GpuWatch(threading.Thread):
             seen |= s[4] or 0
         return dict(samples=len(xs), sm_mhz=median(s[1] for s in xs), sm_mhz_min=min(s[1] for s in xs),
                     temp_c_max=max((s[2] for s in xs if s[2] is not None), default=None),
-                    power_w=median(s[3] for s in xs), limits=[n for bit, n in CLOCK_LIMITS.items() if seen & bit])
+                    power_w=median(s[3] for s in xs),
+                    power_limit_w=median(s[5] for s in xs if len(s) > 5),
+                    power_limit_w_min=min((s[5] for s in xs if len(s) > 5 and s[5] is not None), default=None),
+                    limits=[n for bit, n in CLOCK_LIMITS.items() if seen & bit])
+
+
+def packed_batches(vocab, rows, seq):
+    """Rows of variable-length random documents (log-uniform, 64 to seq tokens), packed best-fit
+    until `rows` rows of `seq` are full: dicts of input_ids, position_ids, labels (-100 at each
+    document's first token and at padding), the same every run."""
+    import math
+    import torch
+    g = torch.Generator().manual_seed(SEED)
+    while True:
+        room, docs = [seq] * rows, [[] for _ in range(rows)]
+        while True:
+            n = int(math.exp(math.log(64) + torch.rand(1, generator=g).item() * (math.log(seq) - math.log(64))))
+            fits = [r for r in range(rows) if room[r] >= n]
+            if not fits:
+                break
+            r = min(fits, key=lambda r: room[r])
+            docs[r].append(torch.randint(0, vocab, (n,), generator=g))
+            room[r] -= n
+        ids = torch.zeros(rows, seq, dtype=torch.long)
+        pos = torch.zeros(rows, seq, dtype=torch.long)
+        lab = torch.full((rows, seq), -100, dtype=torch.long)
+        for r in range(rows):
+            at = 0
+            for d in docs[r]:
+                n = len(d)
+                ids[r, at:at + n], pos[r, at:at + n], lab[r, at + 1:at + n] = d, torch.arange(n), d[1:]
+                at += n
+            pos[r, at:] = torch.arange(pos[r, at - 1] + 1 if at else 0, (pos[r, at - 1] + 1 if at else 0) + seq - at)
+        yield dict(input_ids=ids, position_ids=pos, labels=lab)
+
+
+def to_cuda(batch):
+    """A batch on the GPU: a token tensor (input and labels) or a packed batch's dict."""
+    if isinstance(batch, dict):
+        return {k: v.cuda() for k, v in batch.items()}
+    return batch.cuda()
+
+
+def model_inputs(batch):
+    """The keyword arguments a causal LM trains on for a batch: a packed one keeps attention per
+    document, which transformers does only without a KV cache."""
+    if isinstance(batch, dict):
+        return dict(batch, use_cache=False)
+    return dict(input_ids=batch, labels=batch)
 
 
 def batches(vocab, batch, seq):
@@ -391,7 +469,11 @@ def optimizer_info(opt):
 
 def not_applicable(engine, scenario):
     """Why `engine` doesn't run in `scenario`, or None."""
-    return None if SCENARIOS[scenario]["lora"] else NOT_FOR_FULL.get(engine)
+    sc = SCENARIOS[scenario]
+    if sc.get("docs") and engine == "unsloth":
+        return ("patches attention itself, so it can't be checked to keep attention inside each packed document "
+                "(as transformers does from position_ids); not compared here")
+    return None if sc["lora"] else NOT_FOR_FULL.get(engine)
 
 
 def build(engine, sc):
@@ -408,7 +490,29 @@ def build(engine, sc):
     def plain_step(model, opt):
         def step(ids):
             with torch.autocast("cuda", dtype=bf16):
-                loss = model(input_ids=ids, labels=ids).loss
+                loss = model(**model_inputs(ids)).loss
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            return loss.item()
+        return step
+
+    def chunked_step(model, opt):
+        """TrainStream's own loss path (what TrainStreamTrainer does): the next-token loss computed in
+        chunks from the final hidden states, so the [tokens, vocab] logits never exist."""
+        from trainstream.integrations.huggingface import _CaptureHidden, lm_head_of
+        from trainstream.losses import causal_lm_loss
+        head = lm_head_of(model)
+        if head is None:
+            return plain_step(model, opt)
+
+        def step(ids):
+            kw = model_inputs(ids)
+            labels = kw.pop("labels")
+            with torch.autocast("cuda", dtype=bf16):
+                with _CaptureHidden(head) as cap:
+                    model(**kw)
+                loss = causal_lm_loss(cap.hidden, head.weight, labels, head.bias)
             loss.backward()
             opt.step()
             opt.zero_grad(set_to_none=True)
@@ -442,13 +546,32 @@ def build(engine, sc):
                                                    f"{str(q.bnb_4bit_compute_dtype).replace('torch.', '')}",
                                                    **optimizer_info(opt))
 
+    if engine == "bnb_liger":
+        # the strongest bitsandbytes setup: Liger's fused RMSNorm / RoPE / SwiGLU / linear cross-entropy
+        # kernels (Triton) on the NF4 base, with gradient checkpointing
+        import peft
+        from liger_kernel.transformers import AutoLigerKernelForCausalLM
+        from transformers import BitsAndBytesConfig
+        q = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=bf16)
+        model = AutoLigerKernelForCausalLM.from_pretrained(name, quantization_config=q, dtype=bf16,
+                                                           device_map={"": 0})
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
+        model = peft.get_peft_model(model, lora_config())
+        params = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(params, lr=lr)
+        return model, plain_step(model, opt), dict(base="nf4 (bitsandbytes), compute bfloat16, Liger kernels",
+                                                   **optimizer_info(opt))
+
     if engine == "unsloth":
         from unsloth import FastLanguageModel
         # the same checkpoint as every other engine (not Unsloth's pre-quantized copy)
         model, _ = FastLanguageModel.from_pretrained(name, max_seq_length=sc["seq"], load_in_4bit=True, dtype=bf16,
                                                      use_exact_model_name=True)
+        # its own offloaded gradient checkpointing, the setting Unsloth recommends
         model = FastLanguageModel.get_peft_model(model, r=LORA["r"], lora_alpha=LORA["alpha"],
-                                                 lora_dropout=LORA["dropout"], target_modules=LORA["targets"])
+                                                 lora_dropout=LORA["dropout"], target_modules=LORA["targets"],
+                                                 use_gradient_checkpointing="unsloth")
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=lr)
         return model, plain_step(model, opt), dict(base="4-bit (Unsloth)", **optimizer_info(opt))
@@ -471,7 +594,7 @@ def build(engine, sc):
         engine_, _, _, _ = deepspeed.initialize(model=model, model_parameters=params, config=cfg)
 
         def step(ids):
-            loss = engine_(input_ids=ids, labels=ids).loss
+            loss = engine_(**model_inputs(ids)).loss
             engine_.backward(loss)
             engine_.step()
             return loss.item()
@@ -496,12 +619,13 @@ def build(engine, sc):
         model, opt = trainstream.wrap(model, torch.optim.AdamW(params, lr=lr), device="cuda", quantize=kind)
         session = unwrap_session(model)
         used = (session.config.get("quantize") if session is not None else None) or "none"
-        step = plain_step(model, opt)
+        step = chunked_step(model, opt)
         step.session = session  # the worker reports the decisions TrainStream logs while training
         step.drain = getattr(opt, "synchronize", None)  # its host optimizer runs behind the step: wait for it
         if session is not None:
             step.adapting = lambda: session.adapting  # still tuning itself: those steps are warm-up
         return model, step, dict(base=f"quantize={kind}" + (f" → {used}" if used != kind else "") + " (TrainStream)",
+                                 loss="chunked from the hidden states (trainstream.causal_lm_loss, as TrainStreamTrainer)",
                                  quantize_used=used, **optimizer_info(opt))
 
     raise ValueError(engine)
@@ -612,7 +736,8 @@ def summarize_trace(events, wall_s, n):
         categories[c] = categories.get(c, 0.0) + k["us"]
     top = sorted(kernels.items(), key=lambda kv: -kv[1]["us"])[:10]
     step_ms = wall_s * 1000.0 / n
-    return dict(steps=n, step_ms=round(step_ms, 1), compute_ms=per(compute),
+    span = max(b for _, b in all_spans) - min(a for a, _ in all_spans)  # first GPU event to last
+    return dict(steps=n, step_ms=round(step_ms, 1), gpu_span_ms=per(span), compute_ms=per(compute),
                 copy_only_ms=per(anything - compute), idle_ms=round(max(step_ms - anything / 1000.0 / n, 0.0), 2),
                 kernel_ms=per(sum(k["us"] for k in kernels.values())), kernels_per_step=round(count / n),
                 categories={c: per(us) for c, us in sorted(categories.items(), key=lambda kv: -kv[1])},
@@ -621,8 +746,34 @@ def summarize_trace(events, wall_s, n):
                      for (name, c), k in top])
 
 
+SPAN_OK = (0.90, 1.02)  # the trace's first-to-last GPU event against the steps' wall time
+
+
 def profile_steps(step, data, n):
-    """Run n more steps under torch.profiler (GPU activity) and summarize the trace."""
+    """Run n more steps under torch.profiler (GPU activity) and summarize the trace. The kernel
+    times come from the GPU's timestamps and the step time from the host's clock, so the trace must
+    span about the steps' wall time; once under WSL a trace's GPU times came out ~45 % short, every
+    kernel (memory-bound ones too) looking that much faster and the rest booked as idle. Such a
+    trace is taken again once, then reported as unusable rather than with wrong numbers."""
+    for attempt in (1, 2):
+        out = _profile_once(step, data, n)
+        if out.get("retake") and attempt == 1:
+            continue  # the trace file couldn't be read: take it again
+        if "error" in out:
+            out.pop("retake", None)
+            return out
+        ratio = out["gpu_span_ms"] / out["step_ms"] if out["step_ms"] else 1.0
+        if SPAN_OK[0] <= ratio <= SPAN_OK[1]:
+            if attempt == 2:
+                out["retaken"] = "the first trace was unusable (its GPU timestamps didn't match the wall clock, or it couldn't be read)"
+            return out
+    return dict(error=f"the profiler's GPU timestamps covered {ratio * 100:.0f} % of the profiled steps' wall time "
+                      f"in two traces (expected about 100 %), so its kernel times can't be trusted; the measured "
+                      f"steps stand")
+
+
+def _profile_once(step, data, n):
+    """One traced run of n steps, summarized."""
     import tempfile
     import torch
     from torch.profiler import ProfilerActivity, profile
@@ -639,13 +790,17 @@ def profile_steps(step, data, n):
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             t = time.perf_counter()
             for ids in batches_:
-                step(ids.cuda())
+                step(to_cuda(ids))
             drain()
             torch.cuda.synchronize()
             wall = time.perf_counter() - t
         prof.export_chrome_trace(path)
-        with open(path, encoding="utf-8") as fh:
-            events = json.load(fh).get("traceEvents") or []
+        try:
+            with open(path, encoding="utf-8") as fh:
+                events = json.load(fh).get("traceEvents") or []
+        except ValueError as exc:  # once: PyTorch wrote a trace that isn't valid JSON
+            return dict(error=f"the profiler's trace file could not be read twice ({type(exc).__name__}: {exc}); "
+                              f"the measured steps stand", retake=True)
     finally:
         try:
             os.remove(path)
@@ -665,7 +820,7 @@ def profile_ops(step, data, n, top=OPS_TOP):
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         for ids in batches_:
-            step(ids.cuda())
+            step(to_cuda(ids))
         drain()
         torch.cuda.synchronize()
     rows = []
@@ -708,6 +863,9 @@ def worker(engine, scenario, steps):
     if why:
         out.update(status="not applicable", detail=why)
         return out
+    if sc.get("vram_gb"):  # the scenario's VRAM cap, for every engine alike
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, sc["vram_gb"] * 2**30 / total), 0)
     peak = PeakVRAM()
     sampler = Sampler()
     if LIVE:
@@ -735,7 +893,7 @@ def worker(engine, scenario, steps):
                                   vram_metric="torch.cuda.max_memory_allocated(), kept across the engine's own resets",
                                   ram_metric="peak working set" if sys.platform == "win32"
                                   else "peak resident set (VmHWM)")
-    data = batches(cfg.vocab_size, sc["batch"], sc["seq"])
+    data = (packed_batches if sc.get("docs") else batches)(cfg.vocab_size, sc["batch"], sc["seq"])
     times, losses = [], []
     session, events = getattr(step, "session", None), []  # TrainStream: what it decided, after which step
     adapting = getattr(step, "adapting", None)
@@ -756,13 +914,15 @@ def worker(engine, scenario, steps):
     watch = GpuWatch(gpu_target())
     watch.start()
     starts = []  # wall time each step began: the GPU samples of the measured steps
+    cpu = []  # (process CPU seconds, wall seconds) at each step's start: how many cores the engine kept busy
     try:
         while len(times) < method["steps"]:
             ids = next(data)
             torch.cuda.synchronize()
             starts.append(time.time())
+            cpu.append((time.process_time(), time.perf_counter()))
             t = time.perf_counter()
-            losses.append(step(ids.cuda()))
+            losses.append(step(to_cuda(ids)))
             torch.cuda.synchronize()
             times.append(time.perf_counter() - t)
             i = len(times)
@@ -783,6 +943,10 @@ def worker(engine, scenario, steps):
         sampler.done.set()
         watch.done.set()
     tail = sorted(times[method["warmup"]:] or times)
+    c0 = cpu[min(method["warmup"], len(cpu) - 1)]
+    wall = time.perf_counter() - c0[1]
+    # every thread of this process (a host optimizer's too): a laptop gives its GPU less power while the CPU draws more
+    out["cpu_cores"] = round((time.process_time() - c0[0]) / wall, 2) if wall > 0 else None
     out.update(status="ok", step_s=tail[len(tail) // 2], tokens_per_s=sc["batch"] * sc["seq"] / tail[len(tail) // 2],
                vram_peak_gb=peak.gb(), rss_peak_gb=rss_gb(), losses=losses[:5], step_times=times,
                gpu=watch.summary(starts[min(method["warmup"], len(starts) - 1)], time.time()))
@@ -818,6 +982,9 @@ def main():
     ap.add_argument("--engines", nargs="+", default=ENGINES, choices=ENGINES)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--timeout", type=int, default=3600)
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help=f"run each engine N times in fresh processes and report the median run with the spread "
+                         f"(engines slower than {REPEAT_MAX_S:.0f} s per step run once)")
     ap.add_argument("--profile-ops", action="store_true",
                     help="with --profile: N more steps traced with the operations and shapes behind the kernels")
     ap.add_argument("--profile", type=int, default=0, metavar="N",
@@ -836,35 +1003,67 @@ def main():
         if not_applicable(engine, args.scenario):
             print(f"{engine}: skipped, {not_applicable(engine, args.scenario)}", flush=True)
             continue
-        cmd = [sys.executable, __file__, "--worker", engine, args.scenario, "--steps", str(args.steps),
-               "--profile", str(args.profile)] + (["--profile-ops"] if args.profile_ops else [])
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
-            line = [l for l in res.stdout.splitlines() if l.startswith("RESULT ")]
-            if line:
-                row = json.loads(line[-1][7:])
-            else:
-                err = (res.stderr.strip().splitlines() or ["?"])[-1]
-                row = dict(engine=engine, scenario=args.scenario,
-                           status="out of memory" if "OutOfMemory" in res.stderr or "out of memory" in res.stderr
-                           else "failed", detail=err[:300])
-        except subprocess.TimeoutExpired:
-            # e.g. a model larger than VRAM that the driver spills into system RAM
-            row = dict(engine=engine, scenario=args.scenario,
-                       status=f"did not finish {args.steps} steps in {args.timeout} s")
+        runs = []
+        for k in range(max(1, args.repeat)):
+            row = run_engine(engine, args, profile=args.profile if k == 0 else 0)
+            runs.append(row)
+            if row.get("status") != "ok" or row["step_s"] > REPEAT_MAX_S:
+                break  # a failure or a slow engine: one run says enough
+        row = representative(runs)
         rows.append(row)
         print(json.dumps({k: v for k, v in row.items() if k != "losses"}), flush=True)
         if args.out:
             with open(args.out, "a") as fh:
                 fh.write(json.dumps(row) + "\n")
-    print(f"\n| engine | status | step time | tokens/s | peak VRAM | process RAM |\n|---|---|---|---|---|---|")
+    print(f"\n| engine | status | step time | runs | tokens/s | peak VRAM | process RAM |\n|---|---|---|---|---|---|---|")
     for r in rows:
         if r.get("status") == "ok":
             ram = f"{r['rss_peak_gb']:.1f} GB" if r.get("rss_peak_gb") else "—"
-            print(f"| {r['engine']} | ok | {r['step_s']:.2f} s | {r['tokens_per_s']:.0f} | "
+            runs = r.get("runs_step_s") or [r["step_s"]]
+            spread = f" (±{r['spread'] * 50:.0f} %)" if r.get("spread") else ""
+            print(f"| {r['engine']} | ok | {r['step_s']:.2f} s{spread} | {len(runs)} | {r['tokens_per_s']:.0f} | "
                   f"{r['vram_peak_gb']:.1f} GB | {ram} |")
         else:
-            print(f"| {r['engine']} | {r['status']} | — | — | — | — |")
+            print(f"| {r['engine']} | {r['status']} | — | — | — | — | — |")
+    print_profiles(rows)
+
+
+def run_engine(engine, args, profile):
+    """One worker process for `engine`: its RESULT row (or why it has none)."""
+    cmd = [sys.executable, __file__, "--worker", engine, args.scenario, "--steps", str(args.steps),
+           "--profile", str(profile)] + (["--profile-ops"] if args.profile_ops and profile else [])
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+        line = [l for l in res.stdout.splitlines() if l.startswith("RESULT ")]
+        if line:
+            row = json.loads(line[-1][7:])
+        else:
+            err = (res.stderr.strip().splitlines() or ["?"])[-1]
+            row = dict(engine=engine, scenario=args.scenario,
+                       status="out of memory" if "OutOfMemory" in res.stderr or "out of memory" in res.stderr
+                       else "failed", detail=err[:300])
+    except subprocess.TimeoutExpired:
+        # e.g. a model larger than VRAM that the driver spills into system RAM
+        row = dict(engine=engine, scenario=args.scenario,
+                   status=f"did not finish {args.steps} steps in {args.timeout} s")
+    return row
+
+
+def representative(runs):
+    """The run with the median step time of an engine's ok runs (its profile from the first run),
+    with every run's step time and their spread: (max - min) / median."""
+    ok = sorted((r for r in runs if r.get("status") == "ok"), key=lambda r: r["step_s"])
+    if len(ok) < 2:
+        return runs[0]
+    mid = dict(ok[(len(ok) - 1) // 2])
+    if runs[0].get("profile") is not None:
+        mid["profile"] = runs[0]["profile"]
+    times = [r["step_s"] for r in runs if r.get("status") == "ok"]
+    mid.update(runs_step_s=times, spread=(max(times) - min(times)) / mid["step_s"])
+    return mid
+
+
+def print_profiles(rows):
     profiled = [r for r in rows if (r.get("profile") or {}).get("categories")]
     if profiled:
         cats = []

@@ -130,3 +130,29 @@ def test_deterministic_mode_switched_after_wrap_reaches_recomputed_blocks():
         assert all(b._ts_sdpa_order[0] == SDPBackend.EFFICIENT_ATTENTION for b in s.blocks)
     finally:
         trainstream.unwrap(m)
+
+
+def test_masked_inputs_keep_pytorchs_order():
+    # the timing is unmasked; with packed documents (position ids) or padding (an attention mask),
+    # cuDNN's backward rejects transformers' expanded masks: those forwards keep PyTorch's own order
+    from trainstream.packing import pack_sequences
+    model = tiny_llama()
+    model, opt = trainstream.wrap(model, torch.optim.AdamW(model.parameters(), lr=1e-3), attention="cudnn",
+                                  activation_offload=False, profile=False)
+    try:
+        session = trainstream.wrapper.unwrap_session(model)
+        g = torch.Generator().manual_seed(2)
+        batch = pack_sequences([torch.randint(0, 512, (int(n),), generator=g) for n in (100, 60, 200, 150)], 256)
+        batch.pop("num_tokens")
+        kw = {k: v.cuda() for k, v in batch.items()}
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = model(**kw, use_cache=False).loss
+        assert all(getattr(b, "_ts_sdpa_order", "unset") is None for b in session.attention.blocks)
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        assert any("keep PyTorch's default backend order" in e for e in session.events)
+        step(model, opt, ids(1)[0])  # unmasked again: the chosen backend first
+        assert all(b._ts_sdpa_order is not None for b in session.attention.blocks)
+    finally:
+        trainstream.unwrap(model)

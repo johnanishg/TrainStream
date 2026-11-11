@@ -34,10 +34,11 @@ from .losses import causal_lm_loss, chunked_cross_entropy, dpo_loss, sequence_lo
 from .optimizer import OffloadAdamW
 from .paging import ParamPager
 from .profiler import HardwareProfile, profile_hardware
-from .quant import quantize_model
+from .packing import PackedCollator, pack_sequences
+from .quant import init_lora_from_error, quantize_model
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "wrap",
@@ -61,6 +62,9 @@ __all__ = [
     "pinned_stats",
     "transfer_stats",
     "reserve_pinned",
+    "pack_sequences",
+    "PackedCollator",
+    "init_lora_from_error",
 ]
 
 

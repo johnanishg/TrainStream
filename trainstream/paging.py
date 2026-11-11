@@ -45,6 +45,7 @@ from torch import nn
 
 from . import _C
 from .optimizer import physical_ram_bytes
+from .disk import is_on_disk
 from .quant import make_quantized, quantized_of
 
 
@@ -77,8 +78,8 @@ def pageable_params(model: nn.Module, blocks: Sequence[nn.Module], indices: Iter
         seen: Set[int] = set()
         ps = []
         for p in blocks[i].parameters():
-            if id(p) in seen or id(p) in outside:
-                continue
+            if id(p) in seen or id(p) in outside or getattr(p, "_ts_expert", False):
+                continue  # (stacked experts with moe_paging are copied in by trainstream.experts)
             seen.add(id(p))
             ps.append(p)
         out[i] = ps
@@ -88,8 +89,10 @@ def pageable_params(model: nn.Module, blocks: Sequence[nn.Module], indices: Iter
 class ParamPager:
     def __init__(self, model: nn.Module, blocks: Sequence[nn.Module], optimizer, paged: Iterable[int] = (), *,
                  candidates: Optional[Dict[int, List[nn.Parameter]]] = None,
-                 frozen_init: Optional[Dict[int, torch.Tensor]] = None, prefetch_depth: int = 1):
+                 frozen_init: Optional[Dict[int, torch.Tensor]] = None, prefetch_depth: int = 1, disk=None):
         self.model = model
+        self.disk = disk  # trainstream.disk.DiskStore: where frozen weights over the pin budget go, if set
+        self.frozen_disk_bytes = 0
         self.blocks = list(blocks)
         self.n = len(self.blocks)
         self.opt = optimizer
@@ -277,9 +280,17 @@ class ParamPager:
                 self.frozen_pinned_bytes += nbytes
                 host._ts_pinned = True
             else:
-                host = src.reshape(-1) if src is not None else p.detach().reshape(-1).cpu()
-                self.frozen_pageable_bytes += nbytes
+                base = src if src is not None else p.detach()
+                if self.disk is not None and not is_on_disk(base):
+                    host = self.disk.store(base)  # a file, mapped: RAM only while the page cache keeps it
+                else:
+                    host = base.reshape(-1) if base.device.type == "cpu" else base.reshape(-1).cpu()
+                if is_on_disk(host):
+                    self.frozen_disk_bytes += nbytes
+                else:
+                    self.frozen_pageable_bytes += nbytes
                 host._ts_pinned = False
+                del base
             del src
             self._host_frozen[id(p)] = host
         self.paged.add(i)
@@ -317,6 +328,8 @@ class ParamPager:
                 continue  # the shared copy stays for the other ranks
             if getattr(host, "_ts_pinned", False):
                 self.frozen_pinned_bytes -= nbytes
+            elif is_on_disk(host):
+                self.frozen_disk_bytes -= nbytes
             else:
                 self.frozen_pageable_bytes -= nbytes
             del host
@@ -572,7 +585,8 @@ class ParamPager:
                     continue  # not in this state dict: unchanged (release() drops the expansion)
                 qw = self._quant.get(id(p))
                 if qw is not None:  # re-quantize the loaded values
-                    new = make_quantized(p.detach(), qw.kind, qw.block_size, pin=qw.pinned)
+                    new = make_quantized(p.detach(), qw.kind, qw.block_size, pin=qw.pinned,
+                                         double_quant=qw.host_absmax.dtype == torch.uint8)
                     if qw.dev_q is not None:
                         new.to_device(self.device)
                     new.native = getattr(qw, "native", False)

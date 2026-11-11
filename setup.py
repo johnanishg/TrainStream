@@ -58,6 +58,8 @@ if torch is not None:
             "trainstream/csrc/offload_adamw_kernel.cu",
             "trainstream/csrc/quant.cpp",
             "trainstream/csrc/quant_kernel.cu",
+            "trainstream/csrc/fused.cpp",
+            "trainstream/csrc/fused_kernel.cu",
             "trainstream/csrc/shm.cpp",
             "trainstream/csrc/peer.cpp",
         ],
@@ -71,7 +73,7 @@ with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="trainstream",
-    version="0.6.0",
+    version="0.7.0",
     author="John Anish G",
     license="Apache-2.0",
     description="Zero-dependency PyTorch training offload: optimizer, gradients, activations and weights to host RAM, with a memory planner and built-in int8/NF4/FP8/NVFP4 quantization.",

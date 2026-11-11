@@ -88,6 +88,37 @@ def _quantize_split(x2: torch.Tensor, k: int):
     return q, s, g, idx
 
 
+class _InputCache:
+    """The last activation quantized, so the Linears that read the same tensor (q / k / v,
+    gate / up) quantize it once. Holding the tensor keeps its memory from being reused, so
+    identity plus its version counter (bumped by in-place writes) identify it exactly.
+    Emptied at the first backward, so nothing outlives the forward pass."""
+
+    def __init__(self):
+        self.x = None
+        self.version = -1
+        self.key = None
+        self.value = None
+        self.hits = 0
+
+    def get(self, x, kind, k):
+        if self.x is x and self.version == x._version and self.key == (kind, k):
+            self.hits += 1
+            return self.value
+        return None
+
+    def put(self, x, kind, k, value):
+        self.x, self.version, self.key, self.value = x, x._version, (kind, k), value
+        return value
+
+    def clear(self):
+        self.x = self.key = self.value = None
+        self.version = -1
+
+
+_CACHE = _InputCache()
+
+
 def native_supported(kind: str, device) -> bool:
     """Whether this GPU (and this PyTorch) multiplies `kind` on tensor cores."""
     dev = torch.device(device)
@@ -143,10 +174,13 @@ class QuantLinearFn(torch.autograd.Function):
             x2 = x2.float()
         wq, ws = packed_on_device(qw, x.device)
         k = outlier_count(qw.outliers, K) if qw.kind == "nvfp4" else 0
-        if k:
-            xq, xs, xg, idx = _quantize_split(x2.contiguous(), k)
+        hit = _CACHE.get(x, qw.kind, k)
+        if hit is not None:
+            xq, xs, xg, idx = hit
+        elif k:
+            xq, xs, xg, idx = _CACHE.put(x, qw.kind, k, _quantize_split(x2.contiguous(), k))
         else:
-            xq, xs, xg = _quantize(x2, qw.kind)
+            xq, xs, xg, idx = _CACHE.put(x, qw.kind, k, _quantize(x2, qw.kind) + (None,))
         one = None
         if qw.kind == "nvfp4":
             wg = qw.global_tensor(x.device)
@@ -167,6 +201,7 @@ class QuantLinearFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gy):
+        _CACHE.clear()
         qw = ctx.qw
         N = qw.shape[0]
         K = qw.numel // N
@@ -180,7 +215,15 @@ class QuantLinearFn(torch.autograd.Function):
             dt = g2.dtype if g2.dtype in _FLOAT_DTYPES else torch.float32
             w = torch.empty(N, K, dtype=dt, device=gy.device)
             _C.dequantize_blockscaled(w, wq, ws, qw.kind, qw.global_decode)
-        gx = (g2.to(dt) @ w).view(*gy.shape[:-1], K).to(ctx.x_dtype)
+        if qw.kind == "nvfp4" and qw.fp4_backward and N % 32 == 0 and K % 16 == 0 and g2.shape[0] > 0:
+            # the input gradient on tensor cores too: g [M, N] against W^T [K, N], both nvfp4 with
+            # their 16-value blocks along N, the reduced dimension (round to nearest; NVIDIA's recipe
+            # also rounds gradients stochastically)
+            wq, ws, wg = _quantize(w.t().contiguous(), "nvfp4")
+            gq, gs, gg = _quantize(g2.to(dt).contiguous(), "nvfp4")
+            gx = _mm("nvfp4", gq, gs, gg, wq, ws, wg, dt).view(*gy.shape[:-1], K).to(ctx.x_dtype)
+        else:
+            gx = (g2.to(dt) @ w).view(*gy.shape[:-1], K).to(ctx.x_dtype)
         del w
         gb = g2.sum(0) if ctx.has_bias_grad else None
         return gx, None, gb, None
@@ -193,10 +236,11 @@ def _forward(self, x):
     return QuantLinearFn.apply(x, qw, self.bias, self.weight)
 
 
-def install(blocks, device, outliers: float = 0.0) -> List[nn.Module]:
+def install(blocks, device, outliers: float = 0.0, fp4_backward: bool = False) -> List[nn.Module]:
     """Route the frozen block-scaled Linears of `blocks` through tensor-core
     matmuls where this GPU supports them; nvfp4 ones keep the `outliers`
-    fraction of input channels in bf16. Returns the patched modules."""
+    fraction of input channels in bf16, and with fp4_backward compute the input
+    gradient in nvfp4 too. Returns the patched modules."""
     patched = []
     for b in blocks:
         for m in b.modules():
@@ -207,12 +251,14 @@ def install(blocks, device, outliers: float = 0.0) -> List[nn.Module]:
                 continue
             qw.native = True
             qw.outliers = float(outliers) if qw.kind == "nvfp4" else 0.0
+            qw.fp4_backward = bool(fp4_backward) and qw.kind == "nvfp4"
             m.forward = types.MethodType(_forward, m)
             patched.append(m)
     return patched
 
 
 def uninstall(modules) -> None:
+    _CACHE.clear()
     for m in modules:
         qw = quantized_of(m.weight)
         if qw is not None:

@@ -50,6 +50,9 @@ enum class QKind : int { kNF4 = 0, kInt8 = 1, kNVFP4 = 2, kMXFP8 = 3 };
 // out[0..n) = dequantized values; one fp32 absmax per `block` values (block even).
 cudaError_t dequantize(QKind kind, DType out_dtype, const void* q, const float* absmax, void* out, int64_t n,
                        int block, int sm_count, cudaStream_t stream);
+// The same with double-quantized scales: block i's absmax = group_scale[i / 256] * 2^(-codes[i] / 32).
+cudaError_t dequantize_dq(QKind kind, DType out_dtype, const void* q, const uint8_t* codes, const float* group_scale,
+                          void* out, int64_t n, int block, int sm_count, cudaStream_t stream);
 
 // Block-scaled formats that Blackwell tensor cores multiply directly, for a
 // row-major [rows, cols] matrix with cols % 32 == 0:
@@ -78,6 +81,27 @@ cudaError_t dequantize_nvfp4_cols(DType out_dtype, const uint8_t* q, const uint8
 cudaError_t dequantize_blockscaled(QKind kind, DType out_dtype, const uint8_t* q, const uint8_t* scales,
                                    float global_decode, void* out, int64_t rows, int64_t cols, int sm_count,
                                    cudaStream_t stream);
+
+// Fused transformer-block elementwise ops (fused_kernel.cu), on `stream`.
+// rms_norm: x, y [rows, cols] contiguous; rstd [rows] fp32 out; gemma: y = (x * rstd) * (1 + w)
+// instead of w * (x * rstd). Backward: dw, when not null, is fp32 [rms_norm_backward_grid(), cols]:
+// one partial sum per block, for the caller to sum over its first dimension.
+cudaError_t rms_norm_forward(DType x_dtype, DType w_dtype, const void* x, const void* w, void* y, float* rstd,
+                             int64_t rows, int64_t cols, float eps, bool gemma, int sm_count, cudaStream_t stream);
+int rms_norm_backward_grid(int64_t rows, bool dw, int sm_count);
+cudaError_t rms_norm_backward(DType x_dtype, DType w_dtype, const void* dy, const void* x, const void* w,
+                              const float* rstd, void* dx, float* dw, int64_t rows, int64_t cols, bool gemma,
+                              int sm_count, cudaStream_t stream);
+// Rotary embedding (rotate-half convention) of x [B, H, T, D] into y; xs / ys are the
+// B, H, T strides (the D stride is 1), cos / sin [B or 1, T, D] with strides cb, ct.
+cudaError_t rope(DType dtype, const void* x, void* y, const void* cos_, const void* sin_, int64_t B, int64_t H,
+                 int64_t T, int64_t D, const int64_t* xs, const int64_t* ys, int64_t cb, int64_t ct, bool backward,
+                 int sm_count, cudaStream_t stream);
+// h = act(g) * u over n contiguous values; act 0 silu, 1 gelu (tanh approximation).
+cudaError_t gated_act_forward(DType dtype, const void* g, const void* u, void* h, int64_t n, int act, int sm_count,
+                              cudaStream_t stream);
+cudaError_t gated_act_backward(DType dtype, const void* dh, const void* g, const void* u, void* dg, void* du, int64_t n,
+                               int act, int sm_count, cudaStream_t stream);
 
 // out[0] += sum(grad[i]^2). Used for global gradient-norm clipping on the GPU path.
 cudaError_t grad_sq_norm_accumulate(DType dtype, const void* grad, int64_t n, float* out,

@@ -206,5 +206,5 @@ def explain_ram_shortfall(need: int, have: int, budget: Budget, *, trainable: in
             f"{have / GiB:.1f} GiB is available ({budget.describe()}). "
             f"Trained parameters cost 8-16 bytes each in host RAM ({trainable / 1e9:.2f}B here) and paged frozen "
             f"weights 2-4 bytes ({frozen / 1e9:.2f}B here). Options: close other programs, train fewer parameters "
-            f"(LoRA), use moment_dtype='bfloat16', a smaller model or a machine with more RAM. "
+            f"(LoRA), use moment_dtype='bfloat16' or 'int8', a smaller model or a machine with more RAM. "
             f"Pass check_memory=False to try anyway.")

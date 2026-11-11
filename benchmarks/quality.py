@@ -6,7 +6,8 @@
 
 For every format the base is loaded with trainstream's load_model (quantized
 while read), given zero-initialised LoRA adapters (so the model is exactly the
-quantized base) and wrapped. Then:
+quantized base; the LoftQ formats start them at the quantization error instead)
+and wrapped. Then:
 
   1. perplexity of the base on held-out text, and
   2. eval loss after a short LoRA fine-tune (same data, seed and steps for
@@ -34,11 +35,18 @@ import sys
 import sysconfig
 import time
 
-FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4", "nvfp4-w", "nvfp4-o"]
+FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4", "nvfp4-w", "nvfp4-o", "nf4-k", "nf4-l", "nvfp4-l", "nf4-dq", "nvfp4-b"]
 # variants of a stored format: nvfp4-w multiplies expanded weights (no activation
 # quantization: what 4-bit weights alone cost), nvfp4-o keeps 1% of the input
-# channels in bf16 on the tensor-core path (wrap(outliers=0.01))
-VARIANTS = {"nvfp4-w": ("nvfp4", {"weights_only": True}), "nvfp4-o": ("nvfp4", {"outliers": 0.01})}
+# channels in bf16 on the tensor-core path (wrap(outliers=0.01)); nf4-k keeps the
+# matrices NF4 hurts most as int8 (keep_precise="auto"); nf4-l / nvfp4-l start the
+# LoRA adapters at the weights' quantization error (LoftQ: error_rank=16, the LoRA
+# rank); nf4-dq stores NF4's block scales in one byte each (double_quant); nvfp4-b computes
+# the input gradients in nvfp4 too (nvfp4_backward)
+VARIANTS = {"nvfp4-w": ("nvfp4", {"weights_only": True}), "nvfp4-o": ("nvfp4", {"outliers": 0.01}),
+            "nf4-k": ("nf4", {"keep_precise": "auto"}), "nf4-l": ("nf4", {"error_rank": 16}),
+            "nvfp4-l": ("nvfp4", {"error_rank": 16}), "nf4-dq": ("nf4", {"double_quant": True}),
+            "nvfp4-b": ("nvfp4", {"nvfp4_backward": True})}
 SETTLE = 1  # steps after TrainStream's last change left out of the step time, as in compare.py
 
 
@@ -107,13 +115,15 @@ def _worker(args):
                gpu=torch.cuda.get_device_name(), trainstream=trainstream.__version__)
     live(args, "phase", phase="loading", env=env)
     t0 = time.time()
-    model = load_model(args.model, quantize=kind)
+    model = load_model(args.model, quantize=kind, keep_precise=extra.get("keep_precise", 0),
+                       error_rank=extra.get("error_rank", 0), double_quant=extra.get("double_quant", False))
     model = peft.get_peft_model(model, peft.LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.0, task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))
     params = [p for p in model.parameters() if p.requires_grad]
     model, opt = trainstream.wrap(model, torch.optim.AdamW(params, lr=args.lr), device="cuda",
-                                  quantize=kind if kind != "none" else "none", outliers=extra.get("outliers", 0.0))
+                                  quantize=kind if kind != "none" else "none", outliers=extra.get("outliers", 0.0),
+                                  nvfp4_backward=extra.get("nvfp4_backward", False))
     load_s = time.time() - t0
     session = unwrap_session(model)
 

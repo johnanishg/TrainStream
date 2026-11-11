@@ -110,7 +110,9 @@ class OffloadAdamW {
   // gradient arrives and returned once the host has consumed it. Beyond this
   // many bytes in use, the next gradient waits for one to come back.
   void set_max_staging_bytes(int64_t bytes);
-  std::string moment_dtype() const { return moment_dtype_ == at::kBFloat16 ? "bfloat16" : "float32"; }
+  std::string moment_dtype() const {
+    return moment_dtype_ == at::kBFloat16 ? "bfloat16" : moment_dtype_ == at::kByte ? "int8" : "float32";
+  }
 
  private:
   struct Slot {
@@ -118,7 +120,8 @@ class OffloadAdamW {
     at::Tensor param;  // flat alias of the user's parameter (shares storage)
     int64_t numel = 0;
     at::ScalarType pdtype = at::kFloat;
-    at::Tensor master, exp_avg, exp_avg_sq;  // master fp32; moments fp32 or bf16; host
+    at::Tensor master, exp_avg, exp_avg_sq;  // master fp32; moments fp32, bf16 or 8-bit codes; host
+    at::Tensor m_scale, v_scale;             // 8-bit moments: one fp32 absmax per kQBlock values
     float* d_master = nullptr;               // device aliases (gpu mode)
     void* d_m = nullptr;
     void* d_v = nullptr;

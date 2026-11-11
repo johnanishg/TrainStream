@@ -257,3 +257,39 @@ def test_frozen_weights_beyond_the_pin_budget_stay_pageable(monkeypatch):
         assert train(mine, opt, data) == pytest.approx(train(ref, opt_ref, data), abs=1e-4)
     finally:
         trainstream.unwrap(mine)
+
+
+def test_disk_tier_streams_frozen_weights_from_mapped_files(monkeypatch, tmp_path):
+    # over the page-lock budget, frozen weights go to memory-mapped files instead of RAM: same training
+    import gc
+    import os
+    import trainstream.paging as paging
+    from trainstream.disk import DiskStore, is_on_disk
+    monkeypatch.setattr(paging, "physical_ram_bytes", lambda: 1)  # pin budget ~0
+    torch.manual_seed(0)
+    cpu_model = TinyLM()
+    for b in cpu_model.blocks:
+        for p in b.parameters():
+            p.requires_grad_(False)
+    ref = copy.deepcopy(cpu_model).to(DEV)
+    trainable = lambda m: [p for p in m.parameters() if p.requires_grad]
+    opt_ref = torch.optim.AdamW(trainable(ref), foreach=False, **HP)
+    mine, opt = trainstream.wrap(cpu_model, torch.optim.AdamW(trainable(cpu_model), **HP), device=DEV,
+                                 offload=True, param_offload=True, activation_offload=False, disk_offload=str(tmp_path))
+    try:
+        params = trainstream.memory_report(mine)["params"]
+        assert params["frozen_disk_bytes"] > 0 and params["frozen_pageable_bytes"] == 0
+        session = trainstream.wrapper.unwrap_session(mine)
+        assert any(e.startswith("disk tier:") for e in session.events)
+        assert any(f.endswith(".bin") for _, _, fs in os.walk(tmp_path) for f in fs)
+        data = tokens(5)
+        assert train(mine, opt, data) == pytest.approx(train(ref, opt_ref, data), abs=1e-4)
+    finally:
+        trainstream.unwrap(mine)
+    store = DiskStore(str(tmp_path))
+    t = store.store(torch.arange(12.0))
+    assert is_on_disk(t.view(3, 4)) and torch.equal(t, torch.arange(12.0))
+    del t
+    gc.collect()
+    store.close()
+    assert not os.path.exists(store.dir)

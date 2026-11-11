@@ -54,6 +54,9 @@ class Event {
 };
 using EventPtr = std::shared_ptr<Event>;
 
+// 0 spin, 1 block, 2 poll (default); TRAINSTREAM_EVENT_WAIT, read once. See memory_pinner.cpp.
+int event_wait_mode();
+
 EventPtr make_event(int device, bool timing = false);
 EventPtr record_on_current(int device, bool timing = false);
 
@@ -187,6 +190,18 @@ std::tuple<EventPtr, std::vector<at::Tensor>> dequantize_blockscaled_async(const
                                                                            const std::string& kind,
                                                                            double global_decode,
                                                                            const EventPtr& after);
+
+// ---------------------------------------------------------------------------
+// Fused block ops (fused.cpp): on PyTorch's current stream, for trainstream/fused.py
+// ---------------------------------------------------------------------------
+std::tuple<at::Tensor, at::Tensor> rms_norm_forward(const at::Tensor& x, const at::Tensor& w, double eps, bool gemma);
+std::tuple<at::Tensor, c10::optional<at::Tensor>> rms_norm_backward(const at::Tensor& dy, const at::Tensor& x,
+                                                                    const at::Tensor& w, const at::Tensor& rstd,
+                                                                    bool gemma, bool need_dw);
+at::Tensor rope(const at::Tensor& x, const at::Tensor& cos, const at::Tensor& sin, bool backward);
+at::Tensor gated_act_forward(const at::Tensor& g, const at::Tensor& u, int64_t act);
+std::tuple<at::Tensor, at::Tensor> gated_act_backward(const at::Tensor& dh, const at::Tensor& g, const at::Tensor& u,
+                                                      int64_t act);
 
 // ---------------------------------------------------------------------------
 // Micro-benchmarks (CUDA-event timed)

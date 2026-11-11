@@ -17,6 +17,8 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <cmath>
+
 namespace trainstream {
 namespace kernels {
 namespace {
@@ -59,28 +61,44 @@ struct Out<__nv_bfloat16> {
 
 constexpr int kThreads = 256;
 
-template <typename T>
+// A block's fp32 absmax, read as absmax(i). Double-quantized (bitsandbytes' trick, here with
+// a log code so small scales keep their relative precision): one byte per block, c, and one
+// fp32 scale per kDQGroup blocks, g; absmax = g * 2^(-c / 32), the power from a fixed table
+// (kDQ) so the CUDA kernels and quant.py's reference give the same floats.
+constexpr int kDQGroup = 256;
+__constant__ float kDQ[256];
+
+struct PlainScale {
+  const float* __restrict__ a;
+  __device__ __forceinline__ float operator()(int64_t i) const { return a[i]; }
+};
+
+struct DQScale {
+  const uint8_t* __restrict__ c;
+  const float* __restrict__ g;
+  __device__ __forceinline__ float operator()(int64_t i) const { return g[i / kDQGroup] * kDQ[c[i]]; }
+};
+
+template <typename T, typename S>
 __global__ void __launch_bounds__(kThreads)
-    dequant_nf4_kernel(const uint8_t* __restrict__ q, const float* __restrict__ absmax, T* __restrict__ out,
-                       int64_t n, int block) {
+    dequant_nf4_kernel(const uint8_t* __restrict__ q, S absmax, T* __restrict__ out, int64_t n, int block) {
   const int64_t pairs = (n + 1) / 2;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * kThreads;
   for (int64_t k = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; k < pairs; k += stride) {
     const uint8_t b = q[k];
     const int64_t i = 2 * k;
-    const float s = absmax[i / block];  // block is even: both values share a scale
+    const float s = absmax(i / block);  // block is even: both values share a scale
     out[i] = Out<T>::cvt(kNF4[b >> 4] * s);
     if (i + 1 < n) out[i + 1] = Out<T>::cvt(kNF4[b & 15] * s);
   }
 }
 
-template <typename T>
+template <typename T, typename S>
 __global__ void __launch_bounds__(kThreads)
-    dequant_int8_kernel(const int8_t* __restrict__ q, const float* __restrict__ absmax, T* __restrict__ out,
-                        int64_t n, int block) {
+    dequant_int8_kernel(const int8_t* __restrict__ q, S absmax, T* __restrict__ out, int64_t n, int block) {
   const int64_t stride = static_cast<int64_t>(gridDim.x) * kThreads;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < n; i += stride) {
-    out[i] = Out<T>::cvt(static_cast<float>(q[i]) * (absmax[i / block] * (1.0f / 127.0f)));
+    out[i] = Out<T>::cvt(static_cast<float>(q[i]) * (absmax(i / block) * (1.0f / 127.0f)));
   }
 }
 
@@ -116,17 +134,17 @@ __device__ __forceinline__ uint32_t scale_of(uint32_t chunk, uint32_t per_block,
   return shift >= 0 ? chunk >> shift : chunk / per_block;
 }
 
-template <typename T>
+template <typename T, typename S>
 __global__ void __launch_bounds__(kThreads)
-    dequant_nf4_x8_kernel(const uint32_t* __restrict__ q, const float* __restrict__ absmax, T* __restrict__ out,
-                          uint32_t chunks, uint32_t per_block, int shift) {
+    dequant_nf4_x8_kernel(const uint32_t* __restrict__ q, S absmax, T* __restrict__ out, uint32_t chunks,
+                          uint32_t per_block, int shift) {
   __shared__ float lut[16];
   if (threadIdx.x < 16) lut[threadIdx.x] = kNF4[threadIdx.x];
   __syncthreads();
   const uint32_t stride = gridDim.x * kThreads;
   for (uint32_t k = blockIdx.x * kThreads + threadIdx.x; k < chunks; k += stride) {
     const uint32_t b = q[k];  // 4 bytes, 8 codes: in each byte the first value is the high nibble
-    const float s = absmax[scale_of(k, per_block, shift)];
+    const float s = absmax(scale_of(k, per_block, shift));
     float v[8];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -138,14 +156,14 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-template <typename T>
+template <typename T, typename S>
 __global__ void __launch_bounds__(kThreads)
-    dequant_int8_x8_kernel(const uint2* __restrict__ q, const float* __restrict__ absmax, T* __restrict__ out,
-                           uint32_t chunks, uint32_t per_block, int shift) {
+    dequant_int8_x8_kernel(const uint2* __restrict__ q, S absmax, T* __restrict__ out, uint32_t chunks,
+                           uint32_t per_block, int shift) {
   const uint32_t stride = gridDim.x * kThreads;
   for (uint32_t k = blockIdx.x * kThreads + threadIdx.x; k < chunks; k += stride) {
     const uint2 b = q[k];  // 8 codes
-    const float s = absmax[scale_of(k, per_block, shift)] * (1.0f / 127.0f);
+    const float s = absmax(scale_of(k, per_block, shift)) * (1.0f / 127.0f);
     float v[8];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -166,8 +184,8 @@ inline int grid_for(int64_t work, int sm_count) {
 
 inline bool aligned(const void* p, uintptr_t bytes) { return reinterpret_cast<uintptr_t>(p) % bytes == 0; }
 
-template <typename T>
-cudaError_t launch(QKind kind, const void* q, const float* absmax, void* out, int64_t n, int block, int sm_count,
+template <typename T, typename S>
+cudaError_t launch(QKind kind, const void* q, S absmax, void* out, int64_t n, int block, int sm_count,
                    cudaStream_t stream) {
   if (n == 0) return cudaSuccess;
   const bool nf4 = kind == QKind::kNF4;
@@ -179,19 +197,19 @@ cudaError_t launch(QKind kind, const void* q, const float* absmax, void* out, in
       while ((1u << shift) < per_block) ++shift;
     }
     if (nf4) {
-      dequant_nf4_x8_kernel<T><<<grid_for(chunks, sm_count), kThreads, 0, stream>>>(
+      dequant_nf4_x8_kernel<T, S><<<grid_for(chunks, sm_count), kThreads, 0, stream>>>(
           static_cast<const uint32_t*>(q), absmax, static_cast<T*>(out), chunks, per_block, shift);
     } else {
-      dequant_int8_x8_kernel<T><<<grid_for(chunks, sm_count), kThreads, 0, stream>>>(
+      dequant_int8_x8_kernel<T, S><<<grid_for(chunks, sm_count), kThreads, 0, stream>>>(
           static_cast<const uint2*>(q), absmax, static_cast<T*>(out), chunks, per_block, shift);
     }
     return cudaGetLastError();
   }
   if (nf4) {
-    dequant_nf4_kernel<T><<<grid_for((n + 1) / 2, sm_count), kThreads, 0, stream>>>(
+    dequant_nf4_kernel<T, S><<<grid_for((n + 1) / 2, sm_count), kThreads, 0, stream>>>(
         static_cast<const uint8_t*>(q), absmax, static_cast<T*>(out), n, block);
   } else {
-    dequant_int8_kernel<T><<<grid_for(n, sm_count), kThreads, 0, stream>>>(
+    dequant_int8_kernel<T, S><<<grid_for(n, sm_count), kThreads, 0, stream>>>(
         static_cast<const int8_t*>(q), absmax, static_cast<T*>(out), n, block);
   }
   return cudaGetLastError();
@@ -522,17 +540,42 @@ cudaError_t dequantize_blockscaled(QKind kind, DType out_dtype, const uint8_t* q
   return cudaErrorInvalidValue;
 }
 
-cudaError_t dequantize(QKind kind, DType out_dtype, const void* q, const float* absmax, void* out, int64_t n,
-                       int block, int sm_count, cudaStream_t stream) {
+namespace {
+template <typename S>
+cudaError_t dequantize_with(QKind kind, DType out_dtype, const void* q, S absmax, void* out, int64_t n, int block,
+                            int sm_count, cudaStream_t stream) {
   switch (out_dtype) {
     case DType::kFloat32:
-      return launch<float>(kind, q, absmax, out, n, block, sm_count, stream);
+      return launch<float, S>(kind, q, absmax, out, n, block, sm_count, stream);
     case DType::kFloat16:
-      return launch<__half>(kind, q, absmax, out, n, block, sm_count, stream);
+      return launch<__half, S>(kind, q, absmax, out, n, block, sm_count, stream);
     case DType::kBFloat16:
-      return launch<__nv_bfloat16>(kind, q, absmax, out, n, block, sm_count, stream);
+      return launch<__nv_bfloat16, S>(kind, q, absmax, out, n, block, sm_count, stream);
   }
   return cudaErrorInvalidValue;
+}
+}  // namespace
+
+cudaError_t dequantize(QKind kind, DType out_dtype, const void* q, const float* absmax, void* out, int64_t n,
+                       int block, int sm_count, cudaStream_t stream) {
+  return dequantize_with(kind, out_dtype, q, PlainScale{absmax}, out, n, block, sm_count, stream);
+}
+
+cudaError_t dequantize_dq(QKind kind, DType out_dtype, const void* q, const uint8_t* codes, const float* group_scale,
+                          void* out, int64_t n, int block, int sm_count, cudaStream_t stream) {
+  static bool table[64] = {};  // per GPU: 2^(-c / 32), rounded from double as quant.py does
+  int dev = 0;
+  cudaError_t e = cudaGetDevice(&dev);
+  if (e != cudaSuccess) return e;
+  if (dev < 0 || dev >= 64) return cudaErrorInvalidDevice;
+  if (!table[dev]) {
+    float t[256];
+    for (int c = 0; c < 256; ++c) t[c] = static_cast<float>(std::exp2(-static_cast<double>(c) / 32.0));
+    e = cudaMemcpyToSymbol(kDQ, t, sizeof(t));
+    if (e != cudaSuccess) return e;
+    table[dev] = true;
+  }
+  return dequantize_with(kind, out_dtype, q, DQScale{codes, group_scale}, out, n, block, sm_count, stream);
 }
 
 }  // namespace kernels

@@ -7,8 +7,10 @@ With ``attention="auto"`` TrainStream times the available backends once, on
 the model's own head shape and sequence length (taken from the first training
 forward), and runs every later forward with the winner first in the priority
 order; the other backends stay behind it, so inputs the winner cannot take (an
-unusual mask, fp32) still run. The backward kernel follows from the forward
-one. Recomputed blocks (activation recomputation) use the same order, so the
+unusual mask, fp32) still run. A forward given an attention mask or position
+ids (padding, packed documents) keeps PyTorch's own order instead: the timing
+was without a mask, and cuDNN's backward rejects the expanded masks
+transformers builds. The backward kernel follows from the forward one. Recomputed blocks (activation recomputation) use the same order, so the
 recomputed forward matches the original.
 
 Under ``torch.use_deterministic_algorithms(True)`` nondeterministic kernels
@@ -99,6 +101,13 @@ def time_backends(batch: int, heads: int, seq: int, head_dim: int, dtype, device
     return out
 
 
+def _masked(args, kwargs) -> bool:
+    """Whether a model call may attend through a mask: an attention_mask or position_ids passed."""
+    if kwargs.get("attention_mask") is not None or kwargs.get("position_ids") is not None:
+        return True
+    return len(args) > 1 and isinstance(args[1], torch.Tensor)  # forward(input_ids, attention_mask, ...)
+
+
 def _head_shape(model: nn.Module) -> Optional[Tuple[int, int]]:
     cfg = getattr(model, "config", None)
     heads = getattr(cfg, "num_attention_heads", None) if cfg is not None else None
@@ -131,6 +140,7 @@ class AttentionSelector:
         self.events: List[str] = []
         self._ctx = None
         self._depth = 0
+        self._masked_noted = False
         self._handles = [model.register_forward_pre_hook(self._pre, with_kwargs=True),
                          model.register_forward_hook(self._post, always_call=True)]
         if self.choice is not None:
@@ -171,6 +181,17 @@ class AttentionSelector:
             return None
         if self.choice is None and torch.is_grad_enabled():
             self._decide(args, kwargs)
+        if self.choice is not None and _masked(args, kwargs):
+            # The timing used causal attention without a mask. With one (padding, packed documents),
+            # cuDNN's backward rejects the expanded masks transformers builds: keep PyTorch's own
+            # order (the memory-efficient kernel), for recomputed blocks too.
+            for b in self.blocks:
+                b._ts_sdpa_order = None
+            if not self._masked_noted:
+                self._masked_noted = True
+                self.events.append("attention: inputs with an attention mask or position ids (padding, packed "
+                                   "documents) keep PyTorch's default backend order")
+            return None
         if self.choice is not None:
             # read again every forward (deterministic mode may have changed), for the blocks too
             self._ctx = sdpa_kernel(self._apply(), set_priority=True)

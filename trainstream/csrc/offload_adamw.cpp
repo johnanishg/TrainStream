@@ -161,6 +161,174 @@ void adamw_dispatch(float* p, const at::Tensor& m, const at::Tensor& v, const at
     adamw_dispatch_m(p, m.data_ptr<float>(), v.data_ptr<float>(), grad, pdtype, param_stage, b, e, hp, seed);
 }
 
+// 8-bit moments ("int8"): per block of kQBlock values an fp32 absmax, and one byte per value,
+// a small float relative to it written with stochastic rounding (unbiased, so the tiny per-step
+// changes of exp_avg_sq accumulate instead of rounding away). exp_avg_sq is stored as its square
+// root u (its range is that of the gradients, not of their squares), and a positive u never
+// rounds to zero (that would divide m by eps alone):
+//   u (>= 0)   4-bit exponent f, 4-bit mantissa q: u / absmax = (1 + q/16) 2^(f - 15), f = 0 zero
+//   m (signed) sign bit, 3-bit exponent f, 4-bit mantissa q: |m| / absmax = (1 + q/16) 2^(f - 7),
+//              rounded to nearest
+// 15 octaves below the block's largest u, 7 below its largest |m| (smaller m round
+// stochastically to 0 or the smallest step). The 2 bytes per parameter replace 8 (fp32) or 4 (bf16).
+constexpr int64_t kQBlock = 256;
+
+// exp_bits-bit exponent field f (0: zero; bias 2^exp_bits - 1, so 2^exp_bits - 1 octaves below
+// absmax) and mant_bits-bit mantissa q: value = absmax (1 + q / 2^mant_bits) 2^(f - bias)
+inline float q8_decode(uint8_t c, int mant_bits, float absmax, int exp_bits = 4) {
+  const uint32_t bias = (1u << exp_bits) - 1u;
+  const uint32_t f = (c >> mant_bits) & bias;
+  if (f == 0) return 0.0f;
+  const uint32_t q = c & ((1u << mant_bits) - 1u);
+  const uint32_t bits = ((f - bias + 127u) << 23) | (q << (23 - mant_bits));
+  float y;
+  std::memcpy(&y, &bits, sizeof(y));
+  return y * absmax;
+}
+
+// y = |x| / absmax in [0, 1]; r: random bits for the stochastic rounding; keep: a positive y
+// below the smallest step rounds up to it instead of (stochastically) to zero
+inline uint8_t q8_encode(float y, int mant_bits, uint32_t r, bool keep = false, int exp_bits = 4) {
+  const int bias = (1 << exp_bits) - 1;
+  const float kMin = std::ldexp(1.0f, 1 - bias);  // f = 1, q = 0
+  if (!(y > 0.0f)) return 0;
+  if (y < kMin)
+    return keep || (static_cast<float>(r >> 8) * (1.0f / 16777216.0f)) < y / kMin ? (1u << mant_bits) : 0;
+  uint32_t bits;
+  std::memcpy(&bits, &y, sizeof(bits));
+  const int cut = 23 - mant_bits;
+  bits += r & ((1u << cut) - 1u);  // carries into the exponent when the mantissa overflows
+  int f = static_cast<int>((bits >> 23) & 0xffu) - 127 + bias;
+  if (f > bias) return static_cast<uint8_t>((static_cast<uint32_t>(bias) << mant_bits) | ((1u << mant_bits) - 1u));
+  const uint32_t q = (bits >> cut) & ((1u << mant_bits) - 1u);
+  return static_cast<uint8_t>((static_cast<uint32_t>(f) << mant_bits) | q);
+}
+
+inline float m8_decode(uint8_t c, float absmax) {
+  const float y = q8_decode(c & 0x7fu, 4, absmax, 3);
+  return (c & 0x80u) ? -y : y;
+}
+
+// m rounds to nearest: unlike v it moves by large steps, and stochastic rounding's extra noise would
+// go straight into the update
+inline uint8_t m8_encode(float x, float absmax, uint32_t) {
+  constexpr uint32_t kHalf = (1u << (23 - 4 - 1)) | 0x80000000u;  // half a step; >> 8 gives 1/2 for tiny values
+  const uint8_t c = q8_encode(absmax > 0.0f ? std::fabs(x) / absmax : 0.0f, 4, kHalf, false, 3);
+  return x < 0.0f ? static_cast<uint8_t>(c | 0x80u) : c;
+}
+
+// Host AdamW over [b, e) with 8-bit moments; b is a multiple of kQBlock. The same arithmetic as
+// adamw_host on the decoded moments; each block is re-encoded against its new absmax.
+template <typename G, typename P, bool kStage>
+void adamw_host8(float* __restrict p, uint8_t* __restrict m, uint8_t* __restrict v, float* __restrict ms,
+                 float* __restrict vs, const G* __restrict g, P* __restrict stage, int64_t b, int64_t e,
+                 const HostHp& hp, uint32_t seed) {
+  const float decay = 1.0f - hp.lr * hp.weight_decay;
+  const float omb1 = 1.0f - hp.beta1;
+  const float omb2 = 1.0f - hp.beta2;
+  float mb[kQBlock], vb[kQBlock];
+  for (int64_t a = b; a < e; a += kQBlock) {
+    const int64_t z = std::min(e, a + kQBlock), k = a / kQBlock;
+    const float m_old = ms[k], v_old = vs[k];
+    float m_max = 0.0f, v_max = 0.0f;
+    for (int64_t i = a; i < z; ++i) {
+      const float gi = static_cast<float>(g[i]) * hp.clip;
+      const float m0 = m8_decode(m[i], m_old);
+      const float mi = m0 + omb1 * (gi - m0);
+      const float u0 = q8_decode(v[i], 4, v_old);
+      const float vi = hp.beta2 * (u0 * u0) + omb2 * gi * gi;
+      const float ui = std::sqrt(vi);
+      const float denom = ui / hp.bc2_sqrt + hp.eps;
+      const float pi = p[i] * decay - hp.step_size * (mi / denom);
+      mb[i - a] = mi;
+      vb[i - a] = ui;
+      m_max = std::max(m_max, std::fabs(mi));
+      v_max = std::max(v_max, ui);
+      p[i] = pi;
+      if constexpr (kStage) stage[i] = static_cast<P>(pi);
+    }
+    ms[k] = m_max;
+    vs[k] = v_max;
+    for (int64_t i = a; i < z; ++i) {
+      const uint32_t r = mix32(static_cast<uint32_t>(i) * 0x9e3779b1u ^ seed);
+      m[i] = m8_encode(mb[i - a], m_max, r);
+      v[i] = q8_encode(v_max > 0.0f ? vb[i - a] / v_max : 0.0f, 4, mix32(r ^ 0x85ebca6bu), true);
+    }
+  }
+}
+
+template <typename G>
+void adamw8_dispatch_param(float* p, uint8_t* m, uint8_t* v, float* ms, float* vs, const G* g, at::ScalarType pdtype,
+                           const at::Tensor& param_stage, int64_t b, int64_t e, const HostHp& hp, uint32_t seed) {
+  switch (pdtype) {
+    case at::kFloat:
+      adamw_host8<G, float, false>(p, m, v, ms, vs, g, nullptr, b, e, hp, seed);
+      break;
+    case at::kHalf:
+      adamw_host8<G, at::Half, true>(p, m, v, ms, vs, g, param_stage.data_ptr<at::Half>(), b, e, hp, seed);
+      break;
+    case at::kBFloat16:
+      adamw_host8<G, at::BFloat16, true>(p, m, v, ms, vs, g, param_stage.data_ptr<at::BFloat16>(), b, e, hp, seed);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported parameter dtype");
+  }
+}
+
+void adamw8_dispatch(float* p, const at::Tensor& m, const at::Tensor& v, const at::Tensor& ms, const at::Tensor& vs,
+                     const at::Tensor& grad, at::ScalarType pdtype, const at::Tensor& param_stage, int64_t b,
+                     int64_t e, const HostHp& hp, uint32_t seed) {
+  uint8_t* mp = m.data_ptr<uint8_t>();
+  uint8_t* vp = v.data_ptr<uint8_t>();
+  float* msp = ms.data_ptr<float>();
+  float* vsp = vs.data_ptr<float>();
+  switch (grad.scalar_type()) {
+    case at::kFloat:
+      adamw8_dispatch_param(p, mp, vp, msp, vsp, grad.data_ptr<float>(), pdtype, param_stage, b, e, hp, seed);
+      break;
+    case at::kHalf:
+      adamw8_dispatch_param(p, mp, vp, msp, vsp, grad.data_ptr<at::Half>(), pdtype, param_stage, b, e, hp, seed);
+      break;
+    case at::kBFloat16:
+      adamw8_dispatch_param(p, mp, vp, msp, vsp, grad.data_ptr<at::BFloat16>(), pdtype, param_stage, b, e, hp, seed);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported gradient dtype");
+  }
+}
+
+// fp32 moments of a slot with 8-bit storage, and back (state_dict / load_state_dict)
+at::Tensor decode8(const at::Tensor& codes, const at::Tensor& scale, bool is_m) {
+  at::Tensor out = at::empty({codes.numel()}, at::TensorOptions().dtype(at::kFloat));
+  const uint8_t* c = codes.data_ptr<uint8_t>();
+  const float* s = scale.data_ptr<float>();
+  float* o = out.data_ptr<float>();
+  for (int64_t i = 0; i < codes.numel(); ++i) {
+    const float u = is_m ? 0.0f : q8_decode(c[i], 4, s[i / kQBlock]);
+    o[i] = is_m ? m8_decode(c[i], s[i / kQBlock]) : u * u;  // exp_avg_sq is stored as its square root
+  }
+  return out;
+}
+
+void encode8(const at::Tensor& values, at::Tensor& codes, at::Tensor& scale, bool is_m) {
+  const at::Tensor x = is_m ? values.reshape({-1}).to(at::kFloat).contiguous()
+                            : values.reshape({-1}).to(at::kFloat).clamp_min(0).sqrt().contiguous();
+  const float* xs = x.data_ptr<float>();
+  uint8_t* c = codes.data_ptr<uint8_t>();
+  float* s = scale.data_ptr<float>();
+  const int64_t n = x.numel();
+  for (int64_t a = 0, k = 0; a < n; a += kQBlock, ++k) {
+    const int64_t z = std::min(n, a + kQBlock);
+    float mx = 0.0f;
+    for (int64_t i = a; i < z; ++i) mx = std::max(mx, std::fabs(xs[i]));
+    s[k] = mx;
+    for (int64_t i = a; i < z; ++i) {
+      const uint32_t r = mix32(static_cast<uint32_t>(i) * 0x27d4eb2fu);
+      c[i] = is_m ? m8_encode(xs[i], mx, r) : q8_encode(mx > 0.0f ? xs[i] / mx : 0.0f, 4, r, true);
+    }
+  }
+}
+
 template <typename T>
 void accumulate_host(float* __restrict acc, const T* __restrict g, int64_t b, int64_t e, bool fresh) {
   if (fresh) {
@@ -229,12 +397,13 @@ void WorkerPool::submit(size_t worker, std::function<void()> fn) {
 // ===========================================================================
 OffloadAdamW::OffloadAdamW(int device, const std::string& mode, int threads, int64_t chunk_elems,
                            const std::string& moment_dtype)
-    : device_(resolve_device(device)), chunk_(std::max<int64_t>(chunk_elems, 4096)) {
+    : device_(resolve_device(device)), chunk_((std::max<int64_t>(chunk_elems, 4096) + kQBlock - 1) / kQBlock * kQBlock) {
   TORCH_CHECK(mode == "cpu" || mode == "gpu", "OffloadAdamW mode must be 'cpu' or 'gpu', got '", mode, "'");
-  TORCH_CHECK(moment_dtype == "float32" || moment_dtype == "bfloat16",
-              "OffloadAdamW moment_dtype must be 'float32' or 'bfloat16', got '", moment_dtype, "'");
+  TORCH_CHECK(moment_dtype == "float32" || moment_dtype == "bfloat16" || moment_dtype == "int8",
+              "OffloadAdamW moment_dtype must be 'float32', 'bfloat16' or 'int8', got '", moment_dtype, "'");
+  TORCH_CHECK(moment_dtype != "int8" || mode == "cpu", "8-bit moments (moment_dtype='int8') need cpu mode");
   gpu_mode_ = mode == "gpu";
-  moment_dtype_ = moment_dtype == "bfloat16" ? at::kBFloat16 : at::kFloat;
+  moment_dtype_ = moment_dtype == "bfloat16" ? at::kBFloat16 : moment_dtype == "int8" ? at::kByte : at::kFloat;
   runtime(device_);  // create streams eagerly
   if (threads <= 0) threads = std::max(1u, std::thread::hardware_concurrency() / 2);
   if (!gpu_mode_) pool_ = std::make_unique<WorkerPool>(threads, device_);
@@ -304,6 +473,12 @@ int64_t OffloadAdamW::add_param(const at::Tensor& param, bool pin_moments, const
     s->exp_avg = at::zeros(shape, at::TensorOptions().dtype(moment_dtype_));
     s->exp_avg_sq = at::zeros(shape, at::TensorOptions().dtype(moment_dtype_));
     pageable_state_bytes_ += s->exp_avg.nbytes() * 2;
+  }
+  if (moment_dtype_ == at::kByte) {  // cpu mode only: plain host memory
+    const int64_t nb = (s->numel + kQBlock - 1) / kQBlock;
+    s->m_scale = at::zeros({nb}, at::TensorOptions().dtype(at::kFloat));
+    s->v_scale = at::zeros({nb}, at::TensorOptions().dtype(at::kFloat));
+    pageable_state_bytes_ += nb * 8;
   }
   int64_t bytes = s->exp_avg.nbytes() * 2 + (s->master.defined() ? s->master.nbytes() : 0);
   if (s->master.defined()) pinned_state_bytes_ += s->master.nbytes();
@@ -526,8 +701,12 @@ void OffloadAdamW::enqueue_update(Slot& s, double lr, double beta1, double beta2
     if (prev_ready) prev_ready->synchronize();
     if (from_stage) from_stage->synchronize();  // gradient DMA landed in staging
     const auto t = std::chrono::steady_clock::now();
-    adamw_dispatch(sp->master.data_ptr<float>(), sp->exp_avg, sp->exp_avg_sq,
-                   from_stage ? sp->grad_stage : sp->grad_acc, sp->pdtype, sp->param_stage, b, e, hp, seed);
+    if (sp->m_scale.defined())
+      adamw8_dispatch(sp->master.data_ptr<float>(), sp->exp_avg, sp->exp_avg_sq, sp->m_scale, sp->v_scale,
+                      from_stage ? sp->grad_stage : sp->grad_acc, sp->pdtype, sp->param_stage, b, e, hp, seed);
+    else
+      adamw_dispatch(sp->master.data_ptr<float>(), sp->exp_avg, sp->exp_avg_sq,
+                     from_stage ? sp->grad_stage : sp->grad_acc, sp->pdtype, sp->param_stage, b, e, hp, seed);
     update_us_ += elapsed_us(t);
   });
 
@@ -741,6 +920,8 @@ double OffloadAdamW::last_grad_norm() {
 std::tuple<at::Tensor, at::Tensor, at::Tensor> OffloadAdamW::state(int64_t id) {
   Slot& s = slot(id);
   wait_idle(s);
+  if (s.m_scale.defined())  // 8-bit storage: handed out (and taken back) as fp32
+    return {s.master, decode8(s.exp_avg, s.m_scale, true), decode8(s.exp_avg_sq, s.v_scale, false)};
   return {s.master, s.exp_avg, s.exp_avg_sq};
 }
 
@@ -751,8 +932,13 @@ void OffloadAdamW::load_state(int64_t id, const at::Tensor& exp_avg, const at::T
   if (s.ready) s.ready->synchronize();
   TORCH_CHECK(exp_avg.numel() == s.numel && exp_avg_sq.numel() == s.numel,
               "load_state: moment shape mismatch for param ", id);
-  s.exp_avg.copy_(exp_avg.reshape({-1}));
-  s.exp_avg_sq.copy_(exp_avg_sq.reshape({-1}));
+  if (s.m_scale.defined()) {
+    encode8(exp_avg, s.exp_avg, s.m_scale, true);
+    encode8(exp_avg_sq, s.exp_avg_sq, s.v_scale, false);
+  } else {
+    s.exp_avg.copy_(exp_avg.reshape({-1}));
+    s.exp_avg_sq.copy_(exp_avg_sq.reshape({-1}));
+  }
   if (master.defined() && s.master.defined()) {
     TORCH_CHECK(master.numel() == s.numel, "load_state: master shape mismatch for param ", id);
     s.master.copy_(master.reshape({-1}));

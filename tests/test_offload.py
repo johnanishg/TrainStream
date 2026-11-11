@@ -330,3 +330,50 @@ def test_wrap_end_to_end_matches_baseline(mode):
     finally:
         trainstream.unwrap(mine)
     assert trainstream.wrapper.unwrap_session(mine) is None
+
+
+class MaskedSdpaBlock(nn.Module):
+    """Attention with a broadcast mask [batch, 1, T, T], as transformers passes it (SDPA expands it over the heads)."""
+
+    def __init__(self, d, heads=8):
+        super().__init__()
+        self.qkv = nn.Linear(d, 3 * d)
+        self.proj = nn.Linear(d, d)
+        self.h = heads
+
+    def forward(self, x):
+        b, t, d = x.shape
+        q, k, v = self.qkv(x).view(b, t, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
+        keep = torch.ones(t, t, dtype=torch.bool, device=x.device).tril()
+        keep[t // 2:, : t // 2] = False  # two documents packed in one row
+        mask = keep[None, None].expand(b, 1, t, t)  # [batch, 1, T, T], as transformers passes it
+        o = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        return x + self.proj(o.transpose(1, 2).reshape(b, t, d))
+
+
+def test_broadcast_masks_stay_in_vram_and_training_is_unchanged():
+    # Regression: an expanded mask paged to host came back with its broadcast dimension innermost,
+    # so the memory-efficient attention backward failed ("last dimension must be contiguous"), and
+    # it was materialized and counted once per head
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    def run(offload):
+        torch.manual_seed(0)
+        model = nn.Sequential(*[MaskedSdpaBlock(256) for _ in range(3)]).to(DEV)
+        off = ActivationOffloader(model, list(model), offload=offload, min_bytes=0)
+        x = torch.randn(2, 128, 256, device=DEV)
+        was = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast("cuda", dtype=torch.bfloat16):
+                model(x).float().square().mean().backward()
+        finally:
+            torch.use_deterministic_algorithms(was)
+            off.remove()
+        return [p.grad.clone() for p in model.parameters()], dict(off.stats)
+
+    ref, _ = run(0.0)
+    got, stats = run(1.0)
+    assert stats["packed_tensors"] > 0 and stats["resident_tensors"] > 0  # the masks stayed
+    for a, b in zip(ref, got):
+        assert torch.equal(a, b)

@@ -155,6 +155,21 @@ def _dense_like(t: torch.Tensor) -> torch.Tensor:
     return torch.empty_strided(t.size(), strides, dtype=t.dtype, device=t.device).copy_(t)
 
 
+def _broadcast(t: torch.Tensor) -> bool:
+    """A broadcast view (a size > 1 dimension with stride 0, e.g. an attention mask expanded over
+    the heads): its memory is a fraction of its shape."""
+    return any(st == 0 and n > 1 for st, n in zip(t.stride(), t.size()))
+
+
+def _real_bytes(t: torch.Tensor) -> int:
+    """Bytes a saved tensor's values take: a broadcast view counts once, not per repetition."""
+    n = t.element_size()
+    for st, sz in zip(t.stride(), t.size()):
+        if st != 0:
+            n *= sz
+    return n
+
+
 class _Packed:
     """A saved activation that now lives in pinned host memory."""
 
@@ -483,6 +498,7 @@ class ActivationOffloader:
             self._on_step_time((now - self._last_fwd) * 1e3)
         self._last_fwd = now
         self.stats["forwards"] += 1
+        self._guard_host_ram()
         self._session = _Session(self.n)
         if self.phase == "probe":
             self._probe_steps += 1
@@ -559,7 +575,7 @@ class ActivationOffloader:
             return t
         if not t.is_cuda or t.layout != torch.strided:
             return t
-        nbytes = t.numel() * t.element_size()
+        nbytes = _real_bytes(t)
         is_param = t.untyped_storage()._cdata in self._param_storages
 
         if self.calibrating:
@@ -571,7 +587,10 @@ class ActivationOffloader:
                     sizes[b] = sizes.get(b, 0) + nbytes
             return t
 
-        if b not in self.offload or is_param or nbytes < self.min_bytes:
+        # A broadcast view (transformers' attention masks are expanded over the heads) stays in VRAM,
+        # where it costs only its real storage: paging it would materialize every repetition, and
+        # the copy's stride order (broadcast dimensions innermost) breaks attention kernels' layout.
+        if b not in self.offload or is_param or nbytes < self.min_bytes or _broadcast(t):
             self.stats["resident_tensors"] += 1
             return _Resident(session, b, t)
 
@@ -812,13 +831,48 @@ class ActivationOffloader:
         _C.pinned_arena_trim()
 
     @staticmethod
+    def _ram_floor() -> int:
+        """Host RAM to leave available while activations are paged: page-locked
+        memory can't be reclaimed, and under WSL the Linux view of available RAM
+        doesn't see what Windows itself needs."""
+        from .optimizer import physical_ram_bytes
+        return max(4 << 30, int(0.10 * physical_ram_bytes()))
+
+    @staticmethod
     def _host_ram_blocks(blk: float) -> int:
         """How many blocks' activations host RAM can hold, page-locked, with
-        room left for everything else."""
+        room left for everything else: at most 60 % of the RAM available now,
+        never below the floor (_ram_floor), and after what the pinned staging
+        arena may still grow by (it fills as weights start streaming)."""
         from .planner import available_ram_bytes, local_processes
         if blk <= 0:
             return 1 << 30
-        return int(0.6 * (available_ram_bytes() // max(local_processes(), 1)) // blk)
+        avail = available_ram_bytes() // max(local_processes(), 1)
+        st = _C.pinned_stats()
+        growth = max(0, int(st.get("arena_cap", 0)) - int(st.get("arena_bytes", 0)))
+        room = min(0.6 * avail, avail - ActivationOffloader._ram_floor()) - growth
+        return max(0, int(room // blk))
+
+    def _guard_host_ram(self) -> None:
+        """At a step boundary: while activations are paged and host RAM available
+        has fallen below the floor, recompute half of the paged blocks instead
+        (the latest ones), and say so."""
+        from .planner import available_ram_bytes
+        if not self.offload or not self._recompute_auto or self._probe_block is None:
+            return
+        avail = available_ram_bytes()
+        floor = self._ram_floor()
+        if not avail or avail >= floor:
+            return
+        paged = sorted(self.offload)
+        moved = set(paged[len(paged) // 2:])
+        self.set_recompute(self.recompute | moved)
+        if hasattr(self, "_offload_all"):
+            self._offload_all -= moved
+        self._release_trial_memory()
+        self.events.append(f"activations: host RAM available fell to {avail / 2**30:.1f} GiB, under the "
+                           f"{floor / 2**30:.1f} GiB floor; {len(moved)} more blocks recomputed instead of paged "
+                           f"({len(self.offload)} still paged)")
 
     def keep_resident(self, k: int) -> List[int]:
         """Keep the activations of up to k blocks that "auto" pages or

@@ -214,13 +214,14 @@ def test_paging_requires_cpu_mode():
         trainstream.wrap(model, optimizer_mode="gpu", param_offload=True)
 
 
-def test_pooled_gradient_staging_under_a_tiny_cap():
+@pytest.mark.parametrize("nan_guard", [True, False])
+def test_pooled_gradient_staging_under_a_tiny_cap(nan_guard):
     torch.manual_seed(0)
     ref = TinyLM().to(DEV)
     mine = copy.deepcopy(ref)
     opt_ref = torch.optim.AdamW(ref.parameters(), foreach=False, **HP)
     mine, opt = trainstream.wrap(mine, torch.optim.AdamW(mine.parameters(), **HP), offload=True,
-                                 param_offload=True, activation_offload=False)
+                                 param_offload=True, activation_offload=False, nan_guard=nan_guard)
     opt.engine.set_max_staging_bytes(1)  # one gradient in flight at a time
     try:
         data = tokens(5)
@@ -230,11 +231,13 @@ def test_pooled_gradient_staging_under_a_tiny_cap():
         biggest = max(p.numel() * p.element_size() for p in mine.parameters())
         assert s["staging_bytes"] == 0  # every buffer went back to the pool
         assert 0 < s["staging_peak_bytes"] <= biggest
-        # no per-parameter staging in the persistent host state any more
+        # no per-parameter staging in the persistent host state any more: fp32 master + two fp32
+        # moments, plus the fp32 accumulator that holds a guarded step's gradients until its verdict
         numel = sum(p.numel() for p in mine.parameters())
-        assert s["host_state_bytes"] == numel * 12  # fp32 master + two fp32 moments
+        assert s["host_state_bytes"] == numel * (16 if nan_guard else 12)
     finally:
         trainstream.unwrap(mine)
+        trainstream._C.guard_enable(True)
 
 
 def test_frozen_weights_beyond_the_pin_budget_stay_pageable(monkeypatch):

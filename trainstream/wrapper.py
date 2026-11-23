@@ -50,6 +50,7 @@ class TrainStreamSession:
         self.fused = None  # trainstream.fused.Fused: the fused norm / RoPE / MLP kernels installed
         self.lora_layers: List[nn.Module] = []  # PEFT LoRA Linears routed through trainstream.lora
         self.expert_pagers: list = []  # trainstream.experts.ExpertPager per paged stack of MoE experts
+        self.front = None  # trainstream.fused.FrontPolicy: which gated MLPs keep no gate / up outputs
         self.attention: Optional[AttentionSelector] = None
         self.peer = None  # trainstream.peer.PeerPool once set up
         self._peer_step: Optional[int] = None
@@ -61,6 +62,15 @@ class TrainStreamSession:
         opt.attach(self.model, guard=cfg["guard_params"])
         if cfg.get("kernels") and self.fused is None:
             self.fused = fused.install(self.model, opt.device)
+            mode, kern = cfg.get("mlp_recompute", "auto"), bool(cfg.get("fused_gemm"))
+            if self.fused.mlps and (mode not in (False, None) or kern):
+                self.front = fused.FrontPolicy(mode if mode is not None else False, kern, self._front_pressure,
+                                               self._front_unkept)
+                self.front.on_engage = lambda: self.events.append(
+                    "gated MLPs: in blocks whose activations are paged to host RAM, gate / up outputs (two "
+                    "[tokens, intermediate] tensors per layer) are recomputed in backward instead of paged")
+                for m in self.fused.mlps:
+                    m._ts_front = self.front
         if cfg.get("fused_lora") and not self.lora_layers:
             self.lora_layers = lora.install(self.model)
         if opt.resident:
@@ -76,7 +86,7 @@ class TrainStreamSession:
                 self.candidates = pageable_params(self.model, self.blocks, range(len(self.blocks)))
             self.pager = ParamPager(self.model, self.blocks, opt, self.paged_blocks, candidates=self.candidates,
                                     frozen_init=frozen_init, prefetch_depth=cfg["prefetch_depth"],
-                                    disk=cfg.get("_disk"))
+                                    disk=cfg.get("_disk"), disk_lookahead=cfg.get("disk_lookahead", "auto"))
         rc = cfg.get("recompute", "auto")
         explicit_rc = rc not in ("auto", False, None, 0, 0.0)
         if (cfg["activation_offload"] not in (False, 0, 0.0, None) or explicit_rc) and self.blocks:
@@ -86,10 +96,21 @@ class TrainStreamSession:
                 prefetch_depth=cfg["prefetch_depth"], profile=self.profile,
                 max_slowdown=cfg["max_activation_slowdown"], reserved_link_bytes=cfg["_reserved"],
                 max_inflight_bytes=cfg["max_inflight_bytes"], recompute=rc,
-                memory_pressure=bool(cfg.get("_act_forced")), vram_target=cfg.get("_vram_target"))
+                memory_pressure=bool(cfg.get("_act_forced")), vram_target=cfg.get("_vram_target"),
+                chunks=cfg.get("lora_chunks", "auto"))
             self.activations.events = self.events
             self.activations.weights_paged = lambda: self.pager is not None and bool(self.pager.remote)
             self._act_room_step, self._act_room_done = None, False
+
+    def _front_pressure(self) -> bool:
+        """Whether the block running now has its activations paged to host RAM: there, what a
+        gated MLP does not keep for backward is bytes that do not cross PCIe twice."""
+        act = self.activations
+        return act is not None and act.paging_now()
+
+    def _front_unkept(self, nbytes: int) -> None:
+        if self.activations is not None:
+            self.activations.note_unkept(nbytes)
 
     def teardown(self, materialize: bool = True) -> None:
         if self.pager is not None:
@@ -110,6 +131,7 @@ class TrainStreamSession:
         if self.fused is not None:
             self.fused.remove()
             self.fused = None
+            self.front = None
         lora.uninstall(self.lora_layers)
         self.lora_layers = []
         if self.attention is not None:
@@ -225,7 +247,12 @@ class TrainStreamSession:
         self._act_room_step, self._act_room_done = None, True
         peak = torch.cuda.max_memory_allocated(dev)
         target = self.planner.target if self.planner is not None else self.config.get("_vram_target") or 0
-        kept = act.keep_resident(int((target - peak) // (1.25 * act.block_bytes)))
+        per_block = act.block_bytes
+        if self.front is not None and self.front.mode == "auto":
+            # a block moved back to VRAM keeps its gate / up outputs again (they were only left
+            # out while its activations were paged): it holds that much more than was measured
+            per_block += act.unkept_block_bytes
+        kept = act.keep_resident(int((target - peak) // (1.25 * per_block)))
         if kept:
             self.events.append(f"activations: step peak {peak / 2**30:.2f} GiB of {target / 2**30:.2f} GiB target "
                                f"leaves room for {len(kept)} more blocks' activations: kept in VRAM "
@@ -363,13 +390,11 @@ class TrainStreamSession:
             },
             "resident": self.optimizer.resident,
             "events": list(self.events),
+            "guard": dict(enabled=bool(self.optimizer.nan_guard), skipped_steps=self.optimizer.skipped_steps,
+                          kernel_flags=dict(_C.guard_read(dev.index or 0, False))),
         }
         if self.expert_pagers:
-            out["experts"] = dict(stacks=len(self.expert_pagers),
-                                  host_bytes=sum(e.nbytes for e in self.expert_pagers),
-                                  calls=sum(e.calls for e in self.expert_pagers),
-                                  experts_copied=sum(e.experts_used for e in self.expert_pagers),
-                                  bytes_copied=sum(e.bytes_in for e in self.expert_pagers))
+            out["experts"] = experts.stats(self.expert_pagers)
         if self.attention is not None:
             out["attention"] = dict(mode=self.attention.mode, backend=self.attention.choice,
                                     timings_ms=dict(self.attention.timings))
@@ -381,6 +406,10 @@ class TrainStreamSession:
             out["activations"]["decision"] = dict(self.activations.decision)
             out["activations"]["policy"] = self.activations.policy
             out["activations"]["recompute_blocks"] = sorted(self.activations.recompute)
+            # process-wide: activations fetched in pieces / the pieces / LoRA weight gradients
+            # that started on the first pieces while the rest were still arriving
+            from .hooks import CHUNK_STATS
+            out["activations"]["chunked"] = dict(CHUNK_STATS)
         if self.pager is not None:
             out["params"] = dict(self.pager.stats, paged_blocks=sorted(self.pager.remote),
                                  paged_bytes=self.pager.bytes_paged, total_blocks=self.pager.n,
@@ -393,6 +422,15 @@ class TrainStreamSession:
                                  frozen_disk_bytes=self.pager.frozen_disk_bytes,
                                  peer_blocks=self.peer.pooled_blocks if self.peer is not None else [],
                                  peer_owned_bytes=self.peer.bytes_owned if self.peer is not None else 0)
+        if self.front is not None:
+            # (the counters are process-wide)
+            out["mlp_front"] = dict(fused.FRONT_STATS, mode=self.front.mode, engaged=bool(self.front.engaged),
+                                    fused_gemm=self.front.kernel,
+                                    kernel_available=bool(_C.gemm_fp4_supported(dev.index or 0)))
+        if self.pager is not None and (self.pager.frozen_disk_bytes or self.pager.stats["disk_bytes"]):
+            # process-wide counters of the unbuffered read path (csrc/aio.cpp, csrc/disk.cpp)
+            out["disk"] = dict(_C.disk_stats(), backend=_C.disk_backend(), lookahead=self.pager.disk_ahead,
+                               frozen_bytes=self.pager.frozen_disk_bytes)
         if self.planner is not None:
             out["plan"] = dict(target_vram=self.planner.target, settled=self.planner.done,
                                history=list(self.planner.history), budget=self.planner.budget.describe())
@@ -439,6 +477,24 @@ def _convert_optimizer(optimizer, model: nn.Module, mode: str, max_grad_norm, th
         new.load_state_dict(optimizer.state_dict())  # migrate moments to host
         optimizer.state.clear()  # release the VRAM they occupied
     return new
+
+
+PISSA_LR_MAX = 3e-5  # above it PiSSA trained worse than a zero-started LoRA (Qwen2.5 1.5B / 14B, NF4 and NVFP4)
+
+
+def _warn_pissa_lr(model: nn.Module, opt) -> None:
+    """Warn when PiSSA adapters train at a learning rate made for zero-started LoRA."""
+    ids = Q.pissa_adapter_ids(model)
+    if not ids:
+        return
+    lrs = [float(g["lr"]) for g in opt.param_groups if any(id(p) in ids for p in g["params"])]
+    if lrs and max(lrs) > PISSA_LR_MAX:
+        warnings.warn(
+            f"TrainStream: lora_init='pissa' adapters train at learning rate {max(lrs):g}. PiSSA adapters start at "
+            f"the weights' largest components, so each AdamW step moves the model much further than it moves a "
+            f"LoRA that starts at zero; above about {PISSA_LR_MAX:g} PiSSA usually ends worse than plain LoRA "
+            f"(measured on Qwen2.5 1.5B and 14B: worse at 5e-5 and 2e-4, better at 2e-5). Use about 2e-5 for "
+            f"these adapters.", stacklevel=3)
 
 
 def _unique_params(model: nn.Module):
@@ -492,10 +548,11 @@ def _reserve_host_arena(host_arena, budget, session) -> dict:
     return dict(reserved=int(reserved), cap=int(cap))
 
 
-def _broadcast_from_rank0(model: nn.Module, group) -> None:
+def _broadcast_from_rank0(model: nn.Module, group, tensors=None) -> None:
+    """Every rank takes rank 0's values of `tensors` (default: all parameters and buffers)."""
     import torch.distributed as dist
     with torch.no_grad():
-        for t in list(_unique_params(model)) + [b for b in model.buffers()]:
+        for t in (list(_unique_params(model)) + [b for b in model.buffers()] if tensors is None else tensors):
             host = t.detach().to("cpu", copy=True)
             dist.broadcast(host, src=0, group=group)
             t.copy_(host)
@@ -513,6 +570,7 @@ def wrap(
     device: Optional[Union[str, torch.device]] = None,
     moment_dtype: str = "auto",
     distributed: Optional[bool] = None,
+    distributed_backend: str = "auto",
     guard_params: bool = True,
     max_grad_norm: Optional[float] = None,
     threads: Optional[int] = None,
@@ -530,6 +588,7 @@ def wrap(
     keep_precise: Union[str, float, bool, None] = 0,
     error_rank: int = 0,
     error_iters: int = 1,
+    lora_init: str = "loftq",
     double_quant: bool = False,
     prefer: str = "exact",
     recompute: Union[str, float, bool, Sequence[int]] = "auto",
@@ -538,9 +597,17 @@ def wrap(
     nvfp4_backward: bool = False,
     kernels: Union[str, bool, None] = "auto",
     fused_lora: Union[str, bool, None] = "auto",
+    mlp_recompute: Union[str, bool, None] = "auto",
+    fused_gemm: bool = False,
+    lora_chunks: Union[str, int, bool, None] = "auto",
+    nan_guard: bool = True,
+    fp8_gradients: bool = False,
     host_arena: Union[str, int, bool] = "auto",
     disk_offload: Optional[str] = None,
+    disk_lookahead: Union[str, int] = "auto",
     moe_paging: bool = False,
+    moe_cache: Union[str, int, bool, None] = "auto",
+    moe_capacity: Optional[int] = None,
     peer: Union[str, int, bool] = "auto",
     verbose: bool = False,
 ):
@@ -577,12 +644,25 @@ def wrap(
         distributed: data parallel over torch.distributed (default: on when a
             process group with more than one rank is initialized). Parameters
             are broadcast from rank 0; gradients are averaged on the host.
+        distributed_backend: how data-parallel ranks sum a gradient. "auto"
+            (default): through shared memory when every rank is on this
+            machine, otherwise around a TCP ring between the ranks
+            (trainstream.ring): each rank sends 2 (N - 1) / N of the gradient
+            whatever the number of ranks N, sending and receiving at once, and
+            every rank ends with the same bits, so replicas stay identical. A
+            gradient goes around as soon as its last micro-batch has reached
+            the host, beside the rest of backward. "ring": the ring even on
+            one machine. "gloo": torch.distributed's all_reduce instead of the
+            ring. Parameters are broadcast, and the ranks find each other,
+            through a gloo group either way. TRAINSTREAM_RING_HOST sets the
+            address a rank tells the others to reach it at.
         guard_params: make reads of a weight whose update is still in flight
             wait for it, wherever they happen (default on).
         max_grad_norm: global-norm clipping applied inside the optimizer
             (torch.nn.utils.clip_grad_norm_ cannot see streamed gradients).
         accumulation_steps: backward passes per optimizer.step(). In cpu mode
-            without clipping, updates run eagerly during the last backward.
+            without clipping and with nan_guard=False, updates run eagerly
+            during the last backward.
         max_activation_slowdown: without a VRAM target to measure against (an
             ActivationOffloader used on its own), "auto" activation paging backs
             off until the measured step time is within this fraction of the
@@ -606,6 +686,22 @@ def wrap(
             of at zero, so base + adapter starts close to the original weights.
             Weights quantized beforehand with error_rank (load_model,
             quantize_model) start their adapters the same way. Default 0: off.
+        error_iters: rounds of that fit (LoftQ) or of refitting the principal
+            part against the stored residual (PiSSA). Default 1.
+        lora_init: what the low-rank factors are. "loftq" (default): the
+            quantization error, as above (off while error_rank is 0). "pissa":
+            PiSSA. Each quantized weight that carries a plain PEFT LoRA adapter
+            is split with one randomized SVD into its principal part, of the
+            adapter's own rank r (error_rank is not needed), and the rest. The
+            adapter starts at the principal part (B = U sqrt(S) / scaling, A =
+            sqrt(S) V^T) and the rest is what gets quantized, so the adapter
+            trains the directions that carry most of the weight from the first
+            step and base + adapter still starts at the original weight, up to
+            the residual's quantization. Weights without an adapter are
+            quantized as usual. The base then holds only the residual:
+            trainstream.pissa_to_lora(model) turns the trained adapter into an
+            ordinary LoRA (rank 2r) for the original weights. For a base that
+            is not quantized, use PEFT's own init_lora_weights="pissa".
         double_quant: nf4 / int8 block scales stored as one-byte log codes with
             an fp32 scale per 256 blocks (bitsandbytes' double quantization),
             about 0.37 bit per weight less at block size 64 (0.65 GB on a 14B
@@ -648,6 +744,77 @@ def wrap(
             keeping the input the base layer read instead of a copy. Matches
             PEFT up to the rounding of its intermediate products. "auto"
             (default): on when the frozen weights are quantized; True / False.
+        mlp_recompute: with kernels on, a gated MLP keeps its input for
+            backward instead of the outputs of gate_proj and up_proj, and runs
+            those two projections again in backward (through the model's own
+            modules: the same bits, the same gradients). The two outputs are
+            each [tokens, intermediate], roughly a third of everything a
+            decoder layer keeps for backward, so under memory pressure they
+            are bytes that would cross PCIe twice; recomputing them costs two
+            matmuls (and the LoRA terms) per MLP. "auto" (default): for MLPs
+            whose projections both run on tensor cores (nvfp4 / fp8 on
+            Blackwell, where those matmuls are cheap), in blocks whose
+            activations are being paged to host RAM; True: every MLP, always
+            (with bf16 or expanded weights the recomputation is two full-size
+            matmuls: measure it); False: never. Projections with LoRA dropout
+            in effect are never recomputed, and blocks recomputed as a whole
+            in backward keep nothing anyway. Measured on Qwen2.5-14B (NVFP4
+            base, LoRA r=16, 1 x 2,048 tokens, RTX 5090 Laptop GPU) with every
+            block's activations paged (activation_offload=True,
+            recompute=False): 1.68 s per step against 2.08 s, and 35 % fewer
+            bytes paged. With activations in VRAM or blocks recomputed (what
+            "auto" activation paging chose in every scenario measured on that
+            machine) it changed nothing but cost 0.4 to 2 % when forced on,
+            which is why "auto" confines it to paged blocks.
+            memory_report()["mlp_front"] counts the fronts and the bytes not
+            kept.
+        fused_gemm: compute those MLP fronts with TrainStream's own kernel
+            where it applies, instead of cuBLAS's matmuls and separate passes:
+            the two FP4 tensor-core products, the LoRA terms and the
+            activation in one kernel, accumulated in registers, so gate / up
+            outputs never exist in memory (csrc/gemm_fp4_kernel.cu). It
+            applies on consumer Blackwell (sm_120) to MLPs whose gate_proj and
+            up_proj are nvfp4 without bias or outlier channels, with plain
+            LoRA or none, and bf16 output; such MLPs then always use the
+            recompute front (backward recomputes through cuBLAS). On an RTX
+            5090 Laptop GPU it measured slower than the default path per MLP
+            front (4.3 ms against 4.1 ms at 4,096 tokens of Qwen2.5-14B's
+            shape: cuBLAS's FP4 matmul alone is 1.7 times faster than this
+            kernel's) and made no difference to whole training steps (within
+            1 % in three Qwen2.5-14B scenarios), so it is False by default.
+        lora_chunks: how a large paged activation comes back from host RAM: as
+            several back-to-back copies with a CUDA event after each, so the
+            fused LoRA backward (fused_lora) can compute an adapter's weight
+            gradient from the rows that have landed while the rest of its
+            input is still crossing PCIe, instead of waiting for all of it.
+            It only changes anything when backward reaches a layer before its
+            input has arrived (a link slower than the GPU); the gradient is
+            then a sum of per-piece matmuls, equal up to rounding.
+            memory_report()["activations"]["chunked"] counts both cases.
+            "auto" (default): pieces of at least 4 MiB, at most 8; an int:
+            that many pieces (activations of 2 MiB or more); False: one copy.
+        nan_guard: skip, as a whole, any optimizer step whose gradients hold a
+            NaN or Inf: weights, moments and step counts stay as they were, the
+            gradients are dropped, a warning is printed and training continues
+            with the next batch (optimizer.skipped_steps and
+            memory_report()["guard"] count them; 50 in a row raise
+            FloatingPointError). TrainStream's fused kernels also flag where a
+            non-finite value first appeared. The verdict needs all of a step's
+            gradients before any update runs, so eager updates are off and each
+            trained value keeps a 4-byte host accumulator (both already true
+            when clipping or accumulating). True (default); False: no checks,
+            eager updates where possible. Applies to an OffloadAdamW you pass
+            in as well.
+        fp8_gradients: with optimizer_mode="cpu", gradients cross PCIe as one
+            byte per value (an e4m3 code against an fp32 scale per 256 values,
+            rounded stochastically on the GPU so the rounding is zero-mean
+            noise, not bias) instead of two (bf16) or four (fp32), and are
+            expanded into the host's fp32 accumulator: half or a quarter of
+            the gradient traffic and of its pinned staging memory. It matters
+            for full fine-tunes, whose gradients are as large as the model;
+            LoRA gradients are small either way. Each value is off by up to
+            12.5 % (three mantissa bits), which Adam's averages smooth; not
+            bit-exact with fp32 gradients. Default False.
         host_arena: page-locked host memory reserved up front, from which
             paged activations, gradient staging and other pinned buffers are
             carved, so training steps never page-lock memory (a stall on
@@ -655,17 +822,54 @@ def wrap(
             one slab now and grow on demand within the page-lock budget; an int
             reserves that many bytes now (and caps growth there); False: none.
         disk_offload: a directory (on a fast SSD). Frozen paged weights the
-            page-lock budget can't hold go to memory-mapped files there instead
-            of ordinary RAM: the OS keeps them in its page cache while RAM has
-            room and reads them from the disk when it doesn't, and the RAM
-            check no longer counts them. Weights load_model(disk_offload=...)
-            already put on disk stay there. Default None: RAM only.
+            page-lock budget can't hold go to files there instead of ordinary
+            RAM, and the RAM check no longer counts them. Training reads them
+            with asynchronous unbuffered I/O (an I/O completion port on
+            Windows, io_uring on Linux, a thread pool where neither is
+            available; no OS page cache, no page faults) straight into pinned
+            staging memory ahead of the layer that needs them, and the copy to
+            the GPU waits for the read on a CUDA stream of its own, so the
+            training loop never waits for the SSD. memory_report()["disk"]
+            shows the traffic. Weights load_model(disk_offload=...) already
+            put on disk stay there. Default None: RAM only.
+        disk_lookahead: how many paged blocks ahead of the running one have
+            their files read into pinned staging memory. The first
+            prefetch_depth of them are also copied to VRAM; the rest wait in
+            host memory, which keeps the SSD ahead of the PCIe copy at the
+            price of one staging slot (a block's disk-backed bytes, pinned)
+            each. "auto" (default): prefetch_depth + 1; an int (at least
+            prefetch_depth).
         moe_paging: the frozen experts of mixture-of-experts layers (Hugging
             Face's stacked experts: Qwen3-MoE, Qwen2-MoE, Mixtral...) stay in
             pinned host RAM, and each layer copies in only the experts its
             tokens were routed to, again in backward instead of keeping them.
             Pays when a step routes to few experts (short sequences, small
-            batches); with thousands of tokens nearly all are hit. Default False.
+            batches); with thousands of tokens nearly all are hit. A layer
+            looks at its routing once, queues every expert it needs on the
+            copy stream before computing the first, and computes each as its
+            own copy lands; backward queues a layer's experts, and the MoE
+            layer below's, when it reaches the layer. Results are bit-identical
+            to the unpaged model. Default False.
+        moe_cache: with moe_paging, VRAM that keeps recently used experts
+            (least recently used out first), so an expert used again, by the
+            next step or by backward, is not copied again. With a cache, a
+            layer also queues the experts the next MoE layer will probably
+            need (that layer's router applied to this layer's input, a guess
+            that stops for a layer where it is wrong more often than right):
+            they land in the cache while this layer computes.
+            memory_report()["experts"] counts hits, misses and guesses. "auto"
+            (default): 10 % of the GPU's memory budget, at most the experts'
+            total size; an int: that many bytes; False / 0: no cache and no
+            guessing (each layer holds its experts only while it computes).
+        moe_capacity: with moe_paging, at most this many experts are copied in
+            per MoE layer and pass. Beyond it the most-used ones are copied,
+            and tokens routed to any other expert that is not in VRAM are
+            re-routed: the router's top-k runs again over the experts that are
+            allowed (in the cache, or being copied), and its weights are
+            renormalized as the router does. This changes what the model
+            computes, in exchange for a bound on PCIe traffic; needs Hugging
+            Face's top-k router next to the experts. None (default): no limit,
+            the model's own routing always.
         peer: data parallel on one machine whose GPUs reach each other's
             memory (NVLink / PCIe P2P, through CUDA IPC): the frozen blocks every
             rank streams are split among the GPUs' VRAM and copied GPU to GPU
@@ -692,6 +896,9 @@ def wrap(
         raise ValueError(f"quantize must be 'auto', 'none', 'int8', 'nf4', 'fp8' or 'nvfp4', got {quantize!r}")
     if prefer not in ("exact", "speed"):
         raise ValueError(f"prefer must be 'exact' or 'speed', got {prefer!r}")
+    Q.check_lora_init(lora_init)
+    if distributed_backend not in ("auto", "ring", "gloo"):
+        raise ValueError(f"distributed_backend must be 'auto', 'ring' or 'gloo', got {distributed_backend!r}")
     if not (recompute in ("auto", True, False, None) or isinstance(recompute, (float, int, list, tuple, set))):
         raise ValueError(f"recompute must be 'auto', True, False, a fraction or block indices, got {recompute!r}")
     if getattr(model, "is_gradient_checkpointing", False):
@@ -704,9 +911,27 @@ def wrap(
         raise ValueError(f"kernels must be 'auto', True or False, got {kernels!r}")
     if fused_lora not in ("auto", True, False, None):
         raise ValueError(f"fused_lora must be 'auto', True or False, got {fused_lora!r}")
+    if mlp_recompute not in ("auto", True, False, None):
+        raise ValueError(f"mlp_recompute must be 'auto', True or False, got {mlp_recompute!r}")
+    if fused_gemm not in (True, False, None):
+        raise ValueError(f"fused_gemm must be True or False, got {fused_gemm!r}")
+    if not (lora_chunks in ("auto", True, False, None)
+            or (isinstance(lora_chunks, int) and not isinstance(lora_chunks, bool) and 0 <= lora_chunks <= 64)):
+        raise ValueError(f"lora_chunks must be 'auto', False or a number of pieces up to 64, got {lora_chunks!r}")
+    if lora_chunks is True:
+        lora_chunks = "auto"
     if not (host_arena in ("auto", False, None) or (isinstance(host_arena, int) and not isinstance(host_arena, bool)
                                                     and host_arena >= 0)):
         raise ValueError(f"host_arena must be 'auto', False or a number of bytes, got {host_arena!r}")
+    if not (moe_cache in ("auto", True, False, None)
+            or (isinstance(moe_cache, int) and not isinstance(moe_cache, bool) and moe_cache >= 0)):
+        raise ValueError(f"moe_cache must be 'auto', False or a number of bytes, got {moe_cache!r}")
+    if moe_capacity is not None and (not isinstance(moe_capacity, int) or isinstance(moe_capacity, bool)
+                                     or moe_capacity < 1):
+        raise ValueError(f"moe_capacity must be None or a number of experts (>= 1), got {moe_capacity!r}")
+    if not (disk_lookahead in ("auto", None)
+            or (isinstance(disk_lookahead, int) and not isinstance(disk_lookahead, bool) and disk_lookahead >= 1)):
+        raise ValueError(f"disk_lookahead must be 'auto' or a number of blocks (>= 1), got {disk_lookahead!r}")
     if not (peer in ("auto", False, None) or (isinstance(peer, int) and not isinstance(peer, bool) and peer >= 0)):
         raise ValueError(f"peer must be 'auto', False or a number of bytes per GPU, got {peer!r}")
     params = list(_unique_params(model))
@@ -728,23 +953,35 @@ def wrap(
             want = torch.device("cuda", torch.cuda.current_device())
         if want != target:
             raise ValueError(f"model is on {target} but device={device!r}; move it first or leave device unset")
-    expert_pagers = experts.install(model, target) if moe_paging else []  # before anything places or pages them
+    # before anything places or pages them
+    expert_pagers = experts.install(model, target, capacity=moe_capacity) if moe_paging else []
+    moe_cache_bytes = 0
     if expert_pagers:
         params = list(_unique_params(model))
+        if moe_cache in ("auto", True):
+            moe_cache_bytes = min(sum(e.nbytes for e in expert_pagers), int(0.10 * vram_budget(target)[1]))
+        elif moe_cache:
+            moe_cache_bytes = int(moe_cache)
+        expert_pagers[0].cache.budget = moe_cache_bytes  # one cache for every stack
 
     if distributed is None:
         import torch.distributed as dist
         distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    dp_group = None
     if distributed:
         import torch.distributed as dist
         if not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError("distributed=True needs torch.distributed.init_process_group() first")
         if optimizer_mode == "gpu":
             raise ValueError("distributed training averages gradients on the host: use optimizer_mode='cpu'")
-        _broadcast_from_rank0(model, dist.new_group(backend="gloo"))
+        dp_group = dist.new_group(backend="gloo")
+        _broadcast_from_rank0(model, dp_group)
 
     stack = list(blocks) if blocks is not None else find_blocks(model)
-    weight_bytes = sum(p.numel() * p.element_size() for p in params)
+    # what VRAM holds when nothing is paged: experts under moe_paging are never there as a whole,
+    # only their cache
+    weight_bytes = sum(p.numel() * p.element_size() for p in params if not getattr(p, "_ts_expert", False))
+    weight_bytes += moe_cache_bytes
     candidates = pageable_params(model, stack, range(len(stack))) if stack else {}
     block_bytes = [sum(p.numel() * p.element_size() for p in candidates[i]) for i in range(len(stack))]
     budget = measure_budget(target)
@@ -756,7 +993,7 @@ def wrap(
                if Q.quantized_of(p) is not None or Q.eligible(p)]
     pre = sorted({Q.quantized_of(p).kind for p in qparams if Q.quantized_of(p) is not None})
     trainable_params = [p for p in params if p.requires_grad]
-    grad_acc = bool(max_grad_norm) or accumulation_steps > 1 or bool(distributed)
+    grad_acc = bool(max_grad_norm) or accumulation_steps > 1 or bool(distributed) or bool(nan_guard)
     have = budget.ram_available + (sum(p.untyped_storage().nbytes() for p in params) if on_cpu else 0)
     have = int(0.90 * have)  # room for paged activations and the rest of the process
     frozen_eligible = sum(p.numel() * p.element_size() for p in qparams if Q.quantized_of(p) is None)
@@ -809,6 +1046,8 @@ def wrap(
         # block-scaled formats take only tensor-core shapes; other weights stay as they are
         qparams = [p for p in qparams if Q.quantized_of(p) is not None or Q.eligible(p, qkind)]
         todo = [p for p in qparams if Q.quantized_of(p) is None]
+        # PiSSA splits only weights whose adapter can hold the principal part, at that adapter's rank
+        pissa_rank = Q.adapter_ranks(model) if lora_init == "pissa" else None
         keep = set()
         if keep_frac and qkind in Q.KEEP_KIND and todo:  # measure every weight's loss first, then choose
             keep = Q.choose_precise([(id(p), Q.quant_error(p, qkind, quant_block_size), p.numel(), tuple(p.shape))
@@ -816,17 +1055,30 @@ def wrap(
         for p in todo:  # one tensor at a time: the model never exists twice
             kind = Q.KEEP_KIND[qkind] if id(p) in keep else qkind
             nb = Q.packed_bytes(p.numel(), kind, quant_block_size, p.shape)
+            rank = pissa_rank.get(id(p), 0) if pissa_rank is not None else max(0, int(error_rank))
             Q.attach(p, Q.make_quantized(p, kind, quant_block_size,
                                          pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget,
-                                         error_rank=max(0, int(error_rank)), error_iters=max(1, int(error_iters)),
-                                         double_quant=bool(double_quant)))
+                                         error_rank=rank, error_iters=max(1, int(error_iters)),
+                                         double_quant=bool(double_quant), lora_init=lora_init))
         if any(Q.quantized_of(p).lora_init is not None for p in qparams):
-            n = Q.init_lora_from_error(model)  # before the optimizer copies the adapters to the host
-            kept_note = ((kept_note + "; ") if kept_note else "") + (
-                f"LoftQ: {n} LoRA adapters start at their base weights' quantization error")
+            before = Q.lora_init_counts(model)
+            Q.init_lora_from_error(model)  # before the optimizer copies the adapters to the host
+            if dp_group is not None:  # the fits are per process: every rank takes rank 0's adapters
+                _broadcast_from_rank0(model, dp_group, [p for p in _unique_params(model) if p.requires_grad])
+            started = {k: v - before[k] for k, v in Q.lora_init_counts(model).items()}
+            what = []
+            if started["pissa"]:
+                what.append(f"PiSSA: {started['pissa']} LoRA adapters start at their base weights' principal part "
+                            f"and the bases hold the rest (trainstream.pissa_to_lora converts a trained adapter "
+                            f"for the original weights)")
+            if started["loftq"]:
+                what.append(f"LoftQ: {started['loftq']} LoRA adapters start at their base weights' quantization "
+                            f"error")
+            if what:
+                kept_note = "; ".join(what)
         if keep:
             kept_note = (f"kept the {len(keep)} of {len(todo)} weights that lose the most in {qkind} as "
-                         f"{Q.KEEP_KIND[qkind]} (keep_precise={keep_frac:g})")
+                         f"{Q.KEEP_KIND[qkind]} (keep_precise={keep_frac:g})" + (f"; {kept_note}" if kept_note else ""))
     qset = {id(p) for p in qparams} if qkind is not None else set()
     near_bytes = [sum(Q.quantized_of(p).nbytes if id(p) in qset else p.numel() * p.element_size()
                       for p in candidates.get(i, [])) for i in range(len(stack))]
@@ -929,9 +1181,20 @@ def wrap(
         paged_trainable = {id(p) for ps in pageable_params(model, stack, paged_plain).values()
                            for p in ps if p.requires_grad}
     opt = _convert_optimizer(optimizer, model, optimizer_mode, max_grad_norm, threads, lr,
-                             moment_dtype=moment_dtype, distributed=bool(distributed), _broadcast=False,
-                             _paged=paged_trainable, _host_init=host_init)
+                             moment_dtype=moment_dtype, distributed=bool(distributed), nan_guard=bool(nan_guard),
+                             distributed_backend=distributed_backend,
+                             fp8_gradients=bool(fp8_gradients) and optimizer_mode == "cpu",
+                             _broadcast=False, _paged=paged_trainable, _host_init=host_init)
     host_init.clear()
+    _warn_pissa_lr(model, opt)
+    if opt.nan_guard != bool(nan_guard):  # an OffloadAdamW passed in: wrap's setting wins
+        opt.set_nan_guard(bool(nan_guard))
+    if fp8_gradients and opt.mode != "cpu":
+        raise ValueError("fp8_gradients needs optimizer_mode='cpu' (in gpu mode gradients never leave VRAM)")
+    if fp8_gradients and not opt.fp8_gradients and opt.engine is not None:
+        opt.fp8_gradients = True
+        opt.engine.set_fp8_gradients(True)
+    _C.guard_enable(bool(nan_guard))  # the NaN / Inf checks inside the fused kernels
     if max_grad_norm is not None:
         opt.max_grad_norm = max_grad_norm
     opt.accumulation_steps = max(1, int(accumulation_steps))
@@ -964,17 +1227,25 @@ def wrap(
         print("[trainstream] no repeated block stack found; activation offload disabled")
 
     config = dict(quantize=qkind, quant_block_size=quant_block_size, prefer=prefer, recompute=recompute,
+                  lora_init=lora_init,
                   attention=attention, outliers=outliers if qkind == "nvfp4" else 0.0,
                   nvfp4_backward=bool(nvfp4_backward) and qkind == "nvfp4",
                   kernels=kernels is True or (kernels == "auto" and qkind is not None),
                   fused_lora=fused_lora is True or (fused_lora == "auto" and qkind is not None),
+                  mlp_recompute=mlp_recompute if mlp_recompute is not None else False,
+                  fused_gemm=bool(fused_gemm),
                   optimizer_mode=optimizer_mode, offload=offload, activation_offload=activation_offload,
                   param_offload=param_offload, paged_blocks=len(paged_blocks), moment_dtype=opt.moment_dtype,
-                  distributed=bool(distributed), accumulation_steps=opt.accumulation_steps,
+                  distributed=bool(distributed),
+                  distributed_backend=opt._dp["backend"] if opt._dp is not None else None,
+                  accumulation_steps=opt.accumulation_steps,
                   eager_updates=opt.eager_active, max_grad_norm=max_grad_norm, prefetch_depth=prefetch_depth,
-                  min_offload_bytes=min_offload_bytes, guard_params=guard_params,
+                  min_offload_bytes=min_offload_bytes, guard_params=guard_params, nan_guard=bool(nan_guard),
+                  fp8_gradients=bool(opt.fp8_gradients), lora_chunks=lora_chunks, moe_paging=bool(expert_pagers), moe_cache=moe_cache_bytes,
+                  moe_capacity=moe_capacity if expert_pagers else None,
                   max_activation_slowdown=max_activation_slowdown, max_inflight_bytes=max_inflight_bytes,
                   verbose=verbose, _reserved=reserved, _act_forced=act_forced, _disk=disk,
+                  disk_lookahead=disk_lookahead,
                   _vram_target=planner.target if planner is not None else int(budget.vram_usable * (1 - vram_headroom)),
                   plan=dict(budget=budget.describe(), host_bytes=need, blocks=len(stack),
                             initial_paged=len(paged_blocks), auto=planner is not None))
@@ -983,7 +1254,11 @@ def wrap(
     if expert_pagers:
         session.events.append(f"MoE: {len(expert_pagers)} stacks of experts "
                               f"({sum(e.nbytes for e in expert_pagers) / 2**30:.2f} GiB) stay in host RAM; each layer "
-                              f"copies in only the experts its tokens are routed to")
+                              f"copies in only the experts its tokens are routed to"
+                              + (f", and a {moe_cache_bytes / 2**30:.2f} GiB cache in VRAM keeps the recent ones "
+                                 f"(the next layer's are copied ahead on a guess)" if moe_cache_bytes else "")
+                              + (f"; at most {moe_capacity} experts are copied per layer, tokens routed to others "
+                                 f"are re-routed (this changes the model's output)" if moe_capacity else ""))
     session.planner = planner
     session.candidates = candidates
     session.install(frozen_init=frozen_init)
@@ -1005,8 +1280,35 @@ def wrap(
             else:
                 session.events.append(f"this GPU (sm_{cap[0]}{cap[1]}) has no {qkind} tensor-core matmul: "
                                       f"weights are expanded before use, like nf4 / int8")
+    if opt.nan_guard:
+        session.events.append("non-finite guard: a step whose gradients hold a NaN / Inf is skipped as a whole"
+                              + ("; updates start at optimizer.step(), not during backward (nan_guard=False "
+                                 "restores eager updates)" if opt.mode == "cpu" and not opt.max_grad_norm
+                                 and not opt.compute_grad_norm and opt._dp is None else ""))
+    if opt.fp8_gradients:
+        session.events.append("fp8 gradients: one e4m3 byte per value crosses PCIe, rounded stochastically "
+                              "(not bit-exact with full-precision gradients)")
+    if opt._dp is not None:
+        how = {"shm": "through shared host memory", "ring": "around a TCP ring between the ranks",
+               "gloo": "by torch.distributed's all_reduce (gloo)"}[opt._dp["backend"]]
+        session.events.append(f"data parallel: {opt._dp['world']} ranks, gradients summed {how}")
     if session.fused is not None:
         session.events.append(f"fused kernels: {session.fused.describe()}")
+    if session.front is not None and session.front.mode is True:
+        session.events.append("gated MLPs keep their input for backward instead of gate / up outputs, and "
+                              "recompute those there (mlp_recompute=True)")
+    if fused_gemm:
+        if session.front is None:
+            session.events.append("fused_gemm: no gated MLP runs through TrainStream's kernels here (kernels off, "
+                                  "or the model has none): nothing to fuse")
+        elif not _C.gemm_fp4_supported(target.index or 0):
+            session.events.append("fused_gemm: this GPU or build has no FP4 tensor-core kernel (it needs consumer "
+                                  "Blackwell, sm_120, and a CUDA toolkit that assembles the instruction): MLP fronts "
+                                  "use cuBLAS")
+        else:
+            n = sum(session.front.kernel_serves(m) for m in session.fused.mlps)
+            session.events.append(f"fused_gemm: {n} of {len(session.fused.mlps)} MLP fronts run in one FP4 kernel "
+                                  f"(gate / up products, LoRA terms and activation; nothing kept but the input)")
     if session.lora_layers:
         session.events.append(f"fused LoRA: {len(session.lora_layers)} adapted Linears computed in one function "
                               f"each (two matmuls forward, three backward)")
@@ -1017,8 +1319,10 @@ def wrap(
     config["host_arena"] = _reserve_host_arena(host_arena, budget, session)
     config["disk_offload"] = disk.dir if disk is not None else None
     if session.pager is not None and session.pager.frozen_disk_bytes:
+        config["disk_lookahead"] = session.pager.disk_ahead
         session.events.append(f"disk tier: {session.pager.frozen_disk_bytes / 2**30:.2f} GiB of frozen weights in "
-                              f"memory-mapped files under {disk_offload}")
+                              f"files under {disk_offload or 'the folder load_model wrote'}, read with asynchronous "
+                              f"unbuffered I/O ({_C.disk_backend()}) {session.pager.disk_ahead} paged block(s) ahead")
     config["peer"] = peer if peer not in (None, 0) else False
     if config["peer"] is not False and opt._dp is not None and opt._dp.get("local") is not None:
         session._peer_step = PEER_SETUP_STEP  # the same step on every rank: the setup is collective

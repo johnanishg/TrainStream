@@ -40,6 +40,9 @@ __device__ __forceinline__ __half from_f<__half>(float v) { return __float2half_
 template <>
 __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
 
+// True for NaN and +/-Inf (a bit test: --use_fast_math cannot fold it away).
+__device__ __forceinline__ bool non_finite(float v) { return (__float_as_uint(v) & 0x7f800000u) == 0x7f800000u; }
+
 inline int fused_grid(int64_t work, int sm_count) {
   int64_t blocks = (work + kFusedThreads - 1) / kFusedThreads;
   const int64_t cap = static_cast<int64_t>(sm_count > 0 ? sm_count : 80) * 32;
@@ -72,7 +75,7 @@ __device__ __forceinline__ float block_sum(float v, float* shared) {
 template <typename T, typename W>
 __global__ void __launch_bounds__(kFusedThreads)
     rms_norm_fwd_kernel(const T* __restrict__ x, const W* __restrict__ w, T* __restrict__ y, float* __restrict__ rstd,
-                        int64_t rows, int64_t cols, float eps, bool gemma) {
+                        int64_t rows, int64_t cols, float eps, bool gemma, int32_t* guard) {
   __shared__ float shared[32];
   for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
     const T* xr = x + r * cols;
@@ -81,8 +84,12 @@ __global__ void __launch_bounds__(kFusedThreads)
       const float v = to_f(xr[c]);
       ss += v * v;
     }
-    const float inv = rsqrtf(block_sum(ss, shared) / static_cast<float>(cols) + eps);
-    if (threadIdx.x == 0) rstd[r] = inv;
+    const float total = block_sum(ss, shared);  // not finite when any value of the row is not
+    const float inv = rsqrtf(total / static_cast<float>(cols) + eps);
+    if (threadIdx.x == 0) {
+      rstd[r] = inv;
+      if (guard != nullptr && non_finite(total)) guard[kGuardRmsNormFwd] = 1;
+    }
     T* yr = y + r * cols;
     for (int64_t c = threadIdx.x; c < cols; c += kFusedThreads) {
       const float n = to_f(xr[c]) * inv;
@@ -99,7 +106,7 @@ template <typename T, typename W>
 __global__ void __launch_bounds__(kFusedThreads)
     rms_norm_bwd_kernel(const T* __restrict__ dy, const T* __restrict__ x, const W* __restrict__ w,
                         const float* __restrict__ rstd, T* __restrict__ dx, float* __restrict__ dw_part,
-                        int64_t rows, int64_t cols, bool gemma) {
+                        int64_t rows, int64_t cols, bool gemma, int32_t* guard) {
   extern __shared__ float acc[];  // cols floats when dw is wanted
   __shared__ float shared[32];
   float* dw = dw_part;
@@ -117,6 +124,7 @@ __global__ void __launch_bounds__(kFusedThreads)
       dot += to_f(gr[c]) * wc * n;
     }
     const float mean = block_sum(dot, shared) / static_cast<float>(cols);
+    if (guard != nullptr && threadIdx.x == 0 && non_finite(mean)) guard[kGuardRmsNormBwd] = 1;
     T* dr = dx + r * cols;
     for (int64_t c = threadIdx.x; c < cols; c += kFusedThreads) {
       const float g = to_f(gr[c]);
@@ -187,27 +195,36 @@ __device__ __forceinline__ void act_and_grad(int act, float g, float& a, float& 
 
 template <typename T>
 __global__ void __launch_bounds__(kFusedThreads)
-    gated_act_fwd_kernel(const T* __restrict__ g, const T* __restrict__ u, T* __restrict__ h, int64_t n, int act) {
+    gated_act_fwd_kernel(const T* __restrict__ g, const T* __restrict__ u, T* __restrict__ h, int64_t n, int act,
+                         int32_t* guard) {
+  bool bad = false;
   for (int64_t i = blockIdx.x * static_cast<int64_t>(kFusedThreads) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * kFusedThreads) {
     float a, da;
     act_and_grad(act, to_f(g[i]), a, da);
-    h[i] = from_f<T>(a * to_f(u[i]));
+    const float v = a * to_f(u[i]);
+    bad |= non_finite(v);
+    h[i] = from_f<T>(v);
   }
+  if (bad && guard != nullptr) guard[kGuardGatedActFwd] = 1;
 }
 
 template <typename T>
 __global__ void __launch_bounds__(kFusedThreads)
     gated_act_bwd_kernel(const T* __restrict__ dh, const T* __restrict__ g, const T* __restrict__ u,
-                         T* __restrict__ dg, T* __restrict__ du, int64_t n, int act) {
+                         T* __restrict__ dg, T* __restrict__ du, int64_t n, int act, int32_t* guard) {
+  bool bad = false;
   for (int64_t i = blockIdx.x * static_cast<int64_t>(kFusedThreads) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * kFusedThreads) {
     float a, da;
     act_and_grad(act, to_f(g[i]), a, da);
     const float d = to_f(dh[i]);
-    du[i] = from_f<T>(d * a);
-    dg[i] = from_f<T>(d * to_f(u[i]) * da);
+    const float vu = d * a, vg = d * to_f(u[i]) * da;
+    bad |= non_finite(vu) | non_finite(vg);
+    du[i] = from_f<T>(vu);
+    dg[i] = from_f<T>(vg);
   }
+  if (bad && guard != nullptr) guard[kGuardGatedActBwd] = 1;
 }
 
 template <typename F>
@@ -226,7 +243,8 @@ cudaError_t by_dtype(DType t, F&& f) {
 }  // namespace
 
 cudaError_t rms_norm_forward(DType x_dtype, DType w_dtype, const void* x, const void* w, void* y, float* rstd,
-                             int64_t rows, int64_t cols, float eps, bool gemma, int sm_count, cudaStream_t stream) {
+                             int64_t rows, int64_t cols, float eps, bool gemma, int sm_count, cudaStream_t stream,
+                             int32_t* guard) {
   if (rows == 0) return cudaSuccess;
   const int grid = static_cast<int>(rows < static_cast<int64_t>(sm_count > 0 ? sm_count : 80) * 16
                                         ? rows : static_cast<int64_t>(sm_count > 0 ? sm_count : 80) * 16);
@@ -235,7 +253,8 @@ cudaError_t rms_norm_forward(DType x_dtype, DType w_dtype, const void* x, const 
     return by_dtype(w_dtype, [&](auto wt) {
       using Wt = decltype(wt);
       rms_norm_fwd_kernel<T, Wt><<<grid, kFusedThreads, 0, stream>>>(
-          static_cast<const T*>(x), static_cast<const Wt*>(w), static_cast<T*>(y), rstd, rows, cols, eps, gemma);
+          static_cast<const T*>(x), static_cast<const Wt*>(w), static_cast<T*>(y), rstd, rows, cols, eps, gemma,
+          guard);
       return cudaGetLastError();
     });
   });
@@ -248,7 +267,7 @@ int rms_norm_backward_grid(int64_t rows, bool dw, int sm_count) {
 
 cudaError_t rms_norm_backward(DType x_dtype, DType w_dtype, const void* dy, const void* x, const void* w,
                               const float* rstd, void* dx, float* dw, int64_t rows, int64_t cols, bool gemma,
-                              int sm_count, cudaStream_t stream) {
+                              int sm_count, cudaStream_t stream, int32_t* guard) {
   if (rows == 0) return cudaSuccess;
   const int grid = rms_norm_backward_grid(rows, dw != nullptr, sm_count);
   const size_t smem = dw != nullptr ? static_cast<size_t>(cols) * sizeof(float) : 0;
@@ -263,7 +282,7 @@ cudaError_t rms_norm_backward(DType x_dtype, DType w_dtype, const void* dy, cons
       }
       rms_norm_bwd_kernel<T, Wt><<<grid, kFusedThreads, smem, stream>>>(
           static_cast<const T*>(dy), static_cast<const T*>(x), static_cast<const Wt*>(w), rstd, static_cast<T*>(dx),
-          dw, rows, cols, gemma);
+          dw, rows, cols, gemma, guard);
       return cudaGetLastError();
     });
   });
@@ -285,24 +304,24 @@ cudaError_t rope(DType dtype, const void* x, void* y, const void* cos_, const vo
 }
 
 cudaError_t gated_act_forward(DType dtype, const void* g, const void* u, void* h, int64_t n, int act, int sm_count,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, int32_t* guard) {
   if (n == 0) return cudaSuccess;
   return by_dtype(dtype, [&](auto tt) {
     using T = decltype(tt);
     gated_act_fwd_kernel<T><<<fused_grid(n, sm_count), kFusedThreads, 0, stream>>>(
-        static_cast<const T*>(g), static_cast<const T*>(u), static_cast<T*>(h), n, act);
+        static_cast<const T*>(g), static_cast<const T*>(u), static_cast<T*>(h), n, act, guard);
     return cudaGetLastError();
   });
 }
 
 cudaError_t gated_act_backward(DType dtype, const void* dh, const void* g, const void* u, void* dg, void* du, int64_t n,
-                               int act, int sm_count, cudaStream_t stream) {
+                               int act, int sm_count, cudaStream_t stream, int32_t* guard) {
   if (n == 0) return cudaSuccess;
   return by_dtype(dtype, [&](auto tt) {
     using T = decltype(tt);
     gated_act_bwd_kernel<T><<<fused_grid(n, sm_count), kFusedThreads, 0, stream>>>(
         static_cast<const T*>(dh), static_cast<const T*>(g), static_cast<const T*>(u), static_cast<T*>(dg),
-        static_cast<T*>(du), n, act);
+        static_cast<T*>(du), n, act, guard);
     return cudaGetLastError();
   });
 }

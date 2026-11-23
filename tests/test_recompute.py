@@ -75,7 +75,9 @@ def test_recompute_count_balances_link_and_compute():
     assert recompute_count(10, 11, 0.0, 8.0, 100.0) == 0
 
 
-def test_auto_recompute_engages_only_under_memory_pressure():
+def test_auto_recompute_engages_only_under_memory_pressure(monkeypatch):
+    # the pressure meant is VRAM; how much host RAM is free on this machine now must not decide it
+    monkeypatch.setattr(ActivationOffloader, "_host_ram_blocks", staticmethod(lambda blk: 1 << 30))
     base = make()
     # weights fit: auto never recomputes
     _, _, info = run(copy.deepcopy(base), activation_offload="auto", n=6)

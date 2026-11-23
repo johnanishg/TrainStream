@@ -38,6 +38,7 @@ update waits for that DMA to finish reading.
 
 from __future__ import annotations
 
+import itertools
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 import torch
@@ -45,7 +46,7 @@ from torch import nn
 
 from . import _C
 from .optimizer import physical_ram_bytes
-from .disk import is_on_disk
+from .disk import file_of, is_on_disk, sync as disk_sync
 from .quant import make_quantized, quantized_of
 
 
@@ -86,10 +87,14 @@ def pageable_params(model: nn.Module, blocks: Sequence[nn.Module], indices: Iter
     return out
 
 
+_PAGER_UIDS = itertools.count(1)  # tells one pager's staged disk blocks from another's
+
+
 class ParamPager:
     def __init__(self, model: nn.Module, blocks: Sequence[nn.Module], optimizer, paged: Iterable[int] = (), *,
                  candidates: Optional[Dict[int, List[nn.Parameter]]] = None,
-                 frozen_init: Optional[Dict[int, torch.Tensor]] = None, prefetch_depth: int = 1, disk=None):
+                 frozen_init: Optional[Dict[int, torch.Tensor]] = None, prefetch_depth: int = 1, disk=None,
+                 disk_lookahead="auto"):
         self.model = model
         self.disk = disk  # trainstream.disk.DiskStore: where frozen weights over the pin budget go, if set
         self.frozen_disk_bytes = 0
@@ -97,6 +102,13 @@ class ParamPager:
         self.n = len(self.blocks)
         self.opt = optimizer
         self.depth = max(1, int(prefetch_depth))
+        # Disk-backed weights: how many paged blocks ahead of the running one have their files
+        # read into pinned staging memory. The first `depth` of them are also copied to VRAM
+        # (the ordinary prefetch); the rest wait in host memory, so the SSD is always at
+        # least one block ahead of the PCIe copy.
+        self.disk_ahead = self.depth + 1 if disk_lookahead in ("auto", None) else max(self.depth, int(disk_lookahead))
+        self._disk_slots = self.disk_ahead + 2
+        self._uid = next(_PAGER_UIDS)
         self.device = optimizer.device
         if candidates is None:
             candidates = pageable_params(model, self.blocks, range(self.n))
@@ -129,7 +141,9 @@ class ParamPager:
         self.allocated = {i: True for i in range(self.n)}
         self.fresh = {i: False for i in range(self.n)}
         self.events: Dict[int, object] = {}
-        self.stats = dict(loads=0, load_bytes=0, bounce_bytes=0, peer_bytes=0, releases=0, pages=0, unpages=0)
+        self._also: Dict[int, list] = {}  # per block: events of other streams that also fed it
+        self.stats = dict(loads=0, load_bytes=0, bounce_bytes=0, disk_bytes=0, peer_bytes=0, releases=0, pages=0,
+                          unpages=0)
         self.peer = None  # trainstream.peer.PeerPool: frozen weights other GPUs hold for this one
         frozen_init = frozen_init if frozen_init is not None else {}
         self._shared_frozen: Dict[int, torch.Tensor] = {}
@@ -171,11 +185,45 @@ class ParamPager:
     def _resort(self) -> None:
         self._sorted = sorted(self.paged)
 
-    def _next_paged(self, i: int) -> List[int]:
-        return [j for j in self._sorted if j > i][: self.depth]
+    def _next_paged(self, i: int, n: Optional[int] = None) -> List[int]:
+        return [j for j in self._sorted if j > i][: self.depth if n is None else n]
 
-    def _prev_paged(self, i: int) -> List[int]:
-        return [j for j in reversed(self._sorted) if j < i][: self.depth]
+    def _prev_paged(self, i: int, n: Optional[int] = None) -> List[int]:
+        return [j for j in reversed(self._sorted) if j < i][: self.depth if n is None else n]
+
+    # -- disk-backed weights --------------------------------------------------------
+    def _disk_files(self, i: int) -> list:
+        """[(entry index, path, offset, nbytes)] for block i's frozen weights that live in
+        DiskStore files and are read from there (not quantized, not held by a peer GPU)."""
+        out = []
+        if not self.frozen_disk_bytes:
+            return out
+        for k, (p, slot, nbytes) in enumerate(self._entries[i]):
+            if slot is not None or id(p) in self._quant:
+                continue
+            host = self._host_frozen.get(id(p))
+            if host is None or getattr(host, "_ts_pinned", True):
+                continue
+            if self.peer is not None and self.peer.source(id(p), "w") is not None:
+                continue
+            where = file_of(host)
+            if where is not None:
+                out.append((k, where[0], where[1], where[2]))
+        return out
+
+    def _stage(self, i: int, files: list):
+        """Block i's files on their way into (or already in) a pinned staging slot."""
+        return _C.disk_stage([f[1] for f in files], [f[2] for f in files], [f[3] for f in files],
+                             self._uid * 65536 + i, self.device.index or 0, self._disk_slots)
+
+    def prepare(self, i: int) -> None:
+        """Start reading block i's disk-backed weights into pinned host memory. Takes no VRAM
+        and never waits: load(i) later finds the bytes there (or still arriving)."""
+        if i not in self.paged or self.fresh[i]:
+            return
+        files = self._disk_files(i)
+        if files:
+            self._stage(i, files)
 
     def _share_frozen(self, local, frozen_init) -> None:
         """Data parallel on one machine: every rank maps the same host copy of
@@ -371,7 +419,10 @@ class ParamPager:
         keep = list(self._keep.get(i, [])) if only_native else []
         dev = self.device.index or 0
         bounce_dst, bounce_src = [], []
-        for p, slot, nbytes in entries:
+        disk_files = [] if only_native else self._disk_files(i)
+        on_disk = {f[0] for f in disk_files}
+        disk_dst = []
+        for k, (p, slot, nbytes) in enumerate(entries):
             qw = self._quant.get(id(p))
             native = qw is not None and getattr(qw, "native", False)
             if (only_native and not native) or self._resident_trainable(i, slot):
@@ -392,12 +443,18 @@ class ParamPager:
                 if via_peer:  # on this GPU (H2D stream, in order) before the expansion reads it
                     q, s, last = self._peer_packed(p, qw, after)
                     keep.extend((q, s))
+                    if native:
+                        qw._staged = (q, s)
                 else:
                     q = qw.dev_q if near else qw.host_q
                     s = qw.dev_absmax if near else qw.host_absmax
                 if qw.blockscaled:
                     last, held = _C.dequantize_blockscaled_async(p.detach().view(qw.shape[0], -1), q, s, qw.kind,
                                                                  qw.global_decode, after)
+                    if native and len(held) == 2:
+                        # the packed bytes just copied in for this expansion (backward): a forward
+                        # run again in backward (fused.GatedFrontFn) multiplies them as they are
+                        qw._staged = (held[0], held[1])
                 else:
                     last, held = _C.dequantize_async(p.detach().view(-1), q, s, qw.kind, qw.block_size, after)
                 keep.extend(held)
@@ -410,6 +467,10 @@ class ParamPager:
                 last = _C.peer_copy_async(p.detach().view(-1), base, off, src_dev, after)
                 self.stats["peer_bytes"] += nbytes
                 continue
+            if k in on_disk:  # read from its file, not through the mapping (below)
+                disk_dst.append(p.detach().view(-1))
+                self.stats["load_bytes"] += nbytes
+                continue
             src = self._source(p, slot)
             if getattr(src, "_ts_pinned", True):
                 last = _C.h2d_async(p.detach().view(-1), src, after)
@@ -420,9 +481,20 @@ class ParamPager:
         if bounce_dst:
             last = _C.h2d_bounce_async(bounce_dst, bounce_src, after, self.depth + 2)
             self.stats["bounce_bytes"] += sum(t.numel() * t.element_size() for t in bounce_src)
+        h2d_last = last  # what the H2D stream copied for this block (the trained weights among it)
+        if not only_native:
+            self._also.pop(i, None)
+        if disk_dst:
+            # Unbuffered asynchronous reads into a pinned slot (begun by prepare() a block or
+            # more ago, or just now), then DMA on the disk stream, which waits for the reads
+            # itself: this thread does not.
+            last = _C.h2d_disk_async(disk_dst, self._stage(i, disk_files), after)
+            self.stats["disk_bytes"] += sum(f[3] for f in disk_files)
+            if h2d_last is not None:
+                self._also[i] = [h2d_last]  # two streams fed this block: its consumer waits for both
         self._keep[i] = keep  # staging copies of far packed bytes, alive until the event
-        for s in slots:
-            self.opt.engine.set_ready(s, last)  # the next update waits until this read is done
+        for s in slots:  # the next update waits until this read (on the H2D stream) is done
+            self.opt.engine.set_ready(s, h2d_last if h2d_last is not None else last)
         self.events[i] = last
         self.fresh[i] = True
         if expand_native:
@@ -444,6 +516,8 @@ class ParamPager:
         ev = self.events.get(i)
         if ev is not None:
             ev.wait()  # compute stream waits for the copy (the host does not)
+        for other in self._also.get(i, ()):
+            other.wait()
 
     def release(self, i: int) -> None:
         if i not in self.paged or not self.allocated[i]:
@@ -458,6 +532,7 @@ class ParamPager:
                 qw._staged = None
         self._native_expanded[i] = False
         self._keep.pop(i, None)
+        self._also.pop(i, None)
         self.allocated[i] = False
         self.fresh[i] = False
         self.stats["releases"] += 1
@@ -504,6 +579,9 @@ class ParamPager:
                 self.wait(i)
             for j in self._next_paged(i):
                 self.load(j)
+            if self.frozen_disk_bytes:
+                for j in self._next_paged(i, self.disk_ahead)[self.depth:]:
+                    self.prepare(j)  # the SSD runs ahead of the PCIe prefetch
         return hook
 
     def _make_post(self, i: int):
@@ -531,6 +609,9 @@ class ParamPager:
             self.wait(i)
         for j in self._prev_paged(i):
             self.load(j)
+        if self.frozen_disk_bytes:
+            for j in self._prev_paged(i, self.disk_ahead)[self.depth:]:
+                self.prepare(j)
         for j in self._sorted:
             if j > i:
                 self.release(j)
@@ -597,13 +678,19 @@ class ParamPager:
                 elif slot is not None:
                     self.opt.engine.sync_host_from_param(slot)
                 else:
-                    self._host_frozen[id(p)].copy_(p.detach().reshape(-1))
+                    host = self._host_frozen[id(p)]
+                    host.copy_(p.detach().reshape(-1))
+                    if is_on_disk(host):
+                        disk_sync(host)  # through the mapping: on the device before the next unbuffered read
             self.release(i)
         return hook
 
     def remove(self, materialize: bool = True) -> None:
         if materialize:
             self.materialize()
+        if self.stats["disk_bytes"]:
+            torch.cuda.current_stream(self.device).synchronize()
+            _C.disk_release(self.device.index or 0)  # the pinned staging slots
         for h in self._handles:
             h.remove()
         self._handles.clear()

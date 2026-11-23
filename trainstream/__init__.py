@@ -28,6 +28,7 @@ except ImportError:
     _C = _build.load()  # compiled on first import, then loaded from the cache
     sys.modules[__name__ + "._C"] = _C
 
+from .checkpoint import CheckpointHandle, load_checkpoint, read_checkpoint, save_checkpoint
 from .hooks import ActivationOffloader, GradientOffloader, ParamReadyHooks, find_blocks
 from .kvcache import PagedKVCache
 from .losses import causal_lm_loss, chunked_cross_entropy, dpo_loss, sequence_logprobs
@@ -35,10 +36,10 @@ from .optimizer import OffloadAdamW
 from .paging import ParamPager
 from .profiler import HardwareProfile, profile_hardware
 from .packing import PackedCollator, pack_sequences
-from .quant import init_lora_from_error, quantize_model
+from .quant import init_lora_from_error, pissa_to_lora, quantize_model
 from .wrapper import TrainStreamSession, memory_report, unwrap, wrap
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "wrap",
@@ -65,6 +66,11 @@ __all__ = [
     "pack_sequences",
     "PackedCollator",
     "init_lora_from_error",
+    "pissa_to_lora",
+    "save_checkpoint",
+    "load_checkpoint",
+    "read_checkpoint",
+    "CheckpointHandle",
 ]
 
 

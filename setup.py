@@ -31,11 +31,15 @@ if os.environ.get("TRAINSTREAM_PURE_WHEEL"):  # force the compile-on-import whee
 
 
 def _arch_list():
+    # Consumer Blackwell (12.x) is compiled with its full feature set ("12.0a"): the block-scaled
+    # FP4 tensor-core instruction of gemm_fp4_kernel.cu only exists there. TRAINSTREAM_NO_FP4=1
+    # leaves it out (a CUDA toolkit whose assembler does not know the instruction).
     if os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return os.environ["TORCH_CUDA_ARCH_LIST"]
     if torch is not None and torch.cuda.is_available():
         caps = sorted({torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
-        return ";".join(f"{major}.{minor}" for major, minor in caps)
+        feat = not os.environ.get("TRAINSTREAM_NO_FP4")
+        return ";".join(f"{major}.{minor}" + ("a" if feat and major == 12 else "") for major, minor in caps)
     return "8.0;8.6;8.9;9.0;12.0"
 
 
@@ -49,6 +53,10 @@ if torch is not None:
     nvcc_flags = ["-O3", "--use_fast_math", "-lineinfo", "--expt-relaxed-constexpr"]
     if sys.platform == "win32":
         nvcc_flags += ["-Xcompiler", "/wd4819"]
+    if not os.environ.get("TRAINSTREAM_NO_FP4") and any(
+            a.strip().startswith("12.") and a.strip().split("+")[0].endswith("a")
+            for a in os.environ["TORCH_CUDA_ARCH_LIST"].split(";")):
+        nvcc_flags.append("-DTS_FP4_MMA=1")  # compiles the FP4 tensor-core kernel in
     ext_modules = [CUDAExtension(
         name="trainstream._C",
         sources=[
@@ -62,6 +70,12 @@ if torch is not None:
             "trainstream/csrc/fused_kernel.cu",
             "trainstream/csrc/shm.cpp",
             "trainstream/csrc/peer.cpp",
+            "trainstream/csrc/guard.cpp",
+            "trainstream/csrc/aio.cpp",
+            "trainstream/csrc/disk.cpp",
+            "trainstream/csrc/ckpt.cpp",
+            "trainstream/csrc/ring.cpp",
+            "trainstream/csrc/gemm_fp4_kernel.cu",
         ],
         include_dirs=[os.path.join(HERE, "trainstream", "csrc")],
         extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
@@ -73,7 +87,7 @@ with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="trainstream",
-    version="0.7.0",
+    version="0.8.0",
     author="John Anish G",
     license="Apache-2.0",
     description="Zero-dependency PyTorch training offload: optimizer, gradients, activations and weights to host RAM, with a memory planner and built-in int8/NF4/FP8/NVFP4 quantization.",

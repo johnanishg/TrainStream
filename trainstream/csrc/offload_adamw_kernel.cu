@@ -84,11 +84,17 @@ __global__ void __launch_bounds__(kThreads)
     adamw_zero_copy_kernel(T* __restrict__ param, const T* __restrict__ grad,
                            M* __restrict__ exp_avg, M* __restrict__ exp_avg_sq,
                            float* __restrict__ master, int64_t n, AdamWParams hp,
-                           const float* __restrict__ grad_sq_norm, uint32_t seed) {
+                           const float* __restrict__ grad_sq_norm, uint32_t seed, int32_t* guard) {
   float clip = 1.0f;
   if (grad_sq_norm != nullptr) {
-    const float norm = sqrtf(*grad_sq_norm);
-    clip = fminf(1.0f, hp.max_grad_norm / (norm + 1e-6f));
+    const float sq = *grad_sq_norm;
+    // NaN / Inf somewhere in this step's gradients: every tensor's kernel takes
+    // this exit, so the weights and moments stay exactly as they were.
+    if (guard != nullptr && (__float_as_uint(sq) & 0x7f800000u) == 0x7f800000u) {
+      if (blockIdx.x == 0 && threadIdx.x == 0) guard[kGuardOptimizer] = 1;
+      return;
+    }
+    if (hp.max_grad_norm > 0.0f) clip = fminf(1.0f, hp.max_grad_norm / (sqrtf(sq) + 1e-6f));
   }
   const float decay = 1.0f - hp.lr * hp.weight_decay;
   const float one_minus_b1 = 1.0f - hp.beta1;
@@ -156,20 +162,82 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// |x| in [0, 448] -> e4m3 (sign, 4-bit exponent biased by 7, 3-bit mantissa; the "fn" variant:
+// no infinities, largest value 448), rounded stochastically with the random bits r.
+__device__ __forceinline__ uint8_t e4m3_stochastic(float x, uint32_t r) {
+  const uint32_t sign = (__float_as_uint(x) >> 24) & 0x80u;
+  const float v = fabsf(x);
+  uint32_t code;
+  if (v < 0.015625f) {  // below 2^-6: the subnormal steps of 2^-9
+    const float q = v * 512.0f;  // [0, 8)
+    code = static_cast<uint32_t>(q);
+    if (static_cast<float>(r >> 8) * (1.0f / 16777216.0f) < q - static_cast<float>(code)) code += 1;  // 8: 2^-6
+  } else {
+    // adding random bits below the kept mantissa rounds up with the right probability, and a
+    // mantissa that overflows carries into the exponent
+    const uint32_t bits = __float_as_uint(v) + (r & 0xfffffu);
+    const int e = static_cast<int>((bits >> 23) & 0xffu) - 127;  // -6 .. 8 (9 after a carry at the top)
+    code = (static_cast<uint32_t>(e + 7) << 3) | ((bits >> 20) & 7u);
+    if (code > 0x7eu) code = 0x7eu;  // 448
+  }
+  return static_cast<uint8_t>(code | sign);
+}
+
+// One CUDA block per 256-value block of the gradient: its largest magnitude, then every value
+// relative to it.
+template <typename T>
+__global__ void __launch_bounds__(kThreads)
+    grad_fp8_kernel(const T* __restrict__ grad, int64_t n, uint8_t* __restrict__ codes, float* __restrict__ scales,
+                    uint32_t seed) {
+  __shared__ float warp_max[kThreads / 32];
+  __shared__ float inv_scale;
+  const int64_t nblocks = (n + kThreads - 1) / kThreads;
+  for (int64_t blk = blockIdx.x; blk < nblocks; blk += gridDim.x) {
+    const int64_t i = blk * kThreads + threadIdx.x;
+    const float x = i < n ? Cvt<T>::load(grad[i]) : 0.0f;
+    // NaN / Inf count as an infinite magnitude (a bit test: fast-math comparisons cannot be trusted with NaN)
+    float a = (__float_as_uint(x) & 0x7f800000u) == 0x7f800000u ? __uint_as_float(0x7f800000u) : fabsf(x);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = a;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float m = warp_max[0];
+#pragma unroll
+      for (int w = 1; w < kThreads / 32; ++w) m = fmaxf(m, warp_max[w]);
+      const bool bad = (__float_as_uint(m) & 0x7f800000u) == 0x7f800000u;
+      scales[blk] = bad ? __uint_as_float(0x7fc00000u) : m * (1.0f / 448.0f);
+      inv_scale = (bad || m == 0.0f) ? 0.0f : 448.0f / m;
+    }
+    __syncthreads();
+    if (i < n) codes[i] = e4m3_stochastic(x * inv_scale, mix32(static_cast<uint32_t>(i) * 0x9e3779b1u ^ seed));
+    __syncthreads();  // inv_scale and warp_max are reused by the next block
+  }
+}
+
+template <typename T>
+cudaError_t launch_grad_fp8(const void* grad, int64_t n, uint8_t* codes, float* scales, uint32_t seed, int sm_count,
+                            cudaStream_t stream) {
+  if (n == 0) return cudaSuccess;
+  const int grid = grid_for(n, kThreads, sm_count);
+  grad_fp8_kernel<T><<<grid, kThreads, 0, stream>>>(static_cast<const T*>(grad), n, codes, scales, seed);
+  return cudaGetLastError();
+}
+
 template <typename T>
 cudaError_t launch_adamw(void* param, const void* grad, void* m, void* v, float* master,
                          int64_t n, const AdamWParams& hp, const float* norm, int sm_count,
-                         cudaStream_t stream, bool bf16_moments, uint32_t seed) {
+                         cudaStream_t stream, bool bf16_moments, uint32_t seed, int32_t* guard) {
   if (n == 0) return cudaSuccess;
   const int grid = grid_for(n, kThreads * kUnroll, sm_count);
   if (bf16_moments) {
     adamw_zero_copy_kernel<T, __nv_bfloat16><<<grid, kThreads, 0, stream>>>(
         static_cast<T*>(param), static_cast<const T*>(grad), static_cast<__nv_bfloat16*>(m),
-        static_cast<__nv_bfloat16*>(v), master, n, hp, norm, seed);
+        static_cast<__nv_bfloat16*>(v), master, n, hp, norm, seed, guard);
   } else {
     adamw_zero_copy_kernel<T, float><<<grid, kThreads, 0, stream>>>(
         static_cast<T*>(param), static_cast<const T*>(grad), static_cast<float*>(m),
-        static_cast<float*>(v), master, n, hp, norm, seed);
+        static_cast<float*>(v), master, n, hp, norm, seed, guard);
   }
   return cudaGetLastError();
 }
@@ -188,17 +256,30 @@ cudaError_t launch_sq_norm(const void* grad, int64_t n, float* out, int sm_count
 cudaError_t adamw_zero_copy(DType dtype, void* param, const void* grad, void* exp_avg,
                             void* exp_avg_sq, float* master, int64_t n,
                             const AdamWParams& hp, const float* grad_sq_norm, int sm_count,
-                            cudaStream_t stream, bool bf16_moments, uint32_t seed) {
+                            cudaStream_t stream, bool bf16_moments, uint32_t seed, int32_t* guard) {
   switch (dtype) {
     case DType::kFloat32:
       return launch_adamw<float>(param, grad, exp_avg, exp_avg_sq, master, n, hp, grad_sq_norm,
-                                 sm_count, stream, bf16_moments, seed);
+                                 sm_count, stream, bf16_moments, seed, guard);
     case DType::kFloat16:
       return launch_adamw<__half>(param, grad, exp_avg, exp_avg_sq, master, n, hp, grad_sq_norm,
-                                  sm_count, stream, bf16_moments, seed);
+                                  sm_count, stream, bf16_moments, seed, guard);
     case DType::kBFloat16:
       return launch_adamw<__nv_bfloat16>(param, grad, exp_avg, exp_avg_sq, master, n, hp,
-                                         grad_sq_norm, sm_count, stream, bf16_moments, seed);
+                                         grad_sq_norm, sm_count, stream, bf16_moments, seed, guard);
+  }
+  return cudaErrorInvalidValue;
+}
+
+cudaError_t grad_fp8_encode(DType dtype, const void* grad, int64_t n, uint8_t* codes, float* scales, uint32_t seed,
+                            int sm_count, cudaStream_t stream) {
+  switch (dtype) {
+    case DType::kFloat32:
+      return launch_grad_fp8<float>(grad, n, codes, scales, seed, sm_count, stream);
+    case DType::kFloat16:
+      return launch_grad_fp8<__half>(grad, n, codes, scales, seed, sm_count, stream);
+    case DType::kBFloat16:
+      return launch_grad_fp8<__nv_bfloat16>(grad, n, codes, scales, seed, sm_count, stream);
   }
   return cudaErrorInvalidValue;
 }

@@ -26,8 +26,9 @@ import torch
 NAME = "trainstream_C"
 CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 SOURCES = ["bindings.cpp", "memory_pinner.cpp", "offload_adamw.cpp", "offload_adamw_kernel.cu",
-           "quant.cpp", "quant_kernel.cu", "fused.cpp", "fused_kernel.cu", "shm.cpp", "peer.cpp"]
-HEADERS = ["kernels.h", "offload_adamw.h", "trainstream.h"]
+           "quant.cpp", "quant_kernel.cu", "fused.cpp", "fused_kernel.cu", "shm.cpp", "peer.cpp",
+           "guard.cpp", "aio.cpp", "disk.cpp", "ckpt.cpp", "ring.cpp", "gemm_fp4_kernel.cu"]
+HEADERS = ["kernels.h", "offload_adamw.h", "trainstream.h", "aio.h"]
 
 if sys.platform == "win32":
     CXX_FLAGS = ["/O2", "/EHsc", "/W3", "/wd4244", "/wd4267", "/wd4251", "/wd4275", "/wd4996"]
@@ -53,11 +54,22 @@ def _cache_root():
     return os.path.join(base, "trainstream")
 
 
-def _arch_list():
+def _arch_list(fp4=True):
+    """The architectures to compile for. Consumer Blackwell (12.x) is compiled with its full
+    feature set ("12.0a"): the block-scaled FP4 tensor-core instruction of gemm_fp4_kernel.cu
+    only exists there. fp4=False (or TRAINSTREAM_NO_FP4=1) gives the plain list, for a CUDA
+    toolkit whose assembler does not know that instruction."""
     if os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return os.environ["TORCH_CUDA_ARCH_LIST"]
     caps = sorted({torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
-    return ";".join(f"{major}.{minor}" for major, minor in caps)
+    feat = fp4 and not os.environ.get("TRAINSTREAM_NO_FP4")
+    return ";".join(f"{major}.{minor}" + ("a" if feat and major == 12 else "") for major, minor in caps)
+
+
+def _nvcc_flags(arch):
+    """NVCC_FLAGS, plus the switch that compiles the FP4 kernel in when a 12.x "a" target is built."""
+    fp4 = any(a.strip().startswith("12.") and a.strip().split("+")[0].endswith("a") for a in arch.split(";"))
+    return NVCC_FLAGS + (["-DTS_FP4_MMA=1"] if fp4 and not os.environ.get("TRAINSTREAM_NO_FP4") else [])
 
 
 def _build_key(arch):
@@ -66,7 +78,7 @@ def _build_key(arch):
         with open(os.path.join(CSRC, f), "rb") as fh:
             h.update(f.encode() + b"\0" + fh.read())
     h.update(repr((sys.version_info[:2], torch.__version__, torch.version.cuda, arch,
-                   CXX_FLAGS, NVCC_FLAGS)).encode())
+                   CXX_FLAGS, _nvcc_flags(arch))).encode())
     tag = f"py{sys.version_info[0]}{sys.version_info[1]}-torch{torch.__version__}"
     return re.sub(r"[^A-Za-z0-9_.-]", "_", tag) + "-" + h.hexdigest()[:12]
 
@@ -166,18 +178,20 @@ def load():
         raise BuildError("TrainStream needs an NVIDIA GPU, but torch.cuda.is_available() is False "
                          "(set TORCH_CUDA_ARCH_LIST to compile without one).")
 
+    user_arch = os.environ.get("TORCH_CUDA_ARCH_LIST")
     arch = _arch_list()
-    build_dir = os.path.join(_cache_root(), _build_key(arch))
-    library = os.path.join(build_dir, NAME + LIB_EXT)
-    if os.path.isfile(library):
-        return _import_library(library)
+    plain = _arch_list(fp4=False)
+    # a build without the FP4 kernel, cached by an earlier import whose toolkit could not assemble it
+    for candidate in dict.fromkeys((arch, plain)):
+        library = os.path.join(_cache_root(), _build_key(candidate), NAME + LIB_EXT)
+        marker = os.path.join(_cache_root(), _build_key(arch), "no-fp4")
+        if os.path.isfile(library) and (candidate == arch or os.path.isfile(marker)):
+            return _import_library(library)
 
-    os.makedirs(build_dir, exist_ok=True)
     _setup_ninja()
     _setup_cuda_home()
     if sys.platform == "win32":
         _setup_msvc()
-    os.environ["TORCH_CUDA_ARCH_LIST"] = arch
 
     from torch.utils import cpp_extension
     if os.environ.get("CUDA_HOME"):
@@ -186,20 +200,44 @@ def load():
         raise BuildError("TrainStream could not find the CUDA toolkit (nvcc). " + _hint()
                          + " Set CUDA_HOME if it is installed somewhere unusual.")
 
-    print(f"TrainStream: compiling its CUDA extension for torch {torch.__version__} "
-          f"(first import only, takes a few minutes; cached in {build_dir})", file=sys.stderr, flush=True)
+    def compile_for(target):
+        build_dir = os.path.join(_cache_root(), _build_key(target))
+        os.makedirs(build_dir, exist_ok=True)
+        os.environ["TORCH_CUDA_ARCH_LIST"] = target
+        print(f"TrainStream: compiling its CUDA extension for torch {torch.__version__} "
+              f"(first import only, takes a few minutes; cached in {build_dir})", file=sys.stderr, flush=True)
+        try:
+            return cpp_extension.load(
+                name=NAME,
+                sources=[os.path.join(CSRC, f) for f in SOURCES],
+                extra_include_paths=[CSRC],
+                extra_cflags=CXX_FLAGS,
+                extra_cuda_cflags=_nvcc_flags(target),
+                build_directory=build_dir,
+                verbose=bool(os.environ.get("TRAINSTREAM_VERBOSE_BUILD")),
+            )
+        finally:
+            if user_arch is None:
+                os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+            else:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = user_arch
+
     try:
-        module = cpp_extension.load(
-            name=NAME,
-            sources=[os.path.join(CSRC, f) for f in SOURCES],
-            extra_include_paths=[CSRC],
-            extra_cflags=CXX_FLAGS,
-            extra_cuda_cflags=NVCC_FLAGS,
-            build_directory=build_dir,
-            verbose=bool(os.environ.get("TRAINSTREAM_VERBOSE_BUILD")),
-        )
+        module = compile_for(arch)
     except Exception as exc:
-        raise BuildError(f"TrainStream failed to compile its CUDA extension. {_hint()}\n"
-                         f"Set TRAINSTREAM_VERBOSE_BUILD=1 to see the full compiler output.\n{exc}") from exc
+        if plain == arch:
+            raise BuildError(f"TrainStream failed to compile its CUDA extension. {_hint()}\n"
+                             f"Set TRAINSTREAM_VERBOSE_BUILD=1 to see the full compiler output.\n{exc}") from exc
+        # Most likely a CUDA toolkit that cannot assemble Blackwell's FP4 tensor-core instruction:
+        # everything else builds without it (wrap(fused_gemm=True) is then unavailable).
+        print("TrainStream: the build with the FP4 tensor-core kernel failed; building without it "
+              "(set TRAINSTREAM_VERBOSE_BUILD=1 to see why).", file=sys.stderr, flush=True)
+        try:
+            module = compile_for(plain)
+        except Exception as exc2:
+            raise BuildError(f"TrainStream failed to compile its CUDA extension. {_hint()}\n"
+                             f"Set TRAINSTREAM_VERBOSE_BUILD=1 to see the full compiler output.\n{exc2}") from exc2
+        with open(os.path.join(_cache_root(), _build_key(arch), "no-fp4"), "w") as fh:
+            fh.write("the FP4 kernel did not compile with this toolkit; the build without it is used\n")
     print("TrainStream: build finished.", file=sys.stderr, flush=True)
     return module

@@ -35,18 +35,22 @@ import sys
 import sysconfig
 import time
 
-FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4", "nvfp4-w", "nvfp4-o", "nf4-k", "nf4-l", "nvfp4-l", "nf4-dq", "nvfp4-b"]
+FORMATS = ["none", "int8", "nf4", "fp8", "nvfp4", "nvfp4-w", "nvfp4-o", "nf4-k", "nf4-l", "nvfp4-l", "nf4-dq", "nvfp4-b",
+           "nf4-p", "nvfp4-p"]
 # variants of a stored format: nvfp4-w multiplies expanded weights (no activation
 # quantization: what 4-bit weights alone cost), nvfp4-o keeps 1% of the input
 # channels in bf16 on the tensor-core path (wrap(outliers=0.01)); nf4-k keeps the
 # matrices NF4 hurts most as int8 (keep_precise="auto"); nf4-l / nvfp4-l start the
 # LoRA adapters at the weights' quantization error (LoftQ: error_rank=16, the LoRA
 # rank); nf4-dq stores NF4's block scales in one byte each (double_quant); nvfp4-b computes
-# the input gradients in nvfp4 too (nvfp4_backward)
+# the input gradients in nvfp4 too (nvfp4_backward); nf4-p / nvfp4-p start the LoRA adapters
+# at the weights' principal part and quantize the rest (PiSSA: lora_init="pissa", rank 16)
 VARIANTS = {"nvfp4-w": ("nvfp4", {"weights_only": True}), "nvfp4-o": ("nvfp4", {"outliers": 0.01}),
             "nf4-k": ("nf4", {"keep_precise": "auto"}), "nf4-l": ("nf4", {"error_rank": 16}),
             "nvfp4-l": ("nvfp4", {"error_rank": 16}), "nf4-dq": ("nf4", {"double_quant": True}),
-            "nvfp4-b": ("nvfp4", {"nvfp4_backward": True})}
+            "nvfp4-b": ("nvfp4", {"nvfp4_backward": True}),
+            "nf4-p": ("nf4", {"error_rank": 16, "lora_init": "pissa"}),
+            "nvfp4-p": ("nvfp4", {"error_rank": 16, "lora_init": "pissa"})}
 SETTLE = 1  # steps after TrainStream's last change left out of the step time, as in compare.py
 
 
@@ -116,7 +120,8 @@ def _worker(args):
     live(args, "phase", phase="loading", env=env)
     t0 = time.time()
     model = load_model(args.model, quantize=kind, keep_precise=extra.get("keep_precise", 0),
-                       error_rank=extra.get("error_rank", 0), double_quant=extra.get("double_quant", False))
+                       error_rank=extra.get("error_rank", 0), double_quant=extra.get("double_quant", False),
+                       lora_init=extra.get("lora_init", "loftq"))
     model = peft.get_peft_model(model, peft.LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.0, task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))

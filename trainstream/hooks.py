@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import statistics
+import threading
 import time
 import types
 import weakref
@@ -170,13 +171,80 @@ def _real_bytes(t: torch.Tensor) -> int:
     return n
 
 
+# ---------------------------------------------------------------------------
+# Chunked return of a paged activation
+# ---------------------------------------------------------------------------
+# A large activation comes back from host RAM as several back-to-back copies
+# with an event after each. Most consumers just wait for the last one. One that
+# can work row range by row range (the fused LoRA backward's weight gradient,
+# trainstream.lora) announces itself with chunk_consumer(): the saved tensor is
+# then handed over without waiting for the whole copy, together with its
+# (row end, event) list, and the consumer starts on the rows that have landed
+# while the rest are still crossing PCIe.
+CHUNK_MIN_BYTES = 4 << 20   # "auto": no piece smaller than this
+CHUNK_MAX = 8               # "auto": at most this many pieces
+CHUNK_STATS = dict(tensors=0, pieces=0, overlapped=0)  # fetched in pieces / pieces / consumed while arriving
+_chunk_tls = threading.local()
+
+
+class chunk_consumer:
+    """While active on this thread, a saved tensor that is returning from host RAM in pieces is
+    handed over as soon as its memory exists; take(t) then gives its [(row end, event)] (rows
+    of t.reshape(-1, t.shape[-1])), or None for a tensor that is simply there. The consumer must
+    wait on a piece's event before reading its rows, and on the last event before it returns;
+    wait_rest() does the latter for every tensor it did not take."""
+
+    def __enter__(self):
+        self._prev = getattr(_chunk_tls, "sink", None)
+        self._found: Dict[int, list] = {}
+        _chunk_tls.sink = self._found
+        return self
+
+    def __exit__(self, *exc):
+        _chunk_tls.sink = self._prev
+        return False
+
+    def take(self, t: torch.Tensor):
+        """t's [(row end, event)], which the caller now waits on piece by piece, or None."""
+        return self._found.pop(t.untyped_storage()._cdata, None)
+
+    def wait_rest(self) -> None:
+        """Every other tensor handed over in pieces is read whole: the compute stream waits for it."""
+        for chunks in self._found.values():
+            chunks[-1][1].wait()
+        self._found.clear()
+
+
+def chunk_plan(shape, itemsize: int, chunks) -> Optional[list]:
+    """Row ends of the pieces a contiguous tensor of `shape` is fetched in, or None for one copy.
+    chunks: "auto" (pieces of at least CHUNK_MIN_BYTES, at most CHUNK_MAX), an int (that many,
+    for tensors of at least 2 MiB) or False / None / 0 / 1 (never)."""
+    if chunks in (False, None, 0, 1) or len(shape) < 2:
+        return None
+    cols = int(shape[-1])
+    rows = 1
+    for s in shape[:-1]:
+        rows *= int(s)
+    nbytes = rows * cols * itemsize
+    if chunks == "auto":
+        n = min(CHUNK_MAX, nbytes // CHUNK_MIN_BYTES)
+    else:
+        n = int(chunks) if nbytes >= (2 << 20) else 1
+    n = min(n, rows)
+    if n < 2:
+        return None
+    return sorted({max(1, (rows * k) // n) for k in range(1, n)} | {rows})
+
+
 class _Packed:
     """A saved activation that now lives in pinned host memory."""
 
     __slots__ = ("session", "block", "host", "d2h", "src", "gpu", "gpu_ref", "ready", "device", "size", "stride",
-                 "__weakref__")
+                 "plan", "chunks", "__weakref__")
 
-    def __init__(self, session, block, host, d2h, device, size, stride, src):
+    def __init__(self, session, block, host, d2h, device, size, stride, src, plan=None):
+        self.plan = plan      # row ends when the tensor comes back in pieces (chunk_plan)
+        self.chunks = None    # [(row end, event)] of the copy in flight or landed
         self.session = session
         self.block = block
         self.host = host
@@ -190,7 +258,16 @@ class _Packed:
         self.stride = stride
 
     def fetch(self):
-        return _C.h2d_alloc_async(self.host, self.d2h, self.device, self.size, self.stride)
+        if self.plan is None:
+            self.chunks = None
+            return _C.h2d_alloc_async(self.host, self.d2h, self.device, self.size, self.stride)
+        row_bytes = self.host.numel() * self.host.element_size() // self.plan[-1]
+        t, events = _C.h2d_alloc_chunked_async(self.host, self.d2h, self.device, self.size,
+                                               [r * row_bytes for r in self.plan])
+        self.chunks = list(zip(self.plan, events))
+        CHUNK_STATS["tensors"] += 1
+        CHUNK_STATS["pieces"] += len(events)
+        return t, events[-1]
 
     def release_src(self) -> bool:
         if self.src is not None and self.d2h.query():
@@ -251,21 +328,37 @@ def recompute_count(offloaded: int, blocks: int, fwd_ms: float, link_ms: float, 
     return int(min(max(round(r), 0), offloaded))
 
 
+_recompute_tls = threading.local()
+
+
+def in_block_recompute() -> bool:
+    """True while a block that TrainStream recomputes in backward is running, in its forward
+    pass and in its recomputation alike. Code that chooses what to keep for backward must
+    choose the same both times (torch.utils.checkpoint compares the two runs), and inside such
+    a block nothing is kept anyway."""
+    return getattr(_recompute_tls, "depth", 0) > 0
+
+
 def _checkpointed_forward(self, *args, **kwargs):
     """A block forward that saves nothing for backward and runs again there."""
     import torch.utils.checkpoint as cp
-    order = getattr(self, "_ts_sdpa_order", None)
-    if order is None:
-        return cp.checkpoint(type(self).forward, self, *args, use_reentrant=False, **kwargs)
-    return cp.checkpoint(_forward_with_sdpa_order, self, order, *args, use_reentrant=False, **kwargs)
+    return cp.checkpoint(_block_forward, self, getattr(self, "_ts_sdpa_order", None), *args, use_reentrant=False,
+                         **kwargs)
 
 
-def _forward_with_sdpa_order(module, order, *args, **kwargs):
-    """The block's forward under the session's attention-backend order, so the
-    recomputation in backward picks the same kernels as the original forward."""
-    from torch.nn.attention import sdpa_kernel
-    with sdpa_kernel(order, set_priority=True):
-        return type(module).forward(module, *args, **kwargs)
+def _block_forward(module, order, *args, **kwargs):
+    """The block's own forward, marked as running inside a recomputed block, and under the
+    session's attention-backend order (when there is one), so the recomputation in backward
+    picks the same kernels as the original forward."""
+    _recompute_tls.depth = getattr(_recompute_tls, "depth", 0) + 1
+    try:
+        if order is None:
+            return type(module).forward(module, *args, **kwargs)
+        from torch.nn.attention import sdpa_kernel
+        with sdpa_kernel(order, set_priority=True):
+            return type(module).forward(module, *args, **kwargs)
+    finally:
+        _recompute_tls.depth -= 1
 
 
 class ActivationOffloader:
@@ -326,10 +419,12 @@ class ActivationOffloader:
         recompute="auto",
         memory_pressure: bool = False,
         vram_target: Optional[int] = None,
+        chunks="auto",
     ):
         self.model = model
         self.blocks = list(blocks)
         self.n = len(self.blocks)
+        self.chunks = chunks  # how large activations come back from host RAM (chunk_plan)
         self.min_bytes = int(min_bytes)
         self.depth = max(1, int(prefetch_depth))
         self.profile = profile
@@ -393,6 +488,9 @@ class ActivationOffloader:
         self._probe_block: Optional[int] = None
         self._probe_forced = False
         self.block_bytes = 0  # measured saved activations of one block
+        # per block, this pass: bytes a gated MLP did not keep for backward because the block's
+        # activations are paged (trainstream.fused). A block moved back to VRAM keeps them again.
+        self._unkept: Dict[int, int] = {}
         self.weights_paged: Optional[Callable[[], bool]] = None  # set by the session: are weights streamed now?
         # Blocks that "auto" chose to page or recompute may later be kept in
         # VRAM instead (keep_resident); explicit choices are left alone.
@@ -499,6 +597,7 @@ class ActivationOffloader:
         self._last_fwd = now
         self.stats["forwards"] += 1
         self._guard_host_ram()
+        self._unkept = {}
         self._session = _Session(self.n)
         if self.phase == "probe":
             self._probe_steps += 1
@@ -602,7 +701,8 @@ class ActivationOffloader:
         src = _dense_like(t)
         host = _C.pinned_empty([src.numel()], src.dtype, "activations", False, True)
         d2h = _C.d2h_async(host, src)
-        packed = _Packed(session, b, host, d2h, t.device.index, list(src.shape), list(src.stride()), src)
+        plan = chunk_plan(src.shape, src.element_size(), self.chunks) if src.is_contiguous() else None
+        packed = _Packed(session, b, host, d2h, t.device.index, list(src.shape), list(src.stride()), src, plan)
         session.blocks[b].append(weakref.ref(packed))
         self._inflight.append((weakref.ref(packed), nbytes))
         self._inflight_bytes += nbytes
@@ -638,7 +738,12 @@ class ActivationOffloader:
                 t, obj.ready = obj.fetch()
                 obj.gpu_ref = weakref.ref(t)
                 self.stats["prefetch_misses"] += 1
-        obj.ready.wait()  # compute stream waits on the H2D event (host does not)
+        sink = getattr(_chunk_tls, "sink", None)
+        if sink is not None and obj.chunks is not None:
+            # a consumer that works piece by piece: it waits on each piece's event itself
+            sink[t.untyped_storage()._cdata] = obj.chunks
+        else:
+            obj.ready.wait()  # compute stream waits on the H2D event (host does not)
         return t
 
     def _stage(self, session: _Session, b: int) -> None:
@@ -873,6 +978,25 @@ class ActivationOffloader:
         self.events.append(f"activations: host RAM available fell to {avail / 2**30:.1f} GiB, under the "
                            f"{floor / 2**30:.1f} GiB floor; {len(moved)} more blocks recomputed instead of paged "
                            f"({len(self.offload)} still paged)")
+
+    def paging_now(self) -> bool:
+        """Whether the block running now sends what it keeps for backward to host RAM (and this
+        is not the step that measures the activations with all of them kept in view)."""
+        b = self._block
+        return b is not None and not self.calibrating and self.phase != "probe" and b in self.offload
+
+    def note_unkept(self, nbytes: int) -> None:
+        """A gated MLP of the running block kept `nbytes` less for backward than it would with
+        its activations in VRAM (its gate / up outputs, recomputed instead of paged)."""
+        b = self._block
+        if b is not None:
+            self._unkept[b] = self._unkept.get(b, 0) + int(nbytes)
+
+    @property
+    def unkept_block_bytes(self) -> int:
+        """The most any block left out that way in the last forward pass: what a block kept in
+        VRAM would hold on top of block_bytes."""
+        return max(self._unkept.values()) if self._unkept else 0
 
     def keep_resident(self, k: int) -> List[int]:
         """Keep the activations of up to k blocks that "auto" pages or

@@ -181,6 +181,7 @@ Runtime::Runtime(int dev) : device(dev) {
   TS_CUDA_CHECK(cudaStreamCreateWithPriority(&h2d, cudaStreamNonBlocking, greatest));
   TS_CUDA_CHECK(cudaStreamCreateWithPriority(&d2h, cudaStreamNonBlocking, least));
   TS_CUDA_CHECK(cudaStreamCreateWithPriority(&upd, cudaStreamNonBlocking, least));
+  TS_CUDA_CHECK(cudaStreamCreateWithPriority(&disk, cudaStreamNonBlocking, greatest));
 }
 
 int resolve_device(int device) {
@@ -820,6 +821,44 @@ std::tuple<at::Tensor, EventPtr> h2d_alloc_async(const at::Tensor& src, const Ev
   rt.bytes_h2d += bytes;
   rt.copies_h2d += 1;
   return {dst, done};
+}
+
+std::tuple<at::Tensor, std::vector<EventPtr>> h2d_alloc_chunked_async(const at::Tensor& src, const EventPtr& after,
+                                                                      int device, const std::vector<int64_t>& sizes,
+                                                                      const std::vector<int64_t>& bounds) {
+  TORCH_CHECK(src.device().is_cpu() && src.is_contiguous(),
+              "h2d_alloc_chunked_async: src must be a contiguous (pinned) CPU tensor");
+  const int dev = resolve_device(device);
+  Runtime& rt = runtime(dev);
+  c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(dev));
+  const auto opts =
+      at::TensorOptions().dtype(src.scalar_type()).device(at::Device(at::kCUDA, static_cast<c10::DeviceIndex>(dev)));
+  at::Tensor dst = at::empty(sizes.empty() ? src.sizes().vec() : sizes, opts);  // from the compute stream's pool
+  TORCH_CHECK(dst.numel() == src.numel(), "h2d_alloc_chunked_async: the layout must hold the host buffer's numel");
+  const int64_t bytes = static_cast<int64_t>(src.nbytes());
+  TORCH_CHECK(!bounds.empty() && bounds.back() == bytes, "h2d_alloc_chunked_async: the last bound must be the size (",
+              bytes, " bytes)");
+  auto freed = make_event(dev);
+  freed->record(compute_stream(dev));
+  freed->block(rt.h2d);
+  if (after) after->block(rt.h2d);
+  std::vector<EventPtr> events;
+  const char* s = static_cast<const char*>(src.data_ptr());
+  char* d = static_cast<char*>(dst.data_ptr());
+  int64_t at_byte = 0;
+  for (int64_t end : bounds) {
+    TORCH_CHECK(end >= at_byte && end <= bytes, "h2d_alloc_chunked_async: bounds must increase");
+    if (end > at_byte)
+      TS_CUDA_CHECK(cudaMemcpyAsync(d + at_byte, s + at_byte, static_cast<size_t>(end - at_byte),
+                                    cudaMemcpyHostToDevice, rt.h2d));
+    auto ev = make_event(dev);
+    ev->record(rt.h2d);
+    events.push_back(std::move(ev));
+    at_byte = end;
+  }
+  rt.bytes_h2d += static_cast<uint64_t>(bytes);
+  rt.copies_h2d += 1;
+  return {dst, events};
 }
 
 // ---------------------------------------------------------------------------

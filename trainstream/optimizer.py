@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import sys
 import threading
+import warnings
 from typing import Dict, List, Optional
 
 import torch
@@ -34,6 +36,20 @@ def physical_ram_bytes() -> int:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (OSError, ValueError, AttributeError):
         return 0
+
+
+# nan_guard: this many optimizer steps skipped in a row end the run with an
+# error instead of a training loop that silently does nothing.
+NAN_GUARD_LIMIT = 50
+
+
+def _total_grad_norm(params) -> torch.Tensor:
+    """Global L2 norm of the params' gradients, as a 0-d tensor on their device."""
+    grads = [p.grad for p in params]
+    fn = getattr(torch.nn.utils, "get_total_norm", None)
+    if fn is not None:
+        return fn(grads)
+    return torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g) for g in grads]))
 
 
 # Tensor attributes and methods that never read a parameter's values: the
@@ -109,7 +125,36 @@ class OffloadAdamW(torch.optim.Optimizer):
 
     distributed=True (cpu mode, torch.distributed initialized): data parallel.
     Parameters are broadcast from rank 0, and every gradient is averaged across
-    ranks on the host (over a gloo group) before its update.
+    ranks on the host before its update, as soon as its last micro-batch has
+    arrived there, so the reduction runs beside the rest of backward.
+    distributed_backend picks how: "auto" (default) through shared memory when
+    every rank is on this machine, else over a TCP ring (trainstream.ring: each
+    rank sends 2 (N - 1) / N of a gradient whatever N is, and every rank ends
+    with the same bits); "ring" the ring always; "gloo" torch.distributed's own
+    all_reduce instead of the ring.
+
+    fp8_gradients=True (cpu mode): gradients cross PCIe as one byte per value
+    (the e4m3 code of value / scale, torch.float8_e4m3fn's bits, with an fp32
+    scale per 256 values) instead of two (bf16) or four (fp32), and are
+    expanded into the fp32 accumulator on the host: half or a quarter of the
+    gradient traffic and of its pinned staging memory. e4m3 has three mantissa
+    bits, so each value is off by up to 12.5 %; it is rounded stochastically
+    on the GPU, up or down with the probabilities that make its expected value
+    exact, so the error is zero-mean noise that Adam's moving averages smooth.
+    Values far below their block's largest (more than 2^14 times smaller) come
+    out as zero or one small step, still right on average. Not bit-exact with
+    fp32 gradients; default False.
+
+    nan_guard=True (default): a step whose gradients hold a NaN or Inf is
+    skipped as a whole. Weights, moments and step counts stay exactly as they
+    were, the gradients are dropped, a warning names the step, and training
+    goes on with the next batch; ``skipped_steps`` counts them. Fifty skipped
+    steps in a row raise FloatingPointError (the weights or the data are
+    broken, not one batch). The check needs every gradient of the step before
+    any update runs, so eager updates are off while the guard is on (and each
+    trained value keeps a 4-byte host accumulator, as with clipping);
+    nan_guard=False restores them. Under data parallel the verdict is taken
+    from the averaged gradients, so every rank skips the same steps.
 
     Hyper-parameters and update math match torch.optim.AdamW (amsgrad and
     maximize are not supported). Works standalone (step() then blocks until the
@@ -135,6 +180,9 @@ class OffloadAdamW(torch.optim.Optimizer):
         pin_moments: Optional[bool] = None,
         moment_dtype: str = "float32",
         distributed: bool = False,
+        distributed_backend: str = "auto",
+        nan_guard: bool = True,
+        fp8_gradients: bool = False,
         _broadcast: bool = True,
         _paged: Optional[set] = None,
         _host_init: Optional[Dict[int, torch.Tensor]] = None,
@@ -149,12 +197,17 @@ class OffloadAdamW(torch.optim.Optimizer):
             moment_dtype = "int8"
         if moment_dtype not in ("float32", "bfloat16", "int8"):
             raise ValueError(f"moment_dtype must be 'float32', 'bfloat16' or 'int8', got {moment_dtype!r}")
+        if fp8_gradients and mode != "cpu":
+            raise ValueError("fp8_gradients needs mode='cpu' (in gpu mode gradients never leave VRAM)")
         if moment_dtype == "int8" and mode != "cpu":
             raise ValueError("8-bit moments (moment_dtype='int8') need mode='cpu' (host AdamW)")
         if not 0.0 <= lr:
             raise ValueError(f"invalid learning rate {lr}")
         if not (0.0 <= betas[0] < 1.0 and 0.0 <= betas[1] < 1.0):
             raise ValueError(f"invalid betas {betas}")
+        if distributed_backend not in ("auto", "ring", "gloo"):
+            raise ValueError(f"distributed_backend must be 'auto', 'ring' or 'gloo', got {distributed_backend!r}")
+        self.distributed_backend = distributed_backend
         if distributed and mode != "cpu":
             raise ValueError("distributed=True requires mode='cpu' (gradients are averaged on the host)")
         if _paged and mode != "cpu":
@@ -177,6 +230,17 @@ class OffloadAdamW(torch.optim.Optimizer):
         self.compute_grad_norm = compute_grad_norm
         self.accumulation_steps = max(1, int(accumulation_steps))
         self.eager = eager
+        self.nan_guard = bool(nan_guard)
+        self.fp8_gradients = bool(fp8_gradients)
+        if eager and self.nan_guard:
+            warnings.warn("TrainStream: eager=True has no effect while nan_guard is on (a guarded step updates "
+                          "nothing until all of its gradients have been checked); pass nan_guard=False for eager "
+                          "updates.", RuntimeWarning, stacklevel=2)
+        self._ckpt_events: list = []  # resident mode: D2H copies of a checkpoint still reading the weights
+        self._ckpt_last = None        # the last background checkpoint (trainstream.checkpoint)
+        self._skips_base = 0     # skipped steps of engines that are gone (rebuilt, resident)
+        self._skips_seen = 0     # ... already reported
+        self._resident_streak = 0
         self.moment_dtype = moment_dtype
         self._threads = int(threads or 0)
         self._chunk = int(chunk_elems)
@@ -203,6 +267,9 @@ class OffloadAdamW(torch.optim.Optimizer):
         self.pin_moments = self._decide_pinning(params, self.mode, self._pin_request, self.moment_dtype)
         self.engine = _C.OffloadAdamWEngine(self.device.index or 0, self.mode, self._threads, self._chunk,
                                             self.moment_dtype)
+        self.engine.set_nan_guard(self.nan_guard)
+        if self.fp8_gradients:
+            self.engine.set_fp8_gradients(True)
         self._slot_of: Dict[int, int] = {}
         self._slot_params: List[torch.Tensor] = []
         self._slot_group: List[dict] = []
@@ -260,7 +327,7 @@ class OffloadAdamW(torch.optim.Optimizer):
         model was moved or cast), carrying the optimizer state across."""
         state = self._suspended if self._suspended is not None else self.state_dict()
         self.detach()
-        self.engine = None
+        self._drop_engine()
         self._suspended = None
         params = [p for g in self.param_groups for p in g["params"] if p.requires_grad]
         self.device = device or params[0].device
@@ -271,6 +338,11 @@ class OffloadAdamW(torch.optim.Optimizer):
         """The model left the GPU: keep the state on the host, drop the engine."""
         self._suspended = self.state_dict()
         self.detach()
+        self._drop_engine()
+
+    def _drop_engine(self) -> None:
+        if self.engine is not None:
+            self._skips_base += int(self.engine.skipped_steps(True))
         self.engine = None
 
     # -- attachment --------------------------------------------------------------
@@ -324,7 +396,7 @@ class OffloadAdamW(torch.optim.Optimizer):
 
     @property
     def eager_active(self) -> bool:
-        if self.mode != "cpu" or not self.attached or self._dp is not None:
+        if self.mode != "cpu" or not self.attached or self._dp is not None or self.nan_guard:
             return False
         if self.eager is not None:
             return bool(self.eager) and not self.max_grad_norm
@@ -427,14 +499,28 @@ class OffloadAdamW(torch.optim.Optimizer):
                     dist.broadcast(host, src=0, group=group)
                     p.copy_(host)
         self._dp = {"group": group, "world": world, "queue": queue.Queue(), "error": None,
-                    "local": None, "shm_reduce": None}
+                    "local": None, "shm_reduce": None, "ring": None, "backend": "gloo"}
         from . import shared
         if shared.enabled():
             local = shared.LocalGroup(group, world, dist.get_rank())
             if local.single_node:  # every rank on this machine: share host RAM
                 self._dp["local"] = local
-                cap = max((p.numel() for g in self.param_groups for p in g["params"] if p.requires_grad), default=1)
-                self._dp["shm_reduce"] = shared.ShmAllReduce(local, cap)
+                if self.distributed_backend != "ring":
+                    cap = max((p.numel() for g in self.param_groups for p in g["params"] if p.requires_grad),
+                              default=1)
+                    self._dp["shm_reduce"] = shared.ShmAllReduce(local, cap)
+                    self._dp["backend"] = "shm"
+        if self._dp["shm_reduce"] is None and self.distributed_backend != "gloo" and world > 1:
+            from .ring import RingAllReduce
+            # collective: either every rank gets its two connections, or all of them use gloo
+            ring = RingAllReduce.connect(group, world, dist.get_rank())
+            if ring is None and self.distributed_backend == "ring":
+                raise RuntimeError("TrainStream: distributed_backend='ring', but the ranks could not connect to "
+                                   "each other over TCP (see trainstream.ring; TRAINSTREAM_RING_HOST names the "
+                                   "address a rank is reached at)")
+            self._dp["ring"] = ring
+            if ring is not None:
+                self._dp["backend"] = "ring"
         t = threading.Thread(target=self._reduce_loop, name="trainstream-allreduce", daemon=True)
         self._dp["thread"] = t
         t.start()
@@ -450,12 +536,15 @@ class OffloadAdamW(torch.optim.Optimizer):
                 return
             try:
                 buf = self.engine.grad_buffer(slot)  # waits for this slot's accumulation
-                shm = dp["shm_reduce"]
-                if shm is not None and buf.dtype == torch.float32 and buf.is_contiguous():
+                shm, ring = dp["shm_reduce"], dp["ring"]
+                plain = buf.dtype == torch.float32 and buf.is_contiguous()
+                if shm is not None and plain:
                     shm(buf)  # through shared memory, same order on every rank (backward order)
+                elif ring is not None and plain:
+                    ring(buf)  # around the TCP ring, the same order on every rank
                 else:
                     dist.all_reduce(buf, group=dp["group"])
-                if not self.max_grad_norm and not self.compute_grad_norm:
+                if not self.max_grad_norm and not self.compute_grad_norm and not self.nan_guard:
                     g = self._slot_group[slot]
                     self.engine.update_slot(slot, float(g["lr"]), float(g["betas"][0]), float(g["betas"][1]),
                                             float(g["eps"]), float(g["weight_decay"]), 1.0 / dp["world"])
@@ -510,8 +599,11 @@ class OffloadAdamW(torch.optim.Optimizer):
             wds.append(float(group["weight_decay"]))
 
         self._micro = [0] * len(self._slot_params)
+        # Data parallel + guard: the norm of the averaged gradients is the verdict,
+        # so it is the same on every rank.
+        want_norm = bool(self.compute_grad_norm) or (self._dp is not None and self.nan_guard)
         norm = self.engine.step(ids, lrs, b1s, b2s, epss, wds, grads,
-                                float(self.max_grad_norm or 0.0), bool(self.compute_grad_norm), scale)
+                                float(self.max_grad_norm or 0.0), want_norm, scale)
         if norm >= 0:
             self._last_norm = norm
         for slot in ids:
@@ -523,6 +615,7 @@ class OffloadAdamW(torch.optim.Optimizer):
             self.engine.synchronize()
             self._pending_ids.clear()
             self._pending_ptrs.clear()
+        self._report_skips(fatal=True)
         if self._post_step_cb is not None:
             self._post_step_cb()
         return loss
@@ -533,11 +626,84 @@ class OffloadAdamW(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         params = [p for g in self.param_groups for p in g["params"] if p.grad is not None]
-        if self.max_grad_norm or self.compute_grad_norm:
+        if self.nan_guard and params:
+            total = _total_grad_norm(params)
+            self._last_norm = float(total)  # the one host sync the guard costs here
+            if not math.isfinite(self._last_norm):
+                self._skips_base += 1
+                self._resident_streak += 1
+                self._report_skips(fatal=True)
+                return loss  # nothing touched; the caller's zero_grad() drops the gradients
+            self._resident_streak = 0
+            if self.max_grad_norm:
+                coef = self.max_grad_norm / (self._last_norm + 1e-6)
+                if coef < 1.0:
+                    for p in params:
+                        p.grad.mul_(coef)
+        elif self.max_grad_norm or self.compute_grad_norm:
             total = torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm or float("inf"))
             self._last_norm = float(total)
+        if self._ckpt_events:
+            # a background checkpoint is still copying these weights and moments out of VRAM:
+            # the update waits for those copies on the GPU (this thread does not)
+            for ev in self._ckpt_events:
+                ev.wait()
+            self._ckpt_events = []
         self._resident.step()
         return loss
+
+    # -- checkpoints ---------------------------------------------------------------
+    def save_async(self, path: str, extra: Optional[dict] = None, model: Optional[nn.Module] = None):
+        """Write the trained parameters and this optimizer's state to `path` on a background
+        thread and return a CheckpointHandle at once: trainstream.save_checkpoint(model, self,
+        path, extra=extra). Training goes on meanwhile; see trainstream.checkpoint."""
+        from .checkpoint import save_checkpoint
+        return save_checkpoint(model, self, path, extra=extra)
+
+    # -- non-finite guard ------------------------------------------------------
+    @property
+    def skipped_steps(self) -> int:
+        """Optimizer steps the non-finite guard has dropped. A step still in
+        flight is counted once its gradients have been checked; call
+        synchronize() first for an exact count."""
+        n = self._skips_base
+        if self.engine is not None:
+            n += int(self.engine.skipped_steps(False))
+        return n
+
+    def set_nan_guard(self, on: bool) -> None:
+        """Switch the non-finite guard on or off (see the class docstring)."""
+        self.nan_guard = bool(on)
+        if self.engine is not None:
+            self.engine.set_nan_guard(self.nan_guard)
+
+    def _report_skips(self, fatal: bool = False) -> None:
+        """One warning per skipped step (a step late in the asynchronous modes,
+        where a step's verdict is known once its last gradient has been
+        checked) and, from step() (`fatal`), an error for a run that does
+        nothing but skip."""
+        if not self.nan_guard:
+            return
+        total = self.skipped_steps
+        if total > self._skips_seen:
+            new, self._skips_seen = total - self._skips_seen, total
+            try:
+                flags = _C.guard_read(self.device.index or 0, True)
+                seen = sorted(k for k, v in flags.items() if v)
+            except RuntimeError:
+                seen = []
+            where = f"; kernels that saw a non-finite value: {', '.join(seen)}" if seen else ""
+            warnings.warn(f"TrainStream: skipped {new} optimizer step{'s' if new > 1 else ''} with non-finite "
+                          f"gradients ({total} so far{where}). Weights, moments and step counts are unchanged.",
+                          RuntimeWarning, stacklevel=3)
+        streak = self._resident_streak
+        if self._resident is None and self.engine is not None:
+            streak = int(self.engine.consecutive_skips(False))
+        if fatal and streak >= NAN_GUARD_LIMIT:
+            raise FloatingPointError(
+                f"TrainStream: {streak} optimizer steps in a row had non-finite gradients and were skipped. "
+                "The weights or the data are broken, not a single batch: lower the learning rate, check the "
+                "inputs, or use a more precise quantization. (nan_guard=False turns the guard off.)")
 
     def _go_resident(self) -> None:
         """Switch to torch.optim.AdamW(fused=True) with all state in VRAM.
@@ -554,7 +720,7 @@ class OffloadAdamW(torch.optim.Optimizer):
                 _, m, v = self.engine.state(slot)
                 moved[id(p)] = (step, m.view(p.shape).to(p.device, p.dtype), v.view(p.shape).to(p.device, p.dtype))
         self.detach()
-        self.engine = None
+        self._drop_engine()
         inner = torch.optim.AdamW(self.param_groups, fused=True)  # shares our group dicts
         for p in self._slot_params:
             if id(p) in moved:
@@ -588,6 +754,7 @@ class OffloadAdamW(torch.optim.Optimizer):
             self.engine.synchronize()
         self._pending_ids.clear()
         self._pending_ptrs.clear()
+        self._report_skips()
 
     @property
     def last_grad_norm(self) -> Optional[float]:
@@ -598,10 +765,18 @@ class OffloadAdamW(torch.optim.Optimizer):
 
     def stats(self) -> dict:
         if self.engine is None:
-            return {"mode": "resident" if self._resident is not None else "suspended"}
+            return {"mode": "resident" if self._resident is not None else "suspended",
+                    "nan_guard": self.nan_guard, "skipped_steps": self.skipped_steps}
         s = dict(self.engine.stats())
         s["mode"] = self.mode
         s["moment_dtype"] = self.moment_dtype
+        s["nan_guard"] = self.nan_guard
+        if self._dp is not None:
+            s["distributed_backend"] = self._dp["backend"]
+            if self._dp["ring"] is not None:
+                s["ring"] = self._dp["ring"].stats()
+        s["fp8_gradients"] = self.fp8_gradients
+        s["skipped_steps"] = self.skipped_steps
         if self._grad_hooks is not None:
             s["grad_hook_calls"] = self._grad_hooks.calls
         if self._guard is not None:

@@ -22,7 +22,8 @@ core ``trainstream`` package does not.
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 from torch import nn
@@ -77,10 +78,54 @@ def _owner(model: nn.Module, name: str) -> nn.Module:
 PACKED_SUFFIXES = (".weight", ".weight_scale", ".weight_scale_2", ".input_scale")  # ModelOpt NVFP4 export
 
 
+def _load_bytes(params, elig, quantize, prequant, esize, block, double_quant, keep_frac, error_rank,
+                lora_targets) -> int:
+    """Host bytes load_model's result will hold: quantized matrices packed (plus the
+    keep_precise allowance and LoftQ / PiSSA factors), everything else at esize."""
+    from trainstream import quant as Q
+
+    kind = "nvfp4" if prequant else quantize if quantize in Q.KINDS else None
+    total = 0
+    for name, p in params.items():
+        if kind is None or name not in elig:
+            total += p.numel() * esize
+            continue
+        shape = tuple(p.shape)
+        total += int(Q.packed_bytes(p.numel(), kind, block, shape, double_quant=double_quant) * (1 + keep_frac))
+        if error_rank and not prequant and Q.targets_match(name, lora_targets):
+            total += int(error_rank) * (shape[0] + p.numel() // shape[0]) * esize
+    return total
+
+
+def _too_large(need: int, have: int, quantize, prequant) -> str:
+    """load_model's refusal: the model against RAM, and against RAM and VRAM combined."""
+    vram = 0
+    try:
+        if torch.cuda.is_available():
+            vram = torch.cuda.mem_get_info()[0]
+    except RuntimeError:
+        pass
+    fmt = "as stored (NVFP4)" if prequant else ("in bf16 / the checkpoint's dtype" if quantize == "none"
+                                                else f"quantized to {quantize}")
+    gib = lambda b: f"{b / 2**30:.1f} GiB"  # noqa: E731
+    if need > have + vram:
+        head = (f"TrainStream: the model exceeds RAM and VRAM combined. It needs about {gib(need)} {fmt}; "
+                f"RAM available {gib(have)} + VRAM free {gib(vram)} = {gib(have + vram)}.")
+    else:
+        head = (f"TrainStream: the model exceeds the available RAM. It needs about {gib(need)} {fmt}, but "
+                f"only {gib(have)} of RAM is available (VRAM free: {gib(vram)}). load_model holds the whole "
+                f"model in RAM before wrap() moves part of it to the GPU, so the rest would go to the OS "
+                f"page file on the SSD.")
+    return (head + " Nothing was loaded. Options: a smaller model; a smaller format (quantize='nf4', "
+            "double_quant=True); close other programs to free RAM; or disk_offload=<directory on an SSD> "
+            "(opt-in: the weights are written there once, then only read). check_memory=False loads anyway.")
+
+
 def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch.bfloat16,
                quant_block_size: int = 64, keep_precise=0, error_rank: int = 0, error_iters: int = 1,
+               lora_init: str = "loftq", lora_targets: Optional[Sequence[str]] = None,
                double_quant: bool = False, disk_offload: Optional[str] = None,
-               random_weights: bool = False, ram_fraction: float = 0.85,
+               random_weights: bool = False, ram_fraction: float = 0.85, check_memory: bool = True,
                trust_remote_code: bool = False, **config_overrides) -> nn.Module:
     """Load a causal LM for TrainStream training, streaming its checkpoint.
 
@@ -111,11 +156,25 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     fraction of extra bytes ("auto": 0.05; default 0: none). ``error_rank`` /
     ``error_iters`` (LoftQ): each quantized matrix also keeps a rank-``error_rank``
     approximation of what quantization lost; ``wrap()`` starts the PEFT LoRA
-    adapters added on top at it (see trainstream.wrap). ``double_quant``: nf4 / int8
+    adapters added on top at it (see trainstream.wrap). ``lora_init="pissa"`` (with
+    ``error_rank`` = the r of the LoRA adapters you will add): each matrix is split,
+    as it is read, into its rank-``error_rank`` principal part, which wrap() starts
+    the adapter at, and the rest, which is what gets quantized (PiSSA; see
+    trainstream.wrap). Only matrices that will carry an adapter may be split:
+    ``lora_targets`` names them (module-name suffixes, the same list as
+    ``LoraConfig.target_modules``; None: every quantized matrix); wrap() raises if a
+    split matrix has no adapter. ``double_quant``: nf4 / int8
     block scales stored in one byte each (see trainstream.wrap). ``disk_offload``: a
     directory; decoder-layer matrices that aren't quantized are written to
     memory-mapped files there as they're read (trainstream.disk), so a base
     larger than RAM loads, and wrap() streams them from there.
+
+    ``check_memory`` (default True): before anything is read, the weights'
+    size in the chosen format is compared with the RAM available; a model
+    that doesn't fit raises MemoryError, saying whether it exceeds RAM and
+    VRAM combined, instead of loading into the OS page file (swap) on the
+    SSD. The whole model is held in RAM until wrap() moves part of it to the
+    GPU, so RAM alone is the limit here. Skipped with ``disk_offload``.
     """
     import os
 
@@ -131,6 +190,8 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
     if quantize not in ("auto", "none") + Q.KINDS:
         raise ValueError(f"quantize must be 'auto', 'none', 'int8', 'nf4', 'fp8' or 'nvfp4', got {quantize!r}")
     Q._check("nf4", quant_block_size)
+    if Q.check_lora_init(lora_init) == "pissa" and not error_rank:
+        raise ValueError("lora_init='pissa' needs error_rank = the rank r of the LoRA adapters to be added")
     keep_frac = Q.keep_fraction(keep_precise)
     cfg = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
     qc = getattr(cfg, "quantization_config", None) or {}
@@ -161,6 +222,12 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
                 if rest + sum(Q.packed_bytes(params[n].numel(), kind, quant_block_size) for n in elig) <= room:
                     quantize = kind
                     break
+    if check_memory and not disk_offload:
+        need = _load_bytes(params, elig, quantize, prequant, esize, quant_block_size, double_quant, keep_frac,
+                           error_rank, lora_targets)
+        have = available_ram_bytes() // local_processes()
+        if have and need > have:  # refused before a byte is read: nothing spills into the OS page file
+            raise MemoryError(_too_large(need, have, quantize, prequant))
     ram = physical_ram_bytes()
     pin_budget = int(0.40 * ram) if ram else 1 << 62
     qcount = 0
@@ -181,10 +248,11 @@ def load_model(name_or_path: str, *, quantize="auto", dtype: torch.dtype = torch
             if keep_frac and kind == quantize and quantize in Q.KEEP_KIND:
                 errors.append((name, Q.quant_error(value.to(dtype), quantize, quant_block_size), value.numel(),
                                tuple(value.shape)))
+            rank = max(0, int(error_rank)) if Q.targets_match(name, lora_targets) else 0
             qw = Q.make_quantized(value.to(dtype), kind, quant_block_size,
                                   pin=_C.pinned_stats()["live_bytes"] + nb <= pin_budget,
-                                  error_rank=max(0, int(error_rank)), error_iters=max(1, int(error_iters)),
-                                  double_quant=bool(double_quant))
+                                  error_rank=rank, error_iters=max(1, int(error_iters)),
+                                  double_quant=bool(double_quant), lora_init=lora_init)
             holder = nn.Parameter(torch.empty(tuple(value.shape), dtype=dtype), requires_grad=False)
             Q.attach(holder, qw)
             module._parameters[attr] = holder
@@ -439,6 +507,9 @@ class TrainStreamCache(_HFCache if _HFCache is not None else object):
         super().__init__(layers=[_PagedKVLayer(self.kv, i) for i in range(self.kv.num_layers)])
 
 
+CHECKPOINT_NAME = "trainstream.ckpt"  # async_checkpoint: the optimizer state inside a Trainer checkpoint folder
+
+
 class TrainStreamMetrics:
     """TrainStream memory / transfer metrics for log lines.
 
@@ -500,6 +571,14 @@ class TrainStreamTrainer(Trainer):
     Models with soft-capped or scaled logits, label smoothing, or a custom
     ``compute_loss_func`` use the stock loss.
 
+    ``trainstream={"async_checkpoint": True}``: the Trainer's checkpoints keep
+    their layout, except that the optimizer state (fp32 master weights and both
+    moments: most of a checkpoint's bytes) is written by a background thread
+    to ``trainstream.ckpt`` in the checkpoint folder instead of being pickled
+    into ``optimizer.pt`` on the training thread (trainstream.checkpoint), so
+    training goes on while it is written. ``train(resume_from_checkpoint=...)``
+    reads either. ``train()`` returns once the last one is complete.
+
     A model passed on the CPU is placed by ``trainstream.wrap`` when training
     starts: with ``param_offload`` ("auto" pages when the weights would take
     more than half the GPU) its decoder-layer weights stay in host RAM and are
@@ -522,6 +601,8 @@ class TrainStreamTrainer(Trainer):
         self.chunked_loss = bool(self.trainstream_config.pop("chunked_loss", True))
         self.loss_chunk_size = int(self.trainstream_config.pop("loss_chunk_size", 1024))
         packing = self.trainstream_config.pop("packing", False)
+        self.async_checkpoint = bool(self.trainstream_config.pop("async_checkpoint", False))
+        self.last_checkpoint = None  # CheckpointHandle of the latest background checkpoint
         self.chunked_loss_used = 0
         self.ts_optimizer: Optional[OffloadAdamW] = None
         super().__init__(*args, **kwargs)
@@ -629,8 +710,35 @@ class TrainStreamTrainer(Trainer):
         self._sync()
         return super()._save_checkpoint(model, trial)
 
+    # async_checkpoint: the optimizer state goes to trainstream.ckpt on a background thread
+    def _save_optimizer_and_scheduler(self, output_dir):
+        opt = self.ts_optimizer
+        if not self.async_checkpoint or opt is None or not self.args.should_save:
+            return super()._save_optimizer_and_scheduler(output_dir)
+        from trainstream.checkpoint import save_checkpoint
+        self.last_checkpoint = save_checkpoint(self.model, opt, os.path.join(output_dir, CHECKPOINT_NAME),
+                                               extra={"global_step": int(self.state.global_step)})
+        torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        path = os.path.join(checkpoint, CHECKPOINT_NAME) if checkpoint else None
+        if path is None or not os.path.isfile(path) or self.ts_optimizer is None:
+            return super()._load_optimizer_and_scheduler(checkpoint)
+        from trainstream.checkpoint import load_checkpoint
+        load_checkpoint(path, self.model, self.ts_optimizer)
+        sched = os.path.join(checkpoint, "scheduler.pt")
+        if os.path.isfile(sched):
+            self.lr_scheduler.load_state_dict(torch.load(sched, weights_only=True))
+
     def train(self, *args, **kwargs):
         try:
-            return super().train(*args, **kwargs)
-        finally:
+            out = super().train(*args, **kwargs)
+        except BaseException:
             self._sync()
+            if self.last_checkpoint is not None:
+                self.last_checkpoint._job.wait()  # never leave a half-written file behind an error
+            raise
+        self._sync()
+        if self.last_checkpoint is not None:
+            self.last_checkpoint.wait()  # complete on disk (raises OSError if the write failed)
+        return out

@@ -93,6 +93,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("h2d_alloc_async", &h2d_alloc_async, py::arg("src"), py::arg("after") = EventPtr(),
         py::arg("device") = -1, py::arg("sizes") = std::vector<int64_t>{},
         py::arg("strides") = std::vector<int64_t>{});
+  m.def("h2d_alloc_chunked_async", &h2d_alloc_chunked_async, py::arg("src"), py::arg("after") = EventPtr(),
+        py::arg("device") = -1, py::arg("sizes") = std::vector<int64_t>{}, py::arg("bounds") = std::vector<int64_t>{});
   m.def("h2d_bounce_async", &h2d_bounce_async, py::arg("dsts"), py::arg("srcs"), py::arg("after") = EventPtr(),
         py::arg("slots") = 3, nogil());
   m.def("h2d_pages_async", &h2d_pages_async, py::arg("dst"), py::arg("pages"), py::arg("after") = EventPtr());
@@ -131,18 +133,100 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rope", &rope, py::arg("x"), py::arg("cos"), py::arg("sin"), py::arg("backward"));
   m.def("gated_act_forward", &gated_act_forward, py::arg("g"), py::arg("u"), py::arg("act"));
   m.def("gated_act_backward", &gated_act_backward, py::arg("dh"), py::arg("g"), py::arg("u"), py::arg("act"));
+  m.def("gemm_fp4_supported", &gemm_fp4_supported, py::arg("device") = -1,
+        "Whether this build and GPU have TrainStream's own FP4 tensor-core kernel (consumer Blackwell, sm_120).");
+  m.def("gemm_fp4_front", &gemm_fp4_front, py::arg("xq"), py::arg("xs"), py::arg("xg"), py::arg("wq"), py::arg("ws"),
+        py::arg("wg"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("xa"), py::arg("sb"), py::arg("act") = 0,
+        py::arg("want_h") = true, py::arg("want_out") = false);
   m.def("dequantize_blockscaled_cols", &dequantize_blockscaled_cols, py::arg("q"), py::arg("scales"), py::arg("idx"),
         py::arg("rows"), py::arg("cols"), py::arg("global_decode"), py::arg("dtype") = at::kBFloat16);
   m.def("dequantize_blockscaled", &dequantize_blockscaled, py::arg("dst"), py::arg("q"), py::arg("scales"),
         py::arg("kind"), py::arg("global_decode") = 1.0);
   m.def("dequantize_blockscaled_async", &dequantize_blockscaled_async, py::arg("dst"), py::arg("q"),
         py::arg("scales"), py::arg("kind"), py::arg("global_decode") = 1.0, py::arg("after") = EventPtr());
+  // ---- ring all-reduce --------------------------------------------------------------
+  py::class_<Ring>(m, "Ring")
+      .def(py::init<int64_t, int64_t, int, int, int>(), py::arg("to_next"), py::arg("from_prev"), py::arg("rank"),
+           py::arg("world"), py::arg("timeout_s") = 600)
+      .def("allreduce", &Ring::allreduce, nogil())
+      .def("stats", &Ring::stats);
+
+  // ---- disk tier ----------------------------------------------------------------
+  py::class_<DiskStage, std::shared_ptr<DiskStage>>(m, "DiskStage")
+      .def_property_readonly("ready", [](const DiskStage& s) { return disk_stage_ready(s); },
+                             "True once every read of this stage has landed in its pinned slot.")
+      .def_property_readonly("hit", [](const DiskStage& s) { return s.hit; })
+      .def_property_readonly("bytes", [](const DiskStage& s) { return s.bytes; })
+      .def_property_readonly("key", [](const DiskStage& s) { return s.key; })
+      .def("wait", [](const DiskStage& s) { disk_stage_wait(s); }, nogil());
+  m.def("disk_stage", &disk_stage, py::arg("paths"), py::arg("offsets"), py::arg("nbytes"), py::arg("key") = -1,
+        py::arg("device") = -1, py::arg("slots") = 4, nogil());
+  m.def("h2d_disk_async", &h2d_disk_async, py::arg("dsts"), py::arg("stage"), py::arg("after") = EventPtr());
+  m.def("disk_invalidate", &disk_invalidate, py::arg("device") = -1);
+  m.def("disk_release", &disk_release, py::arg("device") = -1, nogil());
+  m.def("disk_close", &disk_close, py::arg("paths") = std::vector<std::string>{});
+  m.def("disk_sync", &disk_sync, py::arg("mapped"), nogil());
+  m.def("disk_read", &disk_read, py::arg("dst"), py::arg("path"), py::arg("offset") = 0, nogil());
+  m.def("disk_backend", &disk_backend);
+  m.def("disk_stats", &disk_stats);
+
+  // ---- non-finite guard -------------------------------------------------------
+  m.def("guard_enable", &guard_enable, py::arg("on"),
+        "Switch the NaN / Inf checks inside TrainStream's fused kernels on or off (process-wide).");
+  m.def("guard_enabled", &guard_enabled);
+  m.def("guard_read",
+        [](int device, bool clear) {
+          const std::vector<int64_t> words = guard_read(device, clear);
+          std::map<std::string, int64_t> out;
+          for (size_t i = 0; i < words.size(); ++i) {
+            const std::string name = guard_word_name(static_cast<int>(i));
+            if (!name.empty()) out[name] = words[i];
+          }
+          return out;
+        },
+        py::arg("device") = -1, py::arg("clear") = false,
+        "Which kernels saw a NaN / Inf since the flags were last cleared (read from mapped host memory).");
   m.def("synchronize_streams", [](int device) {
         Runtime& rt = runtime(device);
         TS_CUDA_CHECK(cudaStreamSynchronize(rt.d2h));
         TS_CUDA_CHECK(cudaStreamSynchronize(rt.h2d));
         TS_CUDA_CHECK(cudaStreamSynchronize(rt.upd));
+        TS_CUDA_CHECK(cudaStreamSynchronize(rt.disk));
       }, py::arg("device") = -1, nogil());
+
+  // ---- background checkpoints ----------------------------------------------
+  py::class_<CheckpointJob, std::shared_ptr<CheckpointJob>>(m, "CheckpointJob")
+      .def("done", &CheckpointJob::done)
+      .def("wait", &CheckpointJob::wait, nogil())
+      .def_property_readonly("error", &CheckpointJob::error)
+      .def_property_readonly("seconds", &CheckpointJob::seconds)
+      .def_property_readonly("bytes", &CheckpointJob::bytes);
+  m.def("checkpoint_write_async",
+        [](const std::string& path, const py::bytes& header,
+           const std::vector<std::tuple<at::Tensor, int64_t, EventPtr, int64_t, bool>>& items, OffloadAdamW* engine,
+           const std::vector<int64_t>& targets, const std::optional<at::Tensor>& steps, int64_t steps_offset,
+           int device) {
+          std::vector<CheckpointItem> list;
+          for (const auto& t : items) {
+            CheckpointItem it;
+            it.data = std::get<0>(t);
+            it.offset = std::get<1>(t);
+            it.after = std::get<2>(t);
+            it.slot = std::get<3>(t);
+            it.release = std::get<4>(t);
+            list.push_back(std::move(it));
+          }
+          return checkpoint_write_async(path, std::string(header), std::move(list), engine, targets,
+                                        steps.value_or(at::Tensor()), steps_offset, device);
+        },
+        py::arg("path"), py::arg("header"), py::arg("items"), py::arg("engine") = nullptr,
+        py::arg("targets") = std::vector<int64_t>{}, py::arg("steps") = py::none(), py::arg("steps_offset") = 0,
+        py::arg("device") = -1,
+        "Write a checkpoint file on a background thread; items are (host tensor, file offset, event or None, "
+        "engine slot or -1, release the slot afterwards).");
+  m.def("decode_moment8", &decode_moment8, py::arg("codes"), py::arg("scale"), py::arg("is_m"));
+  m.def("grad_fp8_encode", &grad_fp8_encode, py::arg("grad"), py::arg("seed") = 0);
+  m.def("grad_fp8_decode", &grad_fp8_decode, py::arg("codes"), py::arg("scales"));
 
   // ---- benchmarks -----------------------------------------------------------
   m.def("benchmark_pcie", &benchmark_pcie, py::arg("device") = -1, py::arg("bytes") = 256LL << 20,
@@ -183,6 +267,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("wait_ready", &OffloadAdamW::wait_ready, nogil())
       .def("synchronize", &OffloadAdamW::synchronize, nogil())
       .def("last_grad_norm", &OffloadAdamW::last_grad_norm, nogil())
+      .def("raw_state", &OffloadAdamW::raw_state)
+      .def("load_state_raw", &OffloadAdamW::load_state_raw, py::arg("id"), py::arg("state"), py::arg("step") = 0,
+           nogil())
+      .def("checkpoint_begin", &OffloadAdamW::checkpoint_begin, nogil())
+      .def("checkpoint_end", &OffloadAdamW::checkpoint_end, nogil())
+      .def("set_nan_guard", &OffloadAdamW::set_nan_guard, nogil())
+      .def("set_fp8_gradients", &OffloadAdamW::set_fp8_gradients, nogil())
+      .def_property_readonly("fp8_gradients", &OffloadAdamW::fp8_gradients)
+      .def("skipped_steps", &OffloadAdamW::skipped_steps, py::arg("wait") = true, nogil())
+      .def("consecutive_skips", &OffloadAdamW::consecutive_skips, py::arg("wait") = true, nogil())
+      .def_property_readonly("nan_guard", &OffloadAdamW::nan_guard)
       .def("state", &OffloadAdamW::state, nogil())
       .def("load_state",
            [](OffloadAdamW& e, int64_t id, const at::Tensor& m, const at::Tensor& v,
@@ -191,7 +286,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            },
            py::arg("id"), py::arg("exp_avg"), py::arg("exp_avg_sq"), py::arg("master") = py::none(),
            py::arg("step") = 0, nogil())
-      .def("get_step", &OffloadAdamW::get_step)
+      .def("get_step", &OffloadAdamW::get_step, nogil())
       .def("stats", &OffloadAdamW::stats)
       .def_property_readonly("mode", &OffloadAdamW::mode)
       .def_property_readonly("num_params", &OffloadAdamW::num_params)

@@ -16,6 +16,17 @@
 // Moments are fp32, or bf16 with stochastic rounding (half the host memory and
 // traffic). Paged slots (cpu mode) keep no up-to-date weights in VRAM: the
 // host copy is authoritative and the Python ParamPager streams it in per block.
+//
+// Non-finite guard (set_nan_guard): a step whose gradients hold a NaN / Inf is
+// skipped as a whole. No weight, moment or step count changes, the gradients
+// are dropped, and training continues with the next batch.
+//  * cpu: every gradient is checked as host threads accumulate it. step() still
+//    returns at once: each tensor's update waits (on its worker) for a gate
+//    that opens when the step's last gradient has been checked, then either
+//    runs or does nothing.
+//  * gpu: the update kernels read the step's sum(g^2) on the GPU and return
+//    early when it is not finite; the host learns of it from the norm's D2H
+//    copy and takes the step counts back before the next step.
 #pragma once
 
 #include "trainstream.h"
@@ -94,6 +105,40 @@ class OffloadAdamW {
   void wait_ready(const std::vector<int64_t>& ids);
   void synchronize();
 
+  // ---- fp8 gradients (cpu mode) ---------------------------------------------
+  // Gradients cross PCIe as one e4m3 byte per value plus an fp32 scale per 256
+  // values, rounded stochastically on the GPU (kernels::grad_fp8_encode), and
+  // are expanded into the fp32 accumulator on the host: half the D2H traffic
+  // and staging memory of bf16 gradients, a quarter of fp32 ones.
+  void set_fp8_gradients(bool on);
+  bool fp8_gradients() const { return fp8_grads_; }
+
+  // ---- non-finite guard ----------------------------------------------------
+  void set_nan_guard(bool on);
+  bool nan_guard() const { return nan_guard_; }
+  // Steps dropped because a gradient was not finite, and how many of the
+  // latest steps in a row were. A step still in flight is counted once its
+  // verdict is known; wait=true (gpu mode) blocks for the last step's norm.
+  int64_t skipped_steps(bool wait = true);
+  int64_t consecutive_skips(bool wait = true);
+
+  // ---- background checkpoints (ckpt.cpp) -----------------------------------
+  // One parameter's host buffers exactly as they are stored, not copies: "master",
+  // "exp_avg", "exp_avg_sq", "m_scale", "v_scale", "param_stage" (those that exist).
+  std::map<std::string, at::Tensor> raw_state(int64_t id);
+  // Put back buffers saved from raw_state (dtypes and sizes must be this engine's).
+  void load_state_raw(int64_t id, const std::map<std::string, at::Tensor>& state, int64_t step);
+  // A checkpoint is about to read every slot's host state as of the updates queued
+  // so far. Until checkpoint_release(slot), later updates of that slot wait (on
+  // their worker threads; in gpu mode the next step() waits). Returns, per slot,
+  // how many updates must have finished before its state may be read. A second
+  // checkpoint waits here for the first to finish.
+  std::vector<int64_t> checkpoint_begin();
+  // Blocks until slot `id` has finished `target` updates; returns its step count then.
+  int64_t checkpoint_wait(int64_t id, int64_t target);
+  void checkpoint_release(int64_t id);
+  void checkpoint_end();  // drops every hold that is left; the job is over
+
   double last_grad_norm();
   std::tuple<at::Tensor, at::Tensor, at::Tensor> state(int64_t id);  // master|undef, m, v
   void load_state(int64_t id, const at::Tensor& exp_avg, const at::Tensor& exp_avg_sq,
@@ -127,8 +172,14 @@ class OffloadAdamW {
     void* d_v = nullptr;
     bool paged = false;
     at::Tensor grad_stage, grad_acc, param_stage;  // cpu mode staging
+    at::Tensor grad_scale;  // fp8 gradients: the staged block scales (grad_stage holds the codes)
     at::Tensor grad_keep;  // VRAM gradient kept alive until its DMA / kernel is done
     int64_t step = 0;
+    int64_t step_done = 0;      // the step count as of the updates that have finished
+    int64_t enq_seq = 0;        // updates queued so far ...
+    int64_t done_seq = 0;       // ... and finished
+    bool ckpt_hold = false;     // a checkpoint is reading this slot's state as of update ckpt_target
+    int64_t ckpt_target = 0;
     bool has_grad = false;
     bool acc_fresh = true;
     EventPtr d2h_done;
@@ -140,6 +191,25 @@ class OffloadAdamW {
   };
   using ChunkFn = std::function<void(int64_t chunk, int64_t begin, int64_t end)>;
 
+  // One optimizer step's verdict (cpu mode, guard on). Accumulation batches
+  // enter while gradients arrive and leave when their values are checked;
+  // step() seals the gate; updates wait for "sealed and empty" and then read
+  // `bad`. Accumulations are queued before the updates on every worker (FIFO),
+  // so a waiting update can never be in front of a batch it waits for.
+  struct StepGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    int open = 0;
+    bool sealed = false;
+    std::atomic<bool> bad{false};
+    std::atomic<int> verdict{0};  // 0 undecided, 1 apply, 2 skip
+    std::atomic<bool> counted{false};
+    void enter();
+    void leave();
+    void seal();
+    bool skip();  // blocks until decided
+  };
+
   Slot& slot(int64_t id);
   size_t worker_for(int64_t id, int64_t chunk) const;
   void run_batch(Slot& s, std::shared_ptr<ChunkFn> body, std::shared_ptr<std::function<void()>> finalize);
@@ -147,7 +217,9 @@ class OffloadAdamW {
   // Queue AdamW + H2D for one slot. Reads the fp32 accumulator, or the raw
   // staging buffer once `from_stage` (its D2H event) has completed.
   void enqueue_update(Slot& s, double lr, double beta1, double beta2, double eps, double wd, double clip,
-                      EventPtr after, EventPtr from_stage);
+                      EventPtr after, EventPtr from_stage, std::shared_ptr<StepGate> gate = nullptr);
+  void note_step(bool skipped);
+  void settle_gpu_step();  // gpu mode: read the last step's norm; undo its step counts if it was skipped
   // cpu mode: VRAM gradients are kept alive only until their D2H copy has
   // landed (the host works from the staging copy), polled on every call.
   void retire_grad(EventPtr d2h_done, at::Tensor grad);
@@ -190,6 +262,22 @@ class OffloadAdamW {
   EventPtr norm_ev_;
   double last_norm_ = -1.0;
 
+  // background checkpoints
+  std::mutex ckpt_mu_;
+  std::condition_variable ckpt_cv_;
+  int ckpt_jobs_ = 0;   // checkpoints in flight (at most one)
+  int ckpt_holds_ = 0;  // slots it has not finished reading
+  std::mutex settle_mu_;
+
+  bool fp8_grads_ = false;
+  std::atomic<uint32_t> fp8_seq_{0};  // a new seed for every encoded gradient
+
+  // non-finite guard
+  bool nan_guard_ = false;
+  std::shared_ptr<StepGate> gate_;          // cpu mode: the step now collecting gradients
+  std::vector<int64_t> gpu_step_ids_;       // gpu mode: slots of the step whose norm is in flight
+  std::atomic<int64_t> skipped_steps_{0}, consecutive_skips_{0};
+
   // telemetry (microseconds / bytes)
   std::atomic<int64_t> update_us_{0}, accumulate_us_{0}, ready_stall_us_{0}, grad_stall_us_{0};
   std::atomic<int64_t> grad_bytes_{0}, param_bytes_{0}, steps_{0}, steps_eager_{0};
@@ -201,5 +289,56 @@ class OffloadAdamW {
 std::map<std::string, double> benchmark_cpu_adamw(int64_t numel, int threads);
 // Throughput of the zero-copy kernel with moments in mapped pinned memory.
 std::map<std::string, double> benchmark_zero_copy_adamw(int device, int64_t numel);
+
+// ---------------------------------------------------------------------------
+// Background checkpoints (ckpt.cpp)
+// ---------------------------------------------------------------------------
+// One tensor of a checkpoint file. `data` is host memory that is either live
+// optimizer state (slot >= 0: written once that slot has finished the updates
+// the checkpoint covers, while its later updates wait) or a private snapshot
+// (`after`: the D2H copy that fills it).
+struct CheckpointItem {
+  at::Tensor data;
+  int64_t offset = 0;    // in the file; a multiple of 4096
+  EventPtr after;
+  int64_t slot = -1;
+  bool release = false;  // the slot's last item: its updates may run again
+};
+
+class CheckpointJob {
+ public:
+  bool done();
+  void wait();             // blocks until the file is complete (or the job failed)
+  std::string error();     // empty on success
+  double seconds();        // wall time of the write, once done
+  int64_t bytes();         // bytes written, once done
+
+ private:
+  friend void checkpoint_finish(CheckpointJob& job, const std::string& error, int64_t bytes, double seconds);
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  std::string error_;
+  double seconds_ = 0.0;
+  int64_t bytes_ = 0;
+};
+void checkpoint_finish(CheckpointJob& job, const std::string& error, int64_t bytes, double seconds);
+
+// Starts a detached thread that writes `header` at offset 0 and every item at
+// its offset into `path`.tmp with asynchronous unbuffered I/O (aio.cpp), flushes
+// it and renames it over `path`, and returns at once. `engine` (may be null)
+// with `targets` (from checkpoint_begin) coordinates live state; `steps`
+// (int64 [slots], may be undefined) is filled with each slot's step count as it
+// is read and written last, at `steps_offset`.
+std::shared_ptr<CheckpointJob> checkpoint_write_async(const std::string& path, const std::string& header,
+                                                      std::vector<CheckpointItem> items, OffloadAdamW* engine,
+                                                      const std::vector<int64_t>& targets, const at::Tensor& steps,
+                                                      int64_t steps_offset, int device);
+// fp32 values of 8-bit moment codes (OffloadAdamW moment_dtype="int8").
+at::Tensor decode_moment8(const at::Tensor& codes, const at::Tensor& scale, bool is_m);
+// fp8 gradients, for tests and tools: (codes uint8 [n], scales float32 [(n + 255) / 256]) of a
+// CUDA tensor, on its device; and the host's expansion of such a pair back to float32.
+std::tuple<at::Tensor, at::Tensor> grad_fp8_encode(const at::Tensor& grad, int64_t seed);
+at::Tensor grad_fp8_decode(const at::Tensor& codes, const at::Tensor& scales);
 
 }  // namespace trainstream

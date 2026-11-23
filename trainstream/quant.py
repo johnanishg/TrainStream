@@ -31,6 +31,8 @@ a checkpoint, so a base larger than RAM never exists in full precision.
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
 
@@ -49,6 +51,7 @@ NF4_CODES = (
 )
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 MIN_NUMEL = 4096  # smaller frozen tensors (norms, biases) stay unquantized
+LORA_INITS = ("loftq", "pissa")  # what error_rank's low-rank factors hold (lowrank_error / pissa_split)
 _GROUP = {"nvfp4": 16, "fp8": 32}
 
 
@@ -269,9 +272,11 @@ class QuantizedWeight:
     global_decode: float = 1.0
     outliers: float = 0.0  # nvfp4 tensor-core path: input channels kept in bf16 (trainstream.lowp)
     fp4_backward: bool = False  # nvfp4 tensor-core path: the input gradient in nvfp4 too
-    # error_lowrank > 0: (A [r, K], B [N, r]) on the host, B @ A ~ the original weight minus this one's
-    # expansion, for init_lora_from_error (LoftQ)
+    # error_rank > 0: (A [r, K], B [N, r]) on the host, for init_lora_from_error. "loftq": B @ A ~ the
+    # original weight minus this one's expansion. "pissa": B @ A is the original weight's principal
+    # part and this weight stores the rest, so the model is only whole with the adapter on top.
     lora_init: Optional[tuple] = None
+    lora_init_kind: str = "loftq"
     _gdev: Optional[torch.Tensor] = None
 
     @property
@@ -328,33 +333,112 @@ def _host_copy(t: torch.Tensor, pin: bool) -> torch.Tensor:
     return t.to("cpu", copy=True)
 
 
+def check_lora_init(lora_init: str) -> str:
+    if lora_init not in LORA_INITS:
+        raise ValueError(f"lora_init must be 'loftq' or 'pissa', got {lora_init!r}")
+    return lora_init
+
+
 def make_quantized(w: torch.Tensor, kind: str, block_size: int, *, pin: bool, error_rank: int = 0,
-                   error_iters: int = 1, double_quant: bool = False) -> QuantizedWeight:
-    """`w` stored in `kind`. error_rank > 0: LoftQ, see lowrank_error (the factors ride along as
-    qw.lora_init for init_lora_from_error). double_quant: nf4 / int8 block scales stored in
-    one byte each (see _double_quant)."""
+                   error_iters: int = 1, double_quant: bool = False, lora_init: str = "loftq") -> QuantizedWeight:
+    """`w` stored in `kind`. error_rank > 0: also rank-error_rank factors for the LoRA adapter on
+    top (qw.lora_init, for init_lora_from_error): lora_init="loftq" fits them to what quantization
+    lost (lowrank_error); "pissa" makes them w's principal part and stores only the rest
+    (pissa_split). double_quant: nf4 / int8 block scales stored in one byte each (see
+    _double_quant)."""
     factors = None
     if error_rank and w.dim() == 2:
-        w, a, b = lowrank_error(w, kind, block_size, error_rank, error_iters)
+        split = pissa_split if check_lora_init(lora_init) == "pissa" else lowrank_error
+        w, a, b = split(w, kind, block_size, error_rank, error_iters)
         factors = (a, b)
     if kind in BLOCKSCALED_KINDS:
         q, s, g = quantize_blockscaled(w, kind)
         return QuantizedWeight(kind=kind, block_size=_GROUP[kind], shape=tuple(w.shape), dtype=w.dtype,
                                host_q=_host_copy(q, pin), host_absmax=_host_copy(s, pin), pinned=pin,
-                               global_decode=float(g), lora_init=factors)
+                               global_decode=float(g), lora_init=factors, lora_init_kind=lora_init)
     q, absmax = quantize_tensor(w, kind, block_size, double_quant=double_quant)
     return QuantizedWeight(kind=kind, block_size=block_size, shape=tuple(w.shape), dtype=w.dtype,
                            host_q=_host_copy(q, pin), host_absmax=_host_copy(absmax, pin), pinned=pin,
-                           lora_init=factors)
+                           lora_init=factors, lora_init_kind=lora_init)
+
+
+def _plain_lora(m, name) -> bool:
+    """A LoRA adapter the factors can start: two bias-free Linears, no DoRA or other variant."""
+    a, b = m.lora_A[name], m.lora_B[name]
+    return (type(a) is nn.Linear and type(b) is nn.Linear and a.bias is None and b.bias is None
+            and name not in getattr(m, "lora_variant", {}))
+
+
+def adapter_ranks(model: nn.Module) -> Dict[int, int]:
+    """id(base weight) -> r, for every Linear that carries exactly one plain PEFT LoRA adapter
+    (what a PiSSA split can serve: the adapter must hold all of the principal part) and has not
+    been started from factors before (its base may already be a residual: never split twice)."""
+    out = {}
+    for m in model.modules():
+        base = getattr(m, "base_layer", None)
+        if base is None or not hasattr(m, "lora_A") or not isinstance(base, nn.Linear):
+            continue
+        names = list(m.lora_A.keys())
+        if len(names) == 1 and _plain_lora(m, names[0]) and names[0] not in lora_init_record(m):
+            out[id(base.weight)] = int(m.lora_A[names[0]].weight.shape[0])
+    return out
+
+
+def lora_init_counts(model: nn.Module) -> Dict[str, int]:
+    """How many adapters init_lora_from_error has started so far, per kind."""
+    out = {"loftq": 0, "pissa": 0}
+    for m in model.modules():
+        for start in lora_init_record(m).values():
+            out[start["kind"]] += 1
+    return out
+
+
+def pissa_adapter_ids(model: nn.Module) -> set:
+    """ids of the trainable lora_A / lora_B weights of every adapter started at its base's principal part."""
+    out = set()
+    for m in model.modules():
+        for name, start in lora_init_record(m).items():
+            if start["kind"] == "pissa" and name in getattr(m, "lora_A", {}):
+                out.update(id(w) for w in (m.lora_A[name].weight, m.lora_B[name].weight) if w.requires_grad)
+    return out
+
+
+def lora_init_record(m: nn.Module) -> dict:
+    """{adapter name: {"kind": "loftq" | "pissa", "a": A0, "b": B0}} for the adapters of LoRA layer
+    `m` that init_lora_from_error has started. It lives on the layer (not on the quantized
+    weight), so it survives unwrap() and copies of the model; pissa_to_lora reads A0 / B0."""
+    return m.__dict__.get("_ts_lora_init", {})
+
+
+def targets_match(name: str, targets) -> bool:
+    """Whether parameter `name` ("...q_proj.weight") belongs to a module named in `targets`
+    (module-name suffixes, as PEFT's LoraConfig.target_modules list is read). None: every module."""
+    if targets is None:
+        return True
+    if isinstance(targets, str):
+        targets = [targets]
+    module = name.rsplit(".", 1)[0]
+    return any(module == t or module.endswith("." + t) for t in targets)
 
 
 @torch.no_grad()
 def init_lora_from_error(model: nn.Module) -> int:
-    """Start each PEFT LoRA adapter whose base weight carries LoftQ factors (error_rank) at the
-    weight's quantization error, so base + adapter starts close to the original weight instead
-    of the quantized one: lora_B = B / scaling, lora_A = A (their first r components). Returns
-    how many adapters were set."""
+    """Start each PEFT LoRA adapter whose base weight carries low-rank factors (error_rank).
+
+    LoftQ factors: the adapter starts at the weight's quantization error, so base + adapter
+    starts close to the original weight instead of the quantized one: lora_B = B / scaling,
+    lora_A = A (their first r components; an adapter larger than the factors is left as it is).
+
+    PiSSA factors: the adapter starts at the weight's principal part, which the stored base no
+    longer holds. The adapter must therefore exist and have r >= the factors' rank (extra rows
+    keep PEFT's own start, with lora_B zero there); anything else raises, because the layer
+    would silently compute with the residual alone.
+
+    An adapter is started once: the layer remembers it (lora_init_record), so wrapping the same
+    model again, or wrapping it with other options, leaves trained adapters alone. Returns how
+    many adapters were set."""
     n = 0
+    served = set()
     for m in model.modules():
         base = getattr(m, "base_layer", None)
         if base is None or not hasattr(m, "lora_A") or not isinstance(getattr(base, "weight", None), torch.Tensor):
@@ -363,16 +447,134 @@ def init_lora_from_error(model: nn.Module) -> int:
         if qw is None or qw.lora_init is None:
             continue
         a, b = qw.lora_init
-        for name in m.lora_A.keys():
+        pissa = qw.lora_init_kind == "pissa"
+        names = list(m.lora_A.keys())
+        if pissa and len(names) != 1:
+            raise ValueError(f"lora_init='pissa': a layer whose base was split carries {len(names)} LoRA adapters "
+                             f"({names}); exactly one must hold its principal part")
+        done = 0
+        for name in names:
+            if name in lora_init_record(m):
+                done += 1
+                continue
             la, lb = m.lora_A[name].weight, m.lora_B[name].weight
-            r = la.shape[0]
-            if r > a.shape[0] or la.shape[1] != a.shape[1] or lb.shape[0] != b.shape[0]:
-                continue  # the adapter is larger than the factors (or shaped differently): left as it is
+            r, rank = la.shape[0], a.shape[0]
+            fits = la.shape[1] == a.shape[1] and lb.shape[0] == b.shape[0]
+            if pissa:
+                if not fits or r < rank or not _plain_lora(m, name):
+                    raise ValueError(
+                        f"lora_init='pissa': the base weight {tuple(qw.shape)} was split at rank {rank}, but its "
+                        f"LoRA adapter {name!r} has r={r}"
+                        + ("" if fits else f" and shape {tuple(lb.shape)} x {tuple(la.shape)}")
+                        + ". Use a plain LoRA adapter (no DoRA, no bias) with r equal to error_rank.")
+                k = rank
+            else:
+                if r > rank or not fits:
+                    continue  # the adapter is larger than the factors (or shaped differently): left as it is
+                k = r
             s = float(m.scaling[name])
-            la.copy_(a[:r].to(la.device, la.dtype))
-            lb.copy_((b[:, :r].float() / s).to(lb.device, lb.dtype))
+            la[:k].copy_(a[:k].to(la.device, la.dtype))
+            if pissa and r > k:
+                lb[:, k:].zero_()  # the extra directions start like a fresh LoRA: no contribution
+            lb[:, :k].copy_((b[:, :k].float() / s).to(lb.device, lb.dtype))
+            record = dict(m.__dict__.get("_ts_lora_init", {}))
+            record[name] = ({"kind": "pissa", "a": a[:k].float().clone(), "b": b[:, :k].float().clone()} if pissa
+                            else {"kind": "loftq"})
+            m.__dict__["_ts_lora_init"] = record
+            done += 1
             n += 1
+        if done == len(names):
+            served.add(id(qw))
+    orphans = []
+    for p in model.parameters():
+        qw = quantized_of(p)
+        if qw is None or qw.lora_init is None:
+            continue
+        if id(qw) in served:
+            qw.lora_init = None  # the layer holds what is needed from here on
+        elif qw.lora_init_kind == "pissa":
+            orphans.append(tuple(qw.shape))
+    if orphans:
+        raise ValueError(
+            f"lora_init='pissa': {len(orphans)} quantized weights (e.g. {orphans[:3]}) were split into a residual "
+            "and a principal part, but no LoRA adapter sits on them to hold that part, so those layers would "
+            "compute with the residual alone. Give every split matrix an adapter (LoraConfig.target_modules), or "
+            "split only the adapted ones: load_model / quantize_model(..., lora_targets=[...same names...]).")
     return n
+
+
+@torch.no_grad()
+def pissa_to_lora(model: nn.Module, save_directory: Optional[str] = None,
+                  adapter_name: Optional[str] = None) -> Dict[str, torch.Tensor]:
+    """The trained adapters of `model` as an ordinary LoRA on the *original* base weights.
+
+    A PiSSA adapter is only meaningful on top of the residual base TrainStream holds: it started
+    as the weight's principal part, B0 A0. What training changed, relative to the original
+    weight, is  scaling * (B A - B0 A0), which is itself a LoRA of twice the rank:
+
+        lora_B' = [B, -B0]      lora_A' = [A; A0]      (same scaling)
+
+    Returns {"<module name>.lora_A.weight" / ".lora_B.weight": fp32 CPU tensor} in PEFT's saved
+    key format, every adapter at rank 2r (adapters that were not started by PiSSA are padded with
+    zeros, so one config fits all). With `save_directory` it also writes adapter_model.safetensors
+    and an adapter_config.json with r and lora_alpha doubled (lora_alpha * sqrt(2) under rsLoRA),
+    which peft.PeftModel.from_pretrained(original_base, save_directory) loads. LoRA matrices only
+    (no modules_to_save); rank_pattern / alpha_pattern configs are returned but not saved.
+    Works while the model is wrapped and after unwrap(): B0 / A0 are kept on the LoRA layers.
+    (After unwrap() the model itself is also whole: its base holds the expanded residual, so
+    PEFT's merge_and_unload() gives plain weights.)
+    """
+    from .wrapper import unwrap_session
+    session = unwrap_session(model)
+    if session is not None:
+        session.optimizer.synchronize()  # every queued update has reached the adapters
+    out: Dict[str, torch.Tensor] = {}
+    used = None
+    for mod_name, m in model.named_modules():
+        base = getattr(m, "base_layer", None)
+        if base is None or not hasattr(m, "lora_A"):
+            continue
+        for name in m.lora_A.keys():
+            if adapter_name is not None and name != adapter_name:
+                continue
+            if used is not None and name != used:
+                raise ValueError(f"pissa_to_lora: the model has several adapters ({used!r}, {name!r}); "
+                                 "pass adapter_name")
+            used = name
+            la, lb = m.lora_A[name].weight, m.lora_B[name].weight
+            A, B = la.detach().to("cpu", torch.float32), lb.detach().to("cpu", torch.float32)
+            r = A.shape[0]
+            A2, B2 = torch.zeros(2 * r, A.shape[1]), torch.zeros(B.shape[0], 2 * r)
+            A2[:r], B2[:, :r] = A, B
+            start = lora_init_record(m).get(name)
+            if start is not None and start["kind"] == "pissa":
+                a0, b0 = start["a"], start["b"]
+                k = a0.shape[0]
+                A2[r:r + k] = a0.float()
+                B2[:, r:r + k] = -(b0.float() / float(m.scaling[name]))
+            out[f"{mod_name}.lora_A.weight"] = A2
+            out[f"{mod_name}.lora_B.weight"] = B2
+    if not out:
+        raise ValueError("pissa_to_lora: the model has no LoRA adapters")
+    if save_directory is not None:
+        import copy
+
+        from safetensors.torch import save_file
+        configs = getattr(model, "peft_config", None)
+        if not isinstance(configs, dict) or used not in configs:
+            raise ValueError("pissa_to_lora(save_directory=...) needs a peft.PeftModel (for its adapter config)")
+        cfg = copy.deepcopy(configs[used])
+        if getattr(cfg, "rank_pattern", None) or getattr(cfg, "alpha_pattern", None):
+            raise NotImplementedError("pissa_to_lora cannot write a config with rank_pattern / alpha_pattern; "
+                                      "use the returned tensors")
+        cfg.lora_alpha = cfg.lora_alpha * math.sqrt(2.0) if getattr(cfg, "use_rslora", False) else cfg.lora_alpha * 2
+        cfg.r = cfg.r * 2
+        cfg.init_lora_weights = True
+        cfg.inference_mode = True
+        os.makedirs(save_directory, exist_ok=True)
+        cfg.save_pretrained(save_directory)
+        save_file({k: v.contiguous() for k, v in out.items()}, os.path.join(save_directory, "adapter_model.safetensors"))
+    return out
 
 
 # -------------------------------------------------------------- selective precision
@@ -436,6 +638,49 @@ def lowrank_error(w: torch.Tensor, kind: str, block_size: int, rank: int, iters:
     return R.to(w.dtype).view(w.shape), A.to(torch.bfloat16).cpu(), B.to(torch.bfloat16).cpu()
 
 
+def principal_svd(T: torch.Tensor, rank: int, niter: int = 4):
+    """(U [N, rank], S [rank], Vh [rank, K]): the leading singular triplets of T, by randomized
+    subspace iteration (Halko, Martinsson & Tropp, 2011) with `niter` power steps. The test
+    matrix comes from a generator seeded by T's shape alone, so the same weight gives the same
+    factors on every run and on every rank of a data-parallel job."""
+    n, k = T.shape
+    q = min(rank + 8, n, k)
+    g = torch.Generator(device=T.device).manual_seed((n * 1000003 + k * 7919 + rank) & 0x7fffffff)
+    basis = torch.linalg.qr(T @ torch.randn(k, q, device=T.device, dtype=T.dtype, generator=g)).Q
+    for _ in range(max(0, niter)):
+        basis = torch.linalg.qr(T.t() @ basis).Q
+        basis = torch.linalg.qr(T @ basis).Q
+    U, S, Vh = torch.linalg.svd(basis.t() @ T, full_matrices=False)
+    return (basis @ U)[:, :rank], S[:rank], Vh[:rank]
+
+
+@torch.no_grad()
+def pissa_split(w: torch.Tensor, kind: str, block_size: int, rank: int, iters: int = 1):
+    """PiSSA (Meng, Wang & Zhang, 2024), in its quantized form: (weight to store in `kind`,
+    A [rank, K], B [N, rank]) with B @ A the rank-`rank` principal part of w (B = U sqrt(S),
+    A = sqrt(S) V^T) and the stored weight the residual w - B @ A.
+
+    The adapter then trains the directions that matter most from the first step, instead of
+    starting at zero, and the residual, with its largest components taken out, is what gets
+    quantized. One randomized SVD per weight; nothing iterative unless `iters` > 1, where, as in
+    LoftQ, each further round refits B @ A to w minus the expansion of the stored residual.
+    The factors are returned in fp32 on the host and the residual is computed from exactly those
+    values, so base + adapter reproduces w up to the residual's quantization."""
+    dev = _device(None)
+    W = w.detach().to(dev, torch.float32).reshape(w.shape[0], -1)
+    rank = max(1, min(rank, min(W.shape)))
+    target = W
+    for it in range(max(1, iters)):
+        U, S, Vh = principal_svd(target, rank)
+        sq = S.sqrt()
+        B = U * sq
+        A = sq[:, None] * Vh
+        R = W - B @ A
+        if it + 1 < max(1, iters):
+            target = W - roundtrip(R, kind, block_size)
+    return R.to(w.dtype).view(w.shape), A.cpu(), B.cpu()
+
+
 def choose_precise(errors, kind: str, fraction: float, block_size: int = 64) -> set:
     """Which weights to keep at KEEP_KIND[kind]: errors is [(key, relative error, numel, shape)];
     the largest errors first, as long as the extra bytes stay within `fraction` of what the
@@ -491,7 +736,8 @@ def quantized_of(p: torch.Tensor) -> Optional[QuantizedWeight]:
 @torch.no_grad()
 def quantize_model(model: nn.Module, quantize: str = "nf4", *, blocks: Optional[Sequence[nn.Module]] = None,
                    block_size: int = 64, pin_budget: Optional[int] = None, keep_precise=0, error_rank: int = 0,
-                   error_iters: int = 1, double_quant: bool = False) -> Dict[str, int]:
+                   error_iters: int = 1, double_quant: bool = False, lora_init: str = "loftq",
+                   lora_targets: Optional[Sequence[str]] = None) -> Dict[str, int]:
     """Quantize the frozen block weights of `model` in place (before wrap()).
 
     Each eligible weight is quantized one at a time, so peak memory grows by
@@ -501,12 +747,19 @@ def quantize_model(model: nn.Module, quantize: str = "nf4", *, blocks: Optional[
     quantization error as a rank-`error_rank` approximation (LoftQ, `error_iters` rounds), from
     which init_lora_from_error / wrap() start LoRA adapters. double_quant (nf4 / int8): block
     scales in one byte each instead of four (about 0.37 bit per weight less at block size 64).
-    Returns counts and byte totals.
+    lora_init="pissa" (with error_rank = the adapters' r): each matrix is split into its rank-
+    error_rank principal part, which the LoRA adapter added afterwards starts at, and the rest,
+    which is what gets quantized (see pissa_split). Only matrices that will carry an adapter may
+    be split: lora_targets names them (module-name suffixes, the same list as
+    LoraConfig.target_modules; None: every quantized matrix). Returns counts and byte totals.
     """
     from .hooks import find_blocks
     from .optimizer import physical_ram_bytes
     from . import _C
     _check(quantize, block_size)
+    if check_lora_init(lora_init) == "pissa" and not error_rank:
+        raise ValueError("lora_init='pissa' needs error_rank = the rank r of the LoRA adapters to be added")
+    names = {id(p): n for n, p in model.named_parameters()}
     stack = list(blocks) if blocks is not None else find_blocks(model)
     if pin_budget is None:
         ram = physical_ram_bytes()
@@ -526,8 +779,9 @@ def quantize_model(model: nn.Module, quantize: str = "nf4", *, blocks: Optional[
         kind = KEEP_KIND[quantize] if id(p) in keep else quantize
         nb = packed_bytes(p.numel(), kind, block_size, p.shape)
         pin = _C.pinned_stats()["live_bytes"] + nb <= pin_budget
-        qw = make_quantized(p, kind, block_size, pin=pin, error_rank=error_rank, error_iters=error_iters,
-                            double_quant=double_quant)
+        rank = error_rank if targets_match(names.get(id(p), ""), lora_targets) else 0
+        qw = make_quantized(p, kind, block_size, pin=pin, error_rank=rank, error_iters=error_iters,
+                            double_quant=double_quant, lora_init=lora_init)
         attach(p, qw)
         count += 1
         before += p.numel() * p.element_size()

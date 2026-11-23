@@ -329,13 +329,79 @@ void encode8(const at::Tensor& values, at::Tensor& codes, at::Tensor& scale, boo
   }
 }
 
-template <typename T>
-void accumulate_host(float* __restrict acc, const T* __restrict g, int64_t b, int64_t e, bool fresh) {
-  if (fresh) {
-    for (int64_t i = b; i < e; ++i) acc[i] = static_cast<float>(g[i]);
-  } else {
-    for (int64_t i = b; i < e; ++i) acc[i] += static_cast<float>(g[i]);
+// True when any of x[0, n) is NaN or +/-Inf. Integer arithmetic only: it
+// vectorises, and no floating-point compiler mode can fold the test away.
+inline bool any_non_finite(const float* x, int64_t n) {
+  uint32_t m = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, x + i, sizeof(bits));
+    m |= (bits & 0x7f800000u) + 0x00800000u;  // carries into bit 31 only for an all-ones exponent
   }
+  return (m >> 31) != 0;
+}
+
+// acc[b, e) = or += g[b, e). With `check`, returns whether the accumulated
+// values hold a NaN / Inf; they are tested a few KiB at a time, right after
+// they were written, while still in the core's cache.
+template <typename T>
+bool accumulate_host(float* __restrict acc, const T* __restrict g, int64_t b, int64_t e, bool fresh,
+                     bool check = false) {
+  if (!check) {
+    if (fresh) {
+      for (int64_t i = b; i < e; ++i) acc[i] = static_cast<float>(g[i]);
+    } else {
+      for (int64_t i = b; i < e; ++i) acc[i] += static_cast<float>(g[i]);
+    }
+    return false;
+  }
+  constexpr int64_t kSpan = 4096;
+  bool bad = false;
+  for (int64_t a = b; a < e; a += kSpan) {
+    const int64_t z = std::min(e, a + kSpan);
+    if (fresh) {
+      for (int64_t i = a; i < z; ++i) acc[i] = static_cast<float>(g[i]);
+    } else {
+      for (int64_t i = a; i < z; ++i) acc[i] += static_cast<float>(g[i]);
+    }
+    bad |= any_non_finite(acc + a, z - a);
+  }
+  return bad;
+}
+
+// The value of every e4m3 code (sign, 4-bit exponent biased by 7, 3-bit mantissa).
+const float* e4m3_table() {
+  static const std::vector<float> table = [] {
+    std::vector<float> t(256);
+    for (int c = 0; c < 128; ++c) {
+      const int e = c >> 3, m = c & 7;
+      const float v = e == 0 ? std::ldexp(static_cast<float>(m) / 8.0f, -6)
+                             : std::ldexp(1.0f + static_cast<float>(m) / 8.0f, e - 7);
+      t[static_cast<size_t>(c)] = v;
+      t[static_cast<size_t>(c | 0x80)] = -v;
+    }
+    return t;
+  }();
+  return table.data();
+}
+
+// acc[b, e) = or += the fp8-coded gradient (b is a multiple of kQBlock). A block with a NaN
+// scale (the GPU saw a NaN / Inf in it) expands to NaN, which `check` reports like any other.
+bool accumulate_host_fp8(float* __restrict acc, const uint8_t* __restrict codes, const float* __restrict scales,
+                         int64_t b, int64_t e, bool fresh, bool check) {
+  const float* tab = e4m3_table();
+  bool bad = false;
+  for (int64_t a = b; a < e; a += kQBlock) {
+    const int64_t z = std::min(e, a + kQBlock);
+    const float s = scales[a / kQBlock];
+    if (fresh) {
+      for (int64_t i = a; i < z; ++i) acc[i] = tab[codes[i]] * s;
+    } else {
+      for (int64_t i = a; i < z; ++i) acc[i] += tab[codes[i]] * s;
+    }
+    if (check) bad |= any_non_finite(acc + a, z - a);
+  }
+  return bad;
 }
 
 int64_t elapsed_us(std::chrono::steady_clock::time_point t0) {
@@ -393,6 +459,41 @@ void WorkerPool::submit(size_t worker, std::function<void()> fn) {
 }
 
 // ===========================================================================
+// StepGate
+// ===========================================================================
+void OffloadAdamW::StepGate::enter() {
+  std::lock_guard<std::mutex> lock(mu);
+  ++open;
+}
+
+void OffloadAdamW::StepGate::leave() {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    --open;
+  }
+  cv.notify_all();
+}
+
+void OffloadAdamW::StepGate::seal() {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    sealed = true;
+  }
+  cv.notify_all();
+}
+
+bool OffloadAdamW::StepGate::skip() {
+  int v = verdict.load(std::memory_order_acquire);
+  if (v == 0) {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [this] { return sealed && open == 0; });
+    v = bad.load() ? 2 : 1;
+    verdict.store(v, std::memory_order_release);
+  }
+  return v == 2;
+}
+
+// ===========================================================================
 // OffloadAdamW
 // ===========================================================================
 OffloadAdamW::OffloadAdamW(int device, const std::string& mode, int threads, int64_t chunk_elems,
@@ -407,6 +508,7 @@ OffloadAdamW::OffloadAdamW(int device, const std::string& mode, int threads, int
   runtime(device_);  // create streams eagerly
   if (threads <= 0) threads = std::max(1u, std::thread::hardware_concurrency() / 2);
   if (!gpu_mode_) pool_ = std::make_unique<WorkerPool>(threads, device_);
+  gate_ = std::make_shared<StepGate>();
   if (gpu_mode_) {
     c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_));
     TS_CUDA_CHECK(cudaMalloc(&norm_dev_, sizeof(float)));
@@ -415,6 +517,10 @@ OffloadAdamW::OffloadAdamW(int device, const std::string& mode, int threads, int
 }
 
 OffloadAdamW::~OffloadAdamW() {
+  {  // a checkpoint thread still reads this engine's buffers: let it finish
+    std::unique_lock<std::mutex> lock(ckpt_mu_);
+    ckpt_cv_.wait(lock, [this] { return ckpt_jobs_ == 0; });
+  }
   try {
     synchronize();
   } catch (...) {
@@ -532,6 +638,7 @@ void OffloadAdamW::release_stage(Slot& s) {
   if (!s.grad_stage.defined()) return;
   const int64_t nbytes = static_cast<int64_t>(s.grad_stage.nbytes());
   s.grad_stage.reset();  // back to the pinned cache
+  s.grad_scale.reset();
   {
     std::lock_guard<std::mutex> lock(stage_mu_);
     stage_bytes_ -= nbytes;
@@ -632,15 +739,39 @@ void OffloadAdamW::offload_grad(int64_t id, const at::Tensor& grad, bool apply_u
   grad_stall_us_ += elapsed_us(t0);
 
   at::Tensor g = grad.contiguous().view({-1});
-  acquire_stage(s, g.scalar_type());
-  s.d2h_done = d2h_async(s.grad_stage, g);
-  retire_grad(s.d2h_done, g);  // VRAM copy freed as soon as the DMA has landed
+  if (fp8_grads_) {
+    // One byte per value crosses PCIe. The encode kernel runs on the compute stream, behind
+    // whatever produced the gradient; the gradient itself is not kept (its memory can only be
+    // reused by work queued later on that same stream), only the codes until they have landed.
+    c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_));
+    const int64_t nb = (s.numel + kQBlock - 1) / kQBlock;
+    at::Tensor codes = at::empty({s.numel}, g.options().dtype(at::kByte));
+    at::Tensor scales = at::empty({nb}, g.options().dtype(at::kFloat));
+    const uint32_t seed = mix32(fp8_seq_.fetch_add(1) * 0x9e3779b1u ^ static_cast<uint32_t>(id));
+    TS_CUDA_CHECK(kernels::grad_fp8_encode(to_kernel_dtype(g.scalar_type()), g.data_ptr(), s.numel,
+                                           codes.data_ptr<uint8_t>(), scales.data_ptr<float>(), seed,
+                                           runtime(device_).sm_count, compute_stream(device_)));
+    acquire_stage(s, at::kByte);
+    s.grad_scale = pinned_empty({nb}, at::kFloat, "grad.staging", false, true);
+    EventPtr codes_done = d2h_async(s.grad_stage, codes);
+    s.d2h_done = d2h_async(s.grad_scale, scales);  // the same stream: this event covers both copies
+    retire_grad(codes_done, codes);
+    retire_grad(s.d2h_done, scales);
+    grad_bytes_ += static_cast<int64_t>(codes.nbytes() + scales.nbytes());
+  } else {
+    acquire_stage(s, g.scalar_type());
+    s.d2h_done = d2h_async(s.grad_stage, g);
+    retire_grad(s.d2h_done, g);  // VRAM copy freed as soon as the DMA has landed
+    grad_bytes_ += static_cast<int64_t>(g.nbytes());
+  }
   reap_grads(false);
-  grad_bytes_ += static_cast<int64_t>(g.nbytes());
 
   const bool fresh = s.acc_fresh;
   EventPtr landed = s.d2h_done;
-  if (apply_update && fresh) {
+  // Guarded steps are decided as a whole at step(): no update may run before
+  // every gradient of the step has been checked.
+  if (nan_guard_) apply_update = false;
+  if (apply_update && fresh && !fp8_grads_) {  // (fp8 codes are expanded into the accumulator first)
     // Single micro-batch: AdamW reads the DMA staging buffer directly, skipping
     // the fp32 accumulator round trip (~8 fewer bytes of host traffic/element).
     steps_eager_ += 1;
@@ -659,27 +790,39 @@ void OffloadAdamW::offload_grad(int64_t id, const at::Tensor& grad, bool apply_u
     host_state_bytes_ += s.grad_acc.nbytes();
   }
   Slot* sp = &s;
-  auto body = std::make_shared<ChunkFn>([this, sp, landed, fresh](int64_t, int64_t b, int64_t e) {
+  std::shared_ptr<StepGate> gate = nan_guard_ ? gate_ : nullptr;
+  if (gate) gate->enter();
+  auto body = std::make_shared<ChunkFn>([this, sp, landed, fresh, gate](int64_t, int64_t b, int64_t e) {
     landed->synchronize();  // DMA complete -> staging bytes are valid
     const auto t = std::chrono::steady_clock::now();
     float* acc = sp->grad_acc.data_ptr<float>();
+    const bool check = gate != nullptr;
+    bool bad = false;
     switch (sp->grad_stage.scalar_type()) {
       case at::kFloat:
-        accumulate_host(acc, sp->grad_stage.data_ptr<float>(), b, e, fresh);
+        bad = accumulate_host(acc, sp->grad_stage.data_ptr<float>(), b, e, fresh, check);
         break;
       case at::kHalf:
-        accumulate_host(acc, sp->grad_stage.data_ptr<at::Half>(), b, e, fresh);
+        bad = accumulate_host(acc, sp->grad_stage.data_ptr<at::Half>(), b, e, fresh, check);
         break;
       case at::kBFloat16:
-        accumulate_host(acc, sp->grad_stage.data_ptr<at::BFloat16>(), b, e, fresh);
+        bad = accumulate_host(acc, sp->grad_stage.data_ptr<at::BFloat16>(), b, e, fresh, check);
+        break;
+      case at::kByte:  // fp8 gradients
+        bad = accumulate_host_fp8(acc, sp->grad_stage.data_ptr<uint8_t>(), sp->grad_scale.data_ptr<float>(), b, e,
+                                  fresh, check);
         break;
       default:
         TORCH_CHECK(false, "unsupported gradient dtype");
     }
+    if (bad) gate->bad.store(true);
     accumulate_us_ += elapsed_us(t);
   });
   // Accumulated: the staging buffer can go back to the pool.
-  auto release = std::make_shared<std::function<void()>>([this, sp] { release_stage(*sp); });
+  auto release = std::make_shared<std::function<void()>>([this, sp, gate] {
+    release_stage(*sp);
+    if (gate) gate->leave();
+  });
   run_batch(s, body, release);
   if (apply_update) {
     steps_eager_ += 1;
@@ -689,14 +832,26 @@ void OffloadAdamW::offload_grad(int64_t id, const at::Tensor& grad, bool apply_u
 }
 
 void OffloadAdamW::enqueue_update(Slot& s, double lr, double beta1, double beta2, double eps, double wd,
-                                  double clip, EventPtr after, EventPtr from_stage) {
+                                  double clip, EventPtr after, EventPtr from_stage, std::shared_ptr<StepGate> gate) {
   Slot* sp = &s;
-  s.step += 1;
+  s.step += 1;  // taken back in finalize when the step turns out to be skipped
+  const int64_t my_step = s.step;
   const HostHp hp = make_hp(lr, beta1, beta2, eps, wd, s.step, clip);
   const uint32_t seed = slot_seed(s.id, s.step);
   const EventPtr prev_ready = s.ready;
+  int64_t seq;
+  {
+    std::lock_guard<std::mutex> lock(s.mu);
+    seq = ++s.enq_seq;
+  }
 
-  auto body = std::make_shared<ChunkFn>([this, sp, hp, seed, prev_ready, from_stage](int64_t, int64_t b, int64_t e) {
+  auto body = std::make_shared<ChunkFn>([this, sp, hp, seed, prev_ready, from_stage, gate, seq](int64_t, int64_t b,
+                                                                                                int64_t e) {
+    if (gate && gate->skip()) return;  // a gradient of this step was not finite: nothing changes
+    {  // a checkpoint is writing this slot's state as of an earlier update: not yet
+      std::unique_lock<std::mutex> lock(sp->mu);
+      sp->cv.wait(lock, [sp, seq] { return !sp->ckpt_hold || seq <= sp->ckpt_target; });
+    }
     // The previous H2D may still be reading master/param_stage.
     if (prev_ready) prev_ready->synchronize();
     if (from_stage) from_stage->synchronize();  // gradient DMA landed in staging
@@ -710,10 +865,11 @@ void OffloadAdamW::enqueue_update(Slot& s, double lr, double beta1, double beta2
     update_us_ += elapsed_us(t);
   });
 
-  auto finalize = std::make_shared<std::function<void()>>([this, sp, after, from_stage] {
+  auto finalize = std::make_shared<std::function<void()>>([this, sp, after, from_stage, gate, my_step] {
+    const bool skipped = gate && gate->skip();
     if (from_stage) release_stage(*sp);  // fused path: the update read the staging buffer directly
     EventPtr done;
-    if (!sp->paged) {  // paged weights are streamed in by the pager instead
+    if (!skipped && !sp->paged) {  // paged weights are streamed in by the pager instead
       const at::Tensor& src = sp->param_stage.defined() ? sp->param_stage : sp->master;
       done = h2d_async(sp->param, src, after);
       param_bytes_ += static_cast<int64_t>(src.nbytes());
@@ -722,11 +878,64 @@ void OffloadAdamW::enqueue_update(Slot& s, double lr, double beta1, double beta2
       std::lock_guard<std::mutex> lock(sp->mu);
       if (done) sp->ready = std::move(done);
       sp->has_grad = false;
-      sp->acc_fresh = true;
+      sp->acc_fresh = true;  // the next gradient overwrites the accumulator: a skipped step's values are gone
+      if (skipped) {
+        sp->step -= 1;
+      } else {
+        sp->step_done = my_step;
+      }
+      sp->done_seq += 1;  // run_batch notifies the slot's waiters right after this
     }
+    if (gate && !gate->counted.exchange(true)) note_step(skipped);
     last_finalize_ms_ = now_ms();
   });
   run_batch(s, body, finalize);
+}
+
+void OffloadAdamW::note_step(bool skipped) {
+  if (skipped) {
+    skipped_steps_ += 1;
+    consecutive_skips_ += 1;
+  } else {
+    consecutive_skips_ = 0;
+  }
+}
+
+void OffloadAdamW::set_nan_guard(bool on) {
+  synchronize();
+  nan_guard_ = on;
+}
+
+void OffloadAdamW::set_fp8_gradients(bool on) {
+  TORCH_CHECK(!on || !gpu_mode_, "fp8 gradients are for cpu mode (in gpu mode gradients never leave VRAM)");
+  synchronize();
+  fp8_grads_ = on;
+}
+
+int64_t OffloadAdamW::skipped_steps(bool wait) {
+  if (gpu_mode_ && wait) settle_gpu_step();
+  return skipped_steps_.load();
+}
+
+int64_t OffloadAdamW::consecutive_skips(bool wait) {
+  if (gpu_mode_ && wait) settle_gpu_step();
+  return consecutive_skips_.load();
+}
+
+void OffloadAdamW::settle_gpu_step() {
+  std::lock_guard<std::mutex> settle_lock(settle_mu_);  // the training thread and a checkpoint thread
+  if (!norm_ev_) return;
+  norm_ev_->synchronize();
+  const float sq = norm_host_.data_ptr<float>()[0];
+  last_norm_ = std::sqrt(static_cast<double>(sq));
+  norm_ev_.reset();
+  if (nan_guard_) {
+    const bool skipped = !std::isfinite(sq);
+    if (skipped)  // the kernels returned without touching anything: the step never happened
+      for (int64_t id : gpu_step_ids_) slot(id).step -= 1;
+    note_step(skipped);
+  }
+  gpu_step_ids_.clear();
 }
 
 double OffloadAdamW::step(const std::vector<int64_t>& ids, const std::vector<double>& lrs,
@@ -762,6 +971,13 @@ double OffloadAdamW::step_cpu(const std::vector<int64_t>& ids, const std::vector
   for (size_t k = 0; k < ids.size(); ++k)
     if (slot(ids[k]).has_grad) active.push_back(k);
 
+  // Guard: this step's gate stops collecting gradients; the next step gets a new one.
+  std::shared_ptr<StepGate> gate;
+  if (nan_guard_) {
+    gate = gate_;
+    gate_ = std::make_shared<StepGate>();
+  }
+
   // grad_scale multiplies the accumulated gradients (1/world_size after a
   // data-parallel sum); the norm and the clip coefficient refer to the scaled values.
   double clip = grad_scale;
@@ -795,10 +1011,14 @@ double OffloadAdamW::step_cpu(const std::vector<int64_t>& ids, const std::vector
     norm = std::sqrt(sq) * grad_scale;
     last_norm_ = norm;
     if (max_grad_norm > 0.0) clip = std::min(1.0, max_grad_norm / (norm + 1e-6)) * grad_scale;
+    // The norm is taken over what the update will read (after a data-parallel
+    // reduction: the same values on every rank), so every rank decides alike.
+    if (gate && !std::isfinite(norm)) gate->bad.store(true);
   }
 
+  if (gate) gate->seal();
   for (size_t k : active)
-    enqueue_update(slot(ids[k]), lrs[k], beta1s[k], beta2s[k], epss[k], wds[k], clip, step_ev, nullptr);
+    enqueue_update(slot(ids[k]), lrs[k], beta1s[k], beta2s[k], epss[k], wds[k], clip, step_ev, nullptr, gate);
   return norm;
 }
 
@@ -819,11 +1039,18 @@ void OffloadAdamW::step_gpu(const std::vector<int64_t>& ids, const std::vector<d
     TORCH_CHECK(grads[k].numel() == s.numel, "step(gpu): gradient shape mismatch for param ", ids[k]);
     g[k] = grads[k].to(s.pdtype).contiguous().view({-1});
   }
+  {  // a checkpoint still reads the moments these kernels are about to write
+    std::unique_lock<std::mutex> lock(ckpt_mu_);
+    ckpt_cv_.wait(lock, [this] { return ckpt_holds_ == 0; });
+  }
+  settle_gpu_step();  // the previous step's verdict, before its step counts are used again
   const auto t0 = std::chrono::steady_clock::now();
   EventPtr step_ev = record_on_current(device_);
   step_ev->block(rt.upd);
 
-  const bool use_norm = max_grad_norm > 0.0 || compute_norm;
+  // The guard needs sum(g^2) on the device: one extra pass over gradients that
+  // are already in VRAM, small next to the PCIe-bound update that follows.
+  const bool use_norm = max_grad_norm > 0.0 || compute_norm || nan_guard_;
   if (use_norm) {
     TS_CUDA_CHECK(cudaMemsetAsync(norm_dev_, 0, sizeof(float), rt.upd));
     for (size_t k = 0; k < ids.size(); ++k) {
@@ -831,7 +1058,13 @@ void OffloadAdamW::step_gpu(const std::vector<int64_t>& ids, const std::vector<d
       TS_CUDA_CHECK(kernels::grad_sq_norm_accumulate(to_kernel_dtype(g[k].scalar_type()), g[k].data_ptr(),
                                                      g[k].numel(), norm_dev_, rt.sm_count, rt.upd));
     }
+    // Copied out before the update kernels run, so the host can read it early.
+    TS_CUDA_CHECK(cudaMemcpyAsync(norm_host_.data_ptr(), norm_dev_, sizeof(float), cudaMemcpyDeviceToHost, rt.upd));
+    norm_ev_ = make_event(device_);
+    norm_ev_->record(rt.upd);
   }
+  const float* norm_arg = (max_grad_norm > 0.0 || nan_guard_) ? norm_dev_ : nullptr;
+  int32_t* guard_arg = nan_guard_ ? guard_flags_always(device_) : nullptr;
   for (size_t k = 0; k < ids.size(); ++k) {
     if (!g[k].defined()) continue;
     Slot& s = slot(ids[k]);
@@ -841,8 +1074,9 @@ void OffloadAdamW::step_gpu(const std::vector<int64_t>& ids, const std::vector<d
                             static_cast<float>(max_grad_norm)};
     TS_CUDA_CHECK(kernels::adamw_zero_copy(to_kernel_dtype(s.pdtype), s.param.data_ptr(), g[k].data_ptr(),
                                            s.d_m, s.d_v, s.d_master, s.numel, hp,
-                                           max_grad_norm > 0.0 ? norm_dev_ : nullptr, rt.sm_count, rt.upd,
-                                           moment_dtype_ == at::kBFloat16, slot_seed(s.id, s.step)));
+                                           norm_arg, rt.sm_count, rt.upd, moment_dtype_ == at::kBFloat16,
+                                           slot_seed(s.id, s.step), guard_arg));
+    if (use_norm) gpu_step_ids_.push_back(s.id);
     // Keep the gradient alive instead of recordStream (whose free-path event
     // creation can abort on a full device). It is replaced next step, after
     // the next forward has waited on this kernel's `ready` event.
@@ -854,11 +1088,6 @@ void OffloadAdamW::step_gpu(const std::vector<int64_t>& ids, const std::vector<d
     ev->record(rt.upd);
     std::lock_guard<std::mutex> lock(s.mu);
     s.ready = std::move(ev);
-  }
-  if (use_norm) {
-    TS_CUDA_CHECK(cudaMemcpyAsync(norm_host_.data_ptr(), norm_dev_, sizeof(float), cudaMemcpyDeviceToHost, rt.upd));
-    norm_ev_ = make_event(device_);
-    norm_ev_->record(rt.upd);
   }
   update_us_ += elapsed_us(t0);  // host launch overhead only; device time is async
 }
@@ -904,16 +1133,13 @@ void OffloadAdamW::synchronize() {
       std::lock_guard<std::mutex> lock(sp->mu);
       sp->grad_keep.reset();  // kernels are done: gradients can go
     }
+    settle_gpu_step();
   }
   check_error();
 }
 
 double OffloadAdamW::last_grad_norm() {
-  if (gpu_mode_ && norm_ev_) {
-    norm_ev_->synchronize();
-    last_norm_ = std::sqrt(static_cast<double>(norm_host_.data_ptr<float>()[0]));
-    norm_ev_.reset();
-  }
+  if (gpu_mode_) settle_gpu_step();
   return last_norm_;
 }
 
@@ -946,9 +1172,143 @@ void OffloadAdamW::load_state(int64_t id, const at::Tensor& exp_avg, const at::T
     s.master.copy_(s.param);  // re-sync master with the live weights (paged: the host copy already is)
   }
   s.step = step;
+  s.step_done = step;
 }
 
-int64_t OffloadAdamW::get_step(int64_t id) { return slot(id).step; }
+// ===========================================================================
+// Background checkpoints
+// ===========================================================================
+std::map<std::string, at::Tensor> OffloadAdamW::raw_state(int64_t id) {
+  Slot& s = slot(id);
+  std::map<std::string, at::Tensor> out;
+  if (s.master.defined()) out["master"] = s.master;
+  out["exp_avg"] = s.exp_avg;
+  out["exp_avg_sq"] = s.exp_avg_sq;
+  if (s.m_scale.defined()) {
+    out["m_scale"] = s.m_scale;
+    out["v_scale"] = s.v_scale;
+  }
+  if (s.param_stage.defined()) out["param_stage"] = s.param_stage;
+  return out;
+}
+
+void OffloadAdamW::load_state_raw(int64_t id, const std::map<std::string, at::Tensor>& state, int64_t step) {
+  Slot& s = slot(id);
+  wait_idle(s);
+  if (s.ready) s.ready->synchronize();
+  auto put = [&](const char* name, at::Tensor& dst) {
+    auto it = state.find(name);
+    if (it == state.end()) return;
+    TORCH_CHECK(dst.defined() && it->second.numel() == dst.numel() && it->second.scalar_type() == dst.scalar_type(),
+                "load_state_raw: '", name, "' of param ", id, " does not match this optimizer's storage");
+    dst.copy_(it->second.reshape({-1}));
+  };
+  put("master", s.master);
+  put("exp_avg", s.exp_avg);
+  put("exp_avg_sq", s.exp_avg_sq);
+  put("m_scale", s.m_scale);
+  put("v_scale", s.v_scale);
+  put("param_stage", s.param_stage);
+  s.step = step;
+  s.step_done = step;
+}
+
+std::vector<int64_t> OffloadAdamW::checkpoint_begin() {
+  check_error();
+  {
+    std::unique_lock<std::mutex> lock(ckpt_mu_);
+    ckpt_cv_.wait(lock, [this] { return ckpt_jobs_ == 0; });  // one at a time
+    ckpt_jobs_ = 1;
+    ckpt_holds_ = static_cast<int>(slots_.size());
+  }
+  std::vector<int64_t> targets;
+  for (auto& sp : slots_) {
+    std::lock_guard<std::mutex> lock(sp->mu);
+    sp->ckpt_hold = true;
+    sp->ckpt_target = sp->enq_seq;
+    targets.push_back(sp->enq_seq);
+  }
+  return targets;
+}
+
+int64_t OffloadAdamW::checkpoint_wait(int64_t id, int64_t target) {
+  Slot& s = slot(id);
+  if (gpu_mode_) {
+    EventPtr ready;
+    {
+      std::lock_guard<std::mutex> lock(s.mu);
+      ready = s.ready;
+    }
+    if (ready) ready->synchronize();  // the last step's kernel has written this slot's state
+    settle_gpu_step();                // ... and its step count stands (or was taken back)
+    return s.step;
+  }
+  std::unique_lock<std::mutex> lock(s.mu);
+  s.cv.wait(lock, [&s, target] { return s.done_seq >= target; });
+  return s.step_done;
+}
+
+void OffloadAdamW::checkpoint_release(int64_t id) {
+  Slot& s = slot(id);
+  bool held;
+  {
+    std::lock_guard<std::mutex> lock(s.mu);
+    held = s.ckpt_hold;
+    s.ckpt_hold = false;
+  }
+  if (!held) return;
+  s.cv.notify_all();
+  {
+    std::lock_guard<std::mutex> lock(ckpt_mu_);
+    --ckpt_holds_;
+  }
+  ckpt_cv_.notify_all();
+}
+
+void OffloadAdamW::checkpoint_end() {
+  for (auto& sp : slots_) checkpoint_release(sp->id);
+  {
+    std::lock_guard<std::mutex> lock(ckpt_mu_);
+    ckpt_jobs_ = 0;
+  }
+  ckpt_cv_.notify_all();
+}
+
+std::tuple<at::Tensor, at::Tensor> grad_fp8_encode(const at::Tensor& grad, int64_t seed) {
+  TORCH_CHECK(grad.is_cuda(), "grad_fp8_encode: a CUDA tensor");
+  const int dev = grad.get_device();
+  c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(dev));
+  const at::Tensor g = grad.contiguous().view({-1});
+  const int64_t n = g.numel();
+  at::Tensor codes = at::empty({n}, g.options().dtype(at::kByte));
+  at::Tensor scales = at::empty({(n + kQBlock - 1) / kQBlock}, g.options().dtype(at::kFloat));
+  TS_CUDA_CHECK(kernels::grad_fp8_encode(to_kernel_dtype(g.scalar_type()), g.data_ptr(), n, codes.data_ptr<uint8_t>(),
+                                         scales.data_ptr<float>(), static_cast<uint32_t>(seed), runtime(dev).sm_count,
+                                         compute_stream(dev)));
+  return {codes, scales};
+}
+
+at::Tensor grad_fp8_decode(const at::Tensor& codes, const at::Tensor& scales) {
+  TORCH_CHECK(codes.device().is_cpu() && scales.device().is_cpu() && codes.scalar_type() == at::kByte &&
+                  scales.scalar_type() == at::kFloat && scales.numel() == (codes.numel() + kQBlock - 1) / kQBlock,
+              "grad_fp8_decode: uint8 codes and one float32 scale per 256 of them, on the host");
+  const at::Tensor c = codes.contiguous().view({-1}), s = scales.contiguous().view({-1});
+  at::Tensor out = at::empty({c.numel()}, at::TensorOptions().dtype(at::kFloat));
+  accumulate_host_fp8(out.data_ptr<float>(), c.data_ptr<uint8_t>(), s.data_ptr<float>(), 0, c.numel(), true, false);
+  return out;
+}
+
+at::Tensor decode_moment8(const at::Tensor& codes, const at::Tensor& scale, bool is_m) {
+  TORCH_CHECK(codes.scalar_type() == at::kByte && scale.scalar_type() == at::kFloat && codes.device().is_cpu() &&
+                  scale.device().is_cpu() && scale.numel() == (codes.numel() + kQBlock - 1) / kQBlock,
+              "decode_moment8: uint8 codes and one float32 scale per 256 of them");
+  return decode8(codes.contiguous().view({-1}), scale.contiguous().view({-1}), is_m);
+}
+
+int64_t OffloadAdamW::get_step(int64_t id) {
+  if (gpu_mode_) settle_gpu_step();
+  return slot(id).step;
+}
 
 void OffloadAdamW::set_paged(int64_t id, bool paged) {
   TORCH_CHECK(!gpu_mode_ || !paged, "parameter paging requires cpu mode");
@@ -1026,7 +1386,11 @@ std::map<std::string, double> OffloadAdamW::stats() {
           {"accumulate_ms_total", accumulate_us_.load() / 1e3},
           {"ready_stall_ms_total", ready_stall_us_.load() / 1e3},
           {"grad_stall_ms_total", grad_stall_us_.load() / 1e3},
-          {"last_step_wall_ms", gpu_mode_ ? 0.0 : last_wall}};
+          {"last_step_wall_ms", gpu_mode_ ? 0.0 : last_wall},
+          {"nan_guard", nan_guard_ ? 1.0 : 0.0},
+          {"fp8_gradients", fp8_grads_ ? 1.0 : 0.0},
+          {"skipped_steps", static_cast<double>(skipped_steps_.load())},
+          {"consecutive_skips", static_cast<double>(consecutive_skips_.load())}};
 }
 
 // ===========================================================================

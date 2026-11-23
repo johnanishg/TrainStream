@@ -17,6 +17,17 @@ read, shared by q / k / v) and the small x A^T for backward, where
 are three matmuls on [M, r] intermediates. Results match PEFT's up to the
 rounding of its intermediate products, so wrap(fused_lora="auto") turns it on
 only where the base is quantized (already not bit-exact).
+
+When x was paged to host RAM (trainstream.hooks) and is still on its way back
+as backward reaches the layer, dA does not wait for all of it. x returns in
+pieces, a CUDA event after each; (g B) and dx, which need no x, are queued
+first, then dA is summed piece by piece,
+
+    dA = sum_c  s (g B)[rows_c]^T  x[rows_c]
+
+each matmul waiting (on the GPU) for its own piece only, so the first runs
+while the later pieces are still crossing PCIe. Once x has landed (the usual
+case: it is prefetched a block ahead) dA is the single matmul above.
 """
 
 from __future__ import annotations
@@ -26,6 +37,24 @@ from typing import List
 
 import torch
 from torch import nn
+
+from .hooks import CHUNK_STATS, chunk_consumer
+
+CHUNK_ALWAYS = False  # tests: sum dA piece by piece even when x has already landed
+
+
+def grad_a_chunked(gb: torch.Tensor, x2: torch.Tensor, chunks, dt) -> torch.Tensor:
+    """(g B)^T x as a sum over row ranges of x [M, K]; chunks is [(row end, event)], the event
+    being the H2D copy of x's rows up to there. Summed in fp32: each partial product is rounded
+    once to dt by its matmul, their sum is not rounded again."""
+    acc = None
+    start = 0
+    for end, ev in chunks:
+        ev.wait()  # the compute stream waits for this piece only
+        part = (gb[start:end].t() @ x2[start:end].to(dt)).float()
+        acc = part if acc is None else acc.add_(part)
+        start = end
+    return acc
 
 
 class LoRAFn(torch.autograd.Function):
@@ -46,19 +75,35 @@ class LoRAFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
-        x, xa, A, B = ctx.saved_tensors
+        with chunk_consumer() as arriving:  # a paged x is handed over while it is still landing
+            x, xa, A, B = ctx.saved_tensors
+        chunks = arriving.take(x)
+        arriving.wait_rest()  # anything else that came back in pieces (xa) is read whole below
         s, dt = ctx.scaling, ctx.dt
         need_x, need_a, need_b = ctx.needs_input_grad[1:4]
         dx = dA = dB = None
-        with torch.autocast("cuda", enabled=False):
-            g2 = g.reshape(-1, g.shape[-1]).to(dt)
-            gb = g2 @ (B.to(dt) * s)  # s (g B): [M, r]
-            if need_x:
-                dx = (gb @ A.to(dt)).view(x.shape).to(x.dtype)
-            if need_a:
-                dA = (gb.t() @ x.reshape(-1, x.shape[-1]).to(dt)).to(A.dtype)
-            if need_b:
-                dB = (g2.t() @ (xa * s)).to(B.dtype)
+        try:
+            with torch.autocast("cuda", enabled=False):
+                g2 = g.reshape(-1, g.shape[-1]).to(dt)
+                gb = g2 @ (B.to(dt) * s)  # s (g B): [M, r]
+                if need_x:
+                    dx = (gb @ A.to(dt)).view(x.shape).to(x.dtype)  # x's shape and dtype only: no wait
+                if need_b:
+                    dB = (g2.t() @ (xa * s)).to(B.dtype)
+                if need_a:
+                    x2 = x.reshape(-1, x.shape[-1])
+                    if chunks is not None and (CHUNK_ALWAYS or not chunks[-1][1].query()):
+                        CHUNK_STATS["overlapped"] += 1
+                        dA = grad_a_chunked(gb, x2, chunks, dt).to(A.dtype)
+                    else:
+                        if chunks is not None:
+                            chunks[-1][1].wait()
+                        dA = (gb.t() @ x2.to(dt)).to(A.dtype)
+        finally:
+            if chunks is not None:
+                # whatever happened above, nothing queued after this function may see (or the
+                # allocator reuse) x's memory before its copy has finished
+                chunks[-1][1].wait()
         return g, dx, dA, dB, None, None
 
 

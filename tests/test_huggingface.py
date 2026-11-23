@@ -172,6 +172,39 @@ def test_trainer_checkpoint_resume_matches_uninterrupted(tmp_path):
     assert max_diff(full_model, resumed_model) < 1e-5
 
 
+@pytest.mark.parametrize("extra", [{}, {"param_offload": True}], ids=["resident-weights", "paged-weights"])
+def test_trainer_async_checkpoint_resume_matches_uninterrupted(tmp_path, extra):
+    ds = TokenDataset()
+    cfg = {"offload": True, "activation_offload": False, **extra}
+    full_model = tiny_llama()
+    resumed_model = copy.deepcopy(full_model)
+    full = TrainStreamTrainer(model=full_model, args=args(tmp_path / "full", max_steps=6), train_dataset=ds,
+                              trainstream=dict(cfg))
+    full.train()
+
+    first = TrainStreamTrainer(model=tiny_llama(), args=args(tmp_path / "part", max_steps=6, save_strategy="steps",
+                                                             save_steps=3), train_dataset=ds,
+                               trainstream=dict(cfg, async_checkpoint=True))
+    first.train()
+    assert first.last_checkpoint is not None and first.last_checkpoint.done() and first.last_checkpoint.error is None
+    ckpt = os.path.join(tmp_path / "part", "checkpoint-3")
+    assert os.path.isfile(os.path.join(ckpt, "trainstream.ckpt")) and os.path.isfile(os.path.join(ckpt, "scheduler.pt"))
+    assert not os.path.exists(os.path.join(ckpt, "optimizer.pt"))  # nothing was pickled on the training thread
+    assert trainstream.read_checkpoint(os.path.join(ckpt, "trainstream.ckpt"), keys=[])["manifest"]["extra"] == {
+        "global_step": 3}
+
+    def sd_diff(a, b):  # through state_dict(): paged weights are read from their host copies
+        sa, sb = a.state_dict(), b.state_dict()
+        return max((sa[k].float().cpu() - sb[k].float().cpu()).abs().max().item() for k in sa)
+
+    assert sd_diff(first.model, full_model) < 1e-5  # saving in the background changed nothing
+
+    resumed = TrainStreamTrainer(model=resumed_model, args=args(tmp_path / "part", max_steps=6), train_dataset=ds,
+                                 trainstream=dict(cfg))
+    resumed.train(resume_from_checkpoint=ckpt)
+    assert sd_diff(full_model, resumed_model) < 1e-5
+
+
 def test_trainer_rejects_fp16(tmp_path):
     with pytest.raises(ValueError, match="fp16"):
         TrainStreamTrainer(model=tiny_gpt2(), args=args(tmp_path, fp16=True), train_dataset=TokenDataset())
@@ -282,6 +315,26 @@ def test_load_model_auto_picks_the_most_precise_format_that_fits(tmp_path, monke
         assert model._ts_load_info["quantize"] == want, ram_factor
     with pytest.raises(ValueError):
         load_model(d, quantize="fp4")
+
+
+def test_load_model_refuses_a_model_larger_than_ram(tmp_path, monkeypatch):
+    """Too large for the RAM: MemoryError before anything is read, never the OS page file."""
+    import trainstream.planner as planner
+    from trainstream.integrations.huggingface import load_model
+    d = saved_llama(tmp_path, dtype=torch.bfloat16)
+    numel = sum(p.numel() for p in LlamaForCausalLM.from_pretrained(d).parameters())
+    monkeypatch.setattr(planner, "local_processes", lambda: 1)
+    monkeypatch.setattr(planner, "available_ram_bytes", lambda: numel // 10)  # less than even nf4 needs
+    with pytest.raises(MemoryError, match="exceeds the available RAM|exceeds RAM and VRAM combined"):
+        load_model(d)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)  # no VRAM: RAM + VRAM = RAM
+    with pytest.raises(MemoryError, match="exceeds RAM and VRAM combined"):
+        load_model(d, quantize="none")
+    monkeypatch.undo()
+    monkeypatch.setattr(planner, "local_processes", lambda: 1)
+    monkeypatch.setattr(planner, "available_ram_bytes", lambda: numel // 10)
+    assert load_model(d, quantize="none", check_memory=False)._ts_load_info["quantize"] is None
+    assert load_model(d, quantize="none", disk_offload=str(tmp_path / "disk"))._ts_load_info["quantize"] is None
 
 
 def test_load_model_random_weights_and_overrides(tmp_path):

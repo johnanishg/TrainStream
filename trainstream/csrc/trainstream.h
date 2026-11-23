@@ -71,6 +71,7 @@ struct Runtime {
   cudaStream_t d2h = nullptr;  // device -> host (gradients, activations out)
   cudaStream_t h2d = nullptr;  // host -> device (parameters, activation prefetch)
   cudaStream_t upd = nullptr;  // zero-copy optimizer kernels
+  cudaStream_t disk = nullptr; // host -> device for weights read from files (waits for the SSD, see disk.cpp)
 
   std::atomic<uint64_t> bytes_d2h{0};
   std::atomic<uint64_t> bytes_h2d{0};
@@ -128,6 +129,14 @@ EventPtr h2d_async(const at::Tensor& dst, const at::Tensor& src, const EventPtr&
 std::tuple<at::Tensor, EventPtr> h2d_alloc_async(const at::Tensor& src, const EventPtr& after,
                                                  int device, const std::vector<int64_t>& sizes = {},
                                                  const std::vector<int64_t>& strides = {});
+// The same copy issued as several back-to-back pieces, with one event after each:
+// bounds[k] is where piece k ends, in bytes from the start (increasing; the last
+// is the tensor's size). A consumer may start on the first bytes of `dst` while
+// the rest are still crossing PCIe; the last event is the whole copy's. `dst`
+// is contiguous here (its layout is src's shape), so byte ranges are row ranges.
+std::tuple<at::Tensor, std::vector<EventPtr>> h2d_alloc_chunked_async(const at::Tensor& src, const EventPtr& after,
+                                                                      int device, const std::vector<int64_t>& sizes,
+                                                                      const std::vector<int64_t>& bounds);
 // H2D from pageable (not page-locked) host tensors: staged with all CPU cores
 // into one of `slots` pinned slots, then copied on the H2D stream after
 // `after`. The host blocks only for the slot's previous copy.
@@ -202,6 +211,94 @@ at::Tensor rope(const at::Tensor& x, const at::Tensor& cos, const at::Tensor& si
 at::Tensor gated_act_forward(const at::Tensor& g, const at::Tensor& u, int64_t act);
 std::tuple<at::Tensor, at::Tensor> gated_act_backward(const at::Tensor& dh, const at::Tensor& g, const at::Tensor& u,
                                                       int64_t act);
+
+// The front of a gated MLP on an nvfp4 base in one kernel (gemm_fp4_kernel.cu):
+//     out[p] = x W[p]^T + xa[p] sb[p]^T      h = act(out[0]) * out[1]      (two projections)
+// x and each W[p] as TrainStream packs nvfp4 (codes, swizzled scales, tensor scale: xg a
+// 1-element device tensor, wg[p] numbers); xa[p] [M, R] and sb[p] [N, R] bf16 with R a
+// multiple of 16, or empty tensors for a projection without a LoRA term. Returns bf16
+// [M, N] tensors on the current stream: h first when want_h (two projections only), then
+// each out[p] when want_out.
+bool gemm_fp4_supported(int device);  // this build holds the kernel and the GPU is an sm_120 one
+std::vector<at::Tensor> gemm_fp4_front(const at::Tensor& xq, const at::Tensor& xs, const at::Tensor& xg,
+                                       const std::vector<at::Tensor>& wq, const std::vector<at::Tensor>& ws,
+                                       const std::vector<double>& wg, int64_t M, int64_t N, int64_t K,
+                                       const std::vector<at::Tensor>& xa, const std::vector<at::Tensor>& sb,
+                                       int64_t act, bool want_h, bool want_out);
+
+// ---------------------------------------------------------------------------
+// Ring all-reduce over TCP (ring.cpp): data-parallel ranks on different machines
+// ---------------------------------------------------------------------------
+class Ring {
+ public:
+  // to_next / from_prev: connected, blocking stream sockets (OS handles) to rank + 1 and from
+  // rank - 1. The Ring owns them and closes them. A send or receive that makes no progress for
+  // timeout_s seconds fails.
+  Ring(int64_t to_next, int64_t from_prev, int rank, int world, int timeout_s = 600);
+  ~Ring();
+  Ring(const Ring&) = delete;
+  Ring& operator=(const Ring&) = delete;
+  // buf (float32, host, contiguous) <- its sum over every rank, in place. Blocks until done;
+  // every rank must call it for the same tensors in the same order. Bit-identical on all ranks.
+  void allreduce(const at::Tensor& buf);
+  std::map<std::string, double> stats() const;  // calls, bytes_sent, bytes_received, wall_ms, rank, world
+  struct Impl;
+
+ private:
+  Impl* impl_;
+};
+
+// ---------------------------------------------------------------------------
+// Disk tier (disk.cpp): weights in files, read with asynchronous unbuffered I/O
+// ---------------------------------------------------------------------------
+namespace aio {
+class Batch;
+}
+// A block's files being read (or already read) into a pinned staging slot.
+struct DiskStage {
+  int device = 0;
+  int64_t slot = 0;
+  uint64_t generation = 0;
+  int64_t key = -1;
+  int64_t bytes = 0;
+  bool hit = false;  // the slot already held (or was already reading) these bytes: no new reads
+  std::shared_ptr<aio::Batch> batch;
+};
+// Queue unbuffered reads of files[i][offsets[i], +nbytes[i]) into one of `slots`
+// pinned staging slots on `device` and return at once. `key` (>= 0) names the
+// contents: asking for a key some slot already holds returns that slot without
+// reading again. Offsets must be multiples of 4096.
+std::shared_ptr<DiskStage> disk_stage(const std::vector<std::string>& paths, const std::vector<int64_t>& offsets,
+                                      const std::vector<int64_t>& nbytes, int64_t key, int device, int64_t slots);
+// dsts[i] <- the stage's i-th file, on the disk stream after `after`: the stream
+// itself waits for the reads (a host callback), the host does not.
+EventPtr h2d_disk_async(const std::vector<at::Tensor>& dsts, const std::shared_ptr<DiskStage>& stage,
+                        const EventPtr& after);
+bool disk_stage_ready(const DiskStage& stage);
+void disk_stage_wait(const DiskStage& stage);
+void disk_invalidate(int device);  // staged bytes are stale (a file was rewritten); -1: every device
+void disk_release(int device);     // give the staging slots back; -1: every device
+void disk_close(const std::vector<std::string>& paths);  // close cached handles (all when empty)
+// Write a mapped file's dirty pages to the device, so unbuffered reads see them.
+void disk_sync(const at::Tensor& mapped);
+// dst <- file[offset, +dst.nbytes()), blocking, through the same unbuffered path.
+void disk_read(const at::Tensor& dst, const std::string& path, int64_t offset);
+std::string disk_backend();  // "iocp", "io_uring" or "threads"
+std::map<std::string, double> disk_stats();
+
+// ---------------------------------------------------------------------------
+// Non-finite guard (guard.cpp): where a NaN / Inf first appeared
+// ---------------------------------------------------------------------------
+// Device-visible address of this device's flag words (kernels::GuardWord), in
+// mapped pinned host memory; nullptr while the kernel checks are switched off.
+int32_t* guard_flags(int device);
+int32_t* guard_flags_always(int device);  // the same, whatever guard_enable says
+void guard_enable(bool on);
+bool guard_enabled();
+// One value per kernels::GuardWord (non-zero: that kernel saw a NaN / Inf since
+// the flags were last cleared). Read straight from host memory: no stream sync.
+std::vector<int64_t> guard_read(int device, bool clear);
+const char* guard_word_name(int word);
 
 // ---------------------------------------------------------------------------
 // Micro-benchmarks (CUDA-event timed)

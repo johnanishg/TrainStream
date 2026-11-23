@@ -255,7 +255,9 @@ def test_activation_offload_reduces_vram():
     assert paged < 0.6 * resident, (resident, paged)
 
 
-def test_activation_auto_calibrates_then_tunes():
+def test_activation_auto_calibrates_then_tunes(monkeypatch):
+    # what is measured here is the calibration, not how much host RAM this machine has free now
+    monkeypatch.setattr(ActivationOffloader, "_host_ram_blocks", staticmethod(lambda blk: 1 << 30))
     model = lm(d=256, n_layer=6)
     prof = trainstream.profile_hardware()
     off = ActivationOffloader(model, list(model.blocks), offload="auto", min_bytes=0, calibrate_steps=3,
@@ -377,3 +379,21 @@ def test_broadcast_masks_stay_in_vram_and_training_is_unchanged():
     assert stats["packed_tensors"] > 0 and stats["resident_tensors"] > 0  # the masks stayed
     for a, b in zip(ref, got):
         assert torch.equal(a, b)
+
+
+def test_host_ram_bounds_paged_blocks(monkeypatch):
+    """Paged activations are page-locked: no more blocks than fit in 60 % of the RAM available, none
+    once that would go under the floor."""
+    from trainstream import planner
+    blk = 64 << 20
+    floor = ActivationOffloader._ram_floor()
+    monkeypatch.setattr(planner, "local_processes", lambda: 1)
+    monkeypatch.setattr(_C, "pinned_stats", lambda: {"arena_cap": 0, "arena_bytes": 0})
+    monkeypatch.setattr(planner, "available_ram_bytes", lambda: floor)
+    assert ActivationOffloader._host_ram_blocks(blk) == 0
+    avail = 4 * floor
+    monkeypatch.setattr(planner, "available_ram_bytes", lambda: avail)
+    assert ActivationOffloader._host_ram_blocks(blk) == int(min(0.6 * avail, avail - floor) // blk)
+    # the staging arena's remaining growth comes out of it
+    monkeypatch.setattr(_C, "pinned_stats", lambda: {"arena_cap": avail, "arena_bytes": 0})
+    assert ActivationOffloader._host_ram_blocks(blk) == 0

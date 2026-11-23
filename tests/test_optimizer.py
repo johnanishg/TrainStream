@@ -205,8 +205,8 @@ def test_eager_updates_with_declared_accumulation():
     ref, mine = make_mlp(), make_mlp()
     data = batches(12)
     run(ref, torch.optim.AdamW(ref.parameters(), foreach=False, **HP), data, accum=3)
-    opt = OffloadAdamW(mine.parameters(), mode="cpu", accumulation_steps=3, **HP).attach(mine)
-    assert opt.eager_active
+    opt = OffloadAdamW(mine.parameters(), mode="cpu", accumulation_steps=3, nan_guard=False, **HP).attach(mine)
+    assert opt.eager_active  # eager updates need the non-finite guard off
     run(mine, opt, data, accum=3)
     assert opt.stats()["eager_updates"] == 4 * len(list(mine.parameters()))
     assert max_diff(ref, mine) < 5e-5
@@ -214,7 +214,7 @@ def test_eager_updates_with_declared_accumulation():
 
 def test_undeclared_accumulation_raises():
     model = make_mlp()
-    opt = OffloadAdamW(model.parameters(), mode="cpu", **HP).attach(model)
+    opt = OffloadAdamW(model.parameters(), mode="cpu", nan_guard=False, **HP).attach(model)  # eager updates
     (x, y), (x2, y2) = batches(2)
     nn.functional.cross_entropy(model(x), y).backward()
     with pytest.raises(RuntimeError, match="accumulation_steps"):

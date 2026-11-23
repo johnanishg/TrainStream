@@ -79,25 +79,30 @@ def test_wrap_refuses_what_cannot_fit_in_ram(monkeypatch):
     trainstream.unwrap(model)
 
 
-def test_moment_precision_follows_available_ram(monkeypatch):
+@pytest.mark.parametrize("nan_guard", [True, False])
+def test_moment_precision_follows_available_ram(monkeypatch, nan_guard):
     import trainstream.planner as planner
     model = nn.Sequential(*[nn.Linear(1024, 1024) for _ in range(8)]).to(DEV)
     numel = sum(p.numel() for p in model.parameters())
-    # host need: fp32 master 4 + staging 4 + moments 2x(4 or 2) B/param -> 16 (fp32) vs 12 (bf16); give 14
-    room = int(numel * 14 / 0.9)
+    # host need: fp32 master 4 + staging 4 + moments 2x(4 or 2) B/param -> 16 (fp32) vs 12 (bf16); give 14.
+    # The non-finite guard holds every gradient until the step's verdict: 4 B/param more (20 vs 16; give 18).
+    room = int(numel * (18 if nan_guard else 14) / 0.9)
     monkeypatch.setattr(planner, "available_ram_bytes", lambda: room)
-    model, opt = trainstream.wrap(model, torch.optim.AdamW(model.parameters()), offload=True, activation_offload=False)
+    model, opt = trainstream.wrap(model, torch.optim.AdamW(model.parameters()), offload=True, activation_offload=False,
+                                  nan_guard=nan_guard)
     try:
         assert opt.moment_dtype == "bfloat16"
     finally:
         trainstream.unwrap(model)
     monkeypatch.setattr(planner, "available_ram_bytes", lambda: 64 << 30)
     model = nn.Sequential(*[nn.Linear(1024, 1024) for _ in range(8)]).to(DEV)
-    model, opt = trainstream.wrap(model, torch.optim.AdamW(model.parameters()), offload=True, activation_offload=False)
+    model, opt = trainstream.wrap(model, torch.optim.AdamW(model.parameters()), offload=True, activation_offload=False,
+                                  nan_guard=nan_guard)
     try:
         assert opt.moment_dtype == "float32"
     finally:
         trainstream.unwrap(model)
+        trainstream._C.guard_enable(True)
 
 
 # --------------------------------------------------------------------------- live re-planning
